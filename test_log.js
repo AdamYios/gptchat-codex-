@@ -4,27 +4,45 @@ const vm = require("node:vm");
 const path = require("node:path");
 
 async function main() {
-  const saved = {tabId: 7, port: 8765, token: "secret"};
-  const written = [];
+  const saved = {connections: {
+    "7": {id: "taskA", tabId: 7, port: 8765, token: "secretA", title: "A", card: "", threadId: "taskA"},
+    "8": {id: "taskB", tabId: 8, port: 8766, token: "secretB", title: "B", card: "", threadId: "taskB"}
+  }, tabId: 10, port: 8770, token: "old-secret", title: "Old", card: "",
+    bridgePendingEvents: [{time: "old", source: "content", event: "queued_before_upgrade", data: {}}]};
+  const written = new Map([[8765, []], [8766, []], [8767, []], [8768, []], [8770, []]]);
   const batchSizes = [];
+  const apiRouted = [];
   let online = false;
   let listener;
+  let tabRemovedListener;
   const chrome = {
     runtime: {onMessage: {addListener: callback => { listener = callback; }}},
+    tabs: {onRemoved: {addListener: callback => { tabRemovedListener = callback; }}},
     storage: {local: {
       get: async keys => {
         const result = {};
         for (const key of Array.isArray(keys) ? keys : [keys]) result[key] = saved[key];
         return result;
       },
-      set: async values => Object.assign(saved, values)
+      set: async values => Object.assign(saved, values),
+      remove: async keys => { for (const key of Array.isArray(keys) ? keys : [keys]) delete saved[key]; }
     }}
   };
-  const fetch = async (_url, options) => {
+  const fetch = async (url, options) => {
     if (!online) throw new Error("offline");
+    const parsedUrl = new URL(url);
+    const port = Number(parsedUrl.port);
+    assert.equal(options.headers["X-Bridge-Token"], port === 8765 ? "secretA" :
+      port === 8766 ? "secretB" : port === 8767 ? "secretA2" :
+      port === 8768 ? "secretZ" : "old-secret");
+    if (parsedUrl.pathname !== "/events") {
+      apiRouted.push(port);
+      return {ok: true, json: async () => ({threadId: port === 8767 ? "taskA" : port === 8768 ? "taskZ" :
+        port === 8766 ? "taskB" : "taskA"})};
+    }
     const events = JSON.parse(options.body).events;
     batchSizes.push(events.length);
-    written.push(...events);
+    written.get(port).push(...events);
     return {ok: true};
   };
   const source = fs.readFileSync(path.join(__dirname, "extension", "background.js"), "utf8");
@@ -32,30 +50,127 @@ async function main() {
   const send = (message, sender = {}) => new Promise(resolve => {
     assert.equal(listener(message, sender, resolve), true);
   });
-  const bound = {tab: {id: 7, url: "https://chatgpt.com/c/example"}};
-  assert.equal((await send({type: "bridgeIsBound"}, bound)).bound, true);
-  assert.equal((await send({type: "bridgeIsBound"}, {tab: {id: 8, url: "https://chatgpt.com/c/other"}})).bound, false);
+  const tabA = {tab: {id: 7, url: "https://chatgpt.com/c/a"}};
+  const tabB = {tab: {id: 8, url: "https://chatgpt.com/c/b"}};
+  assert.equal((await send({type: "bridgeIsBound"}, tabA)).bound, true);
+  assert.equal((await send({type: "bridgeIsBound"}, tabB)).bound, true);
+  assert.equal((await send({type: "bridgeIsBound"}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}})).bound, true);
+  assert.equal((await send({type: "bridgeIsBound"}, {tab: {id: 9, url: "https://chatgpt.com/c/other"}})).bound, false);
+  const configB = await send({type: "bridgeGetConfig"}, tabB);
+  assert.equal(configB.ok, true);
+  assert.equal(configB.bound, true);
+  assert.equal(configB.title, "B");
+  assert.equal(configB.card, "");
+
   await send({type: "bridgeLog", event: "send_click", data: {
     reportId: 2, token: "secret", instruction: "private text", phase: "report_ready"
-  }}, bound);
-  await send({type: "bridgeLog", event: "bind_error", data: {reason: "receiver_missing", token: "secret"}});
-  await send({type: "bridgeLog", event: "ignored"}, {tab: {id: 8, url: "https://chatgpt.com/c/other"}});
-  assert.equal(saved.bridgePendingEvents.length, 2);
-  assert.equal(saved.bridgePendingEvents[0].data.token, undefined);
-  assert.equal(saved.bridgePendingEvents[0].data.instruction, undefined);
+  }}, tabA);
+  await send({type: "bridgeLog", event: "bind_error", data: {reason: "receiver_missing", token: "secret"}, tabId: 8});
+  await send({type: "bridgeLog", event: "card_choices_viewed", data: {
+    round: 1, cardChoices: 1, strictChoiceCount: 0, manualCandidateCount: 2,
+    relaxedChoiceCount: 1, latestOnly: true, method: "main_manual_loose",
+    instruction: "private text"
+  }}, tabB);
+  await send({type: "bridgeLog", event: "post_upgrade", tabId: 10}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}});
+  await send({type: "bridgeLog", event: "ignored"}, {tab: {id: 9, url: "https://chatgpt.com/c/other"}});
+  assert.equal(saved.bridgePendingEvents_taskA.length, 1);
+  assert.equal(saved.bridgePendingEvents_taskB.length, 2);
+  assert.equal(saved.bridgePendingEvents_taskA[0].taskId, "taskA");
+  assert.equal(saved.bridgePendingEvents_taskA[0].data.token, undefined);
+  assert.equal(saved.bridgePendingEvents_taskA[0].data.instruction, undefined);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.manualCandidateCount, 2);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.latestOnly, true);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.method, "main_manual_loose");
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.instruction, undefined);
+
   for (let index = 0; index < 205; index += 1)
-    await send({type: "bridgeLog", event: "offline_step", data: {round: index}}, bound);
+    await send({type: "bridgeLog", event: "offline_step", data: {round: index}}, tabA);
+
+  await send({type: "bridgeUnbind", tabId: 7});
+  assert.equal(saved.connections["7"], undefined);
+  assert.equal(saved.bridgePendingEvents_taskA, undefined);
+  assert.equal(saved.bridgePendingEvents_tab_7.length, 207);
+  await send({type: "bridgeBind", connection: {
+    id: "taskZ", tabId: 7, port: 8768, token: "secretZ", threadId: "taskZ", title: "Z", card: ""
+  }});
+  assert.equal(saved.connections["7"].threadId, "taskZ");
+  assert.equal(saved.bridgePendingEvents_tab_7.length, 207);
+  assert.equal(saved.bridgePendingEvents_taskZ, undefined);
+  await send({type: "bridgeBind", connection: {
+    id: "taskA2", tabId: 7, port: 8767, token: "secretA2", threadId: "taskA", title: "A", card: ""
+  }});
+  assert.equal(saved.connections["7"].id, "taskA2");
+  assert.equal(saved.bridgePendingEvents_tab_7, undefined);
+
   online = true;
-  await send({type: "bridgeLog", event: "connected"}, bound);
-  assert.equal(written.length, 208);
-  assert.deepEqual(written.slice(0, 2).map(entry => entry.event), ["send_click", "bind_error"]);
-  assert.equal(written.at(-1).event, "connected");
+  const reboundTabA = {tab: {id: 7, url: "https://chatgpt.com/c/a"}};
+  await send({type: "bridgeLog", event: "connected", tabId: 7}, reboundTabA);
+  await send({type: "bridgeLog", event: "connected", tabId: 8}, tabB);
+  await send({type: "bridgeLog", event: "connected", tabId: 10}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}});
+  const stateA = await send({type: "bridgeRequest", path: "/state"}, reboundTabA);
+  const stateB = await send({type: "bridgeRequest", path: "/state"}, tabB);
+  assert.equal(stateA.data.threadId, "taskA");
+  assert.equal(stateB.data.threadId, "taskB");
+  assert.deepEqual(apiRouted, [8767, 8766]);
+
+  online = false;
+  await tabRemovedListener(8);
+  assert.equal(saved.connections["8"], undefined);
+  assert.equal(saved.bridgePendingEvents_taskB, undefined);
+  assert.deepEqual(Array.from(saved.bridgePendingEvents_tab_8, entry => entry.event), ["unbind"]);
+  assert.equal(saved.bridgePendingEvents_tab_8[0].source, "tab_closed");
+  assert.equal(saved.bridgePendingEvents_tab_8[0].taskId, "taskB");
+
+  assert.equal(written.get(8765).length, 0);
+  assert.equal(written.get(8767).length, 208);
+  assert.equal(written.get(8766).length, 3);
+  assert.equal(written.get(8770).length, 3);
+  assert.deepEqual(written.get(8767).slice(0, 2).map(entry => entry.event), ["send_click", "offline_step"]);
+  assert.equal(written.get(8767)[0].taskId, "taskA");
+  assert.equal(written.get(8767).at(-1).taskId, "taskA");
+  assert.equal(written.get(8767).at(-1).event, "connected");
+  assert.equal(written.get(8766)[0].event, "bind_error");
+  assert.equal(written.get(8770)[0].event, "queued_before_upgrade");
   assert.ok(batchSizes.every(size => size <= 100));
-  assert.equal(saved.bridgePendingEvents.length, 0);
-  assert.equal(written[0].source, "content");
-  assert.match(written[0].time, /^\d{4}-\d\d-\d\dT/);
-  assert.equal(written[1].source, "popup");
-  console.log("Unified operation log queues offline, flushes and removes private fields OK");
+  assert.equal(saved.bridgePendingEvents_taskA, undefined);
+  assert.equal(saved.bridgePendingEvents_taskA2.length, 0);
+  assert.equal(saved.bridgePendingEvents_taskB, undefined);
+  assert.equal(saved.bridgePendingEvents, undefined);
+  assert.equal(written.get(8767)[0].source, "content");
+  assert.match(written.get(8767)[0].time, /^\d{4}-\d\d-\d\dT/);
+  assert.equal(written.get(8766)[0].source, "popup");
+  console.log("Per-tab bridge routing and offline log handoff across rebind OK");
+  await verifyLegacyQueueMigratesOnReplacement();
+}
+
+async function verifyLegacyQueueMigratesOnReplacement() {
+  const saved = {tabId: 7, port: 8765, token: "old-secret", title: "Old", card: "",
+    bridgePendingEvents: [{event: "legacy_global", time: "old-global", data: {}}],
+    bridgePendingEvents_legacy: [{event: "legacy_connection", time: "old-connection", data: {}}]};
+  let listener;
+  const chrome = {runtime: {onMessage: {addListener: callback => { listener = callback; }}},
+    storage: {local: {
+      get: async keys => {
+        const result = {};
+        for (const key of Array.isArray(keys) ? keys : [keys]) result[key] = saved[key];
+        return result;
+      },
+      set: async values => Object.assign(saved, values),
+      remove: async keys => { for (const key of Array.isArray(keys) ? keys : [keys]) delete saved[key]; }
+    }}};
+  const source = fs.readFileSync(path.join(__dirname, "extension", "background.js"), "utf8");
+  vm.runInNewContext(source, {chrome, fetch: async () => { throw new Error("offline"); },
+    URL, AbortSignal, Promise, Set, Object, String, Number});
+  const result = await new Promise(resolve => listener({type: "bridgeBind", connection: {
+    id: "replacement", tabId: 7, port: 8766, token: "new-secret", threadId: "old-task", title: "New", card: ""
+  }}, {}, resolve));
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(saved.bridgePendingEvents_replacement, entry => entry.event),
+    ["legacy_global", "legacy_connection"]);
+  assert.equal(saved.bridgePendingEvents, undefined);
+  assert.equal(saved.bridgePendingEvents_legacy, undefined);
+  assert.equal(saved.connections["7"].id, "replacement");
+  console.log("Legacy singleton log queues migrate when replacing its connection OK");
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

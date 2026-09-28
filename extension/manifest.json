@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT ↔ Codex 本地桥接",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "仅在绑定的 ChatGPT 标签页和本机 Codex CLI 之间转发指令卡片与最终报告。",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["http://127.0.0.1/*", "https://chatgpt.com/*", "https://chat.openai.com/*"],

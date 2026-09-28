@@ -1,19 +1,19 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><style>
-body{font:14px system-ui;width:340px;padding:14px}label{display:block;margin:9px 0}input{box-sizing:border-box;width:100%;padding:7px}button{padding:8px;margin-top:8px;cursor:pointer}#status{white-space:pre-wrap;color:#555}.group{border-top:1px solid #ddd;margin-top:12px;padding-top:10px}.hint{font-size:12px;color:#555;margin:4px 0}.wide{width:100%;text-align:left}
+body{font:14px system-ui;width:360px;padding:14px}label{display:block;margin:9px 0}input{box-sizing:border-box;width:100%;padding:7px}button{padding:8px;margin-top:8px;cursor:pointer}#status{white-space:pre-wrap;color:#555}.group{border-top:1px solid #ddd;margin-top:12px;padding-top:10px}.hint{font-size:12px;color:#555;margin:4px 0}.wide{width:100%;text-align:left}.connection{border-bottom:1px solid #ddd;padding:6px 0}.connection button{margin:4px}
 </style><h3>ChatGPT ↔ Codex</h3>
-<label>本地端口<input id="port" type="number" value="8765"></label>
-<label>桥接令牌<input id="token" type="text"></label>
+<label>桥接连接信息（从对应终端整行复制）<input id="connectionCode" type="text" placeholder="8765|终端显示的连接令牌"></label>
 <label>指令卡片标题（正则）<input id="title" value="给\s*Codex\s*的指令|Instructions?\s+for\s+Codex"></label>
 <label>可选：卡片 CSS 选择器<input id="card" placeholder="留空则按标题和复制按钮识别"></label>
-<button id="bind">绑定当前 ChatGPT 标签页</button> <button id="unbind">解除绑定</button>
+<button id="bind">绑定当前 ChatGPT 标签页</button> <button id="unbind">解除当前标签页绑定</button>
 <div class="group"><strong>选择本次起点</strong>
 <button id="startA" class="wide">A：从网页现有指令卡片开始</button>
 <button id="startB" class="wide">B：从 Codex 最新最终报告开始</button>
-<p class="hint">先启动 bridge.py 并绑定标签页。待发报告时也能重选；会放弃该报告。A 会重新执行网页当前卡片，请确认不是已执行的旧指令。Codex 正在执行时请等本轮结束。</p></div>
+<p class="hint">待发报告时也能重选；会放弃该报告。A 会重新执行网页当前卡片，请确认不是已执行的旧指令。Codex 正在执行时请等本轮结束。</p></div>
+<div class="group"><strong>已连接的任务</strong><div id="connections"></div></div>
 <div class="group"><strong>指令卡片</strong>
 <button id="viewCards" class="wide">查看卡片</button>
 <div id="cardChoices"></div>
-<p class="hint">新版页面若无法识别助手消息，自动投递会暂停。请核对卡片预览后再选择；宽松匹配尤其需要确认。</p></div>
+<p class="hint">只有无法自动定位、存在歧义或需要人工恢复时才需手动处理。</p></div>
 <div class="group"><strong>发送卡住时恢复</strong>
 <button id="recheck" class="wide">重新检查 ChatGPT 是否收到报告</button>
 <button id="confirmSent" class="wide">我确认已发送，继续下一轮</button>
@@ -21,6 +21,6 @@ body{font:14px system-ui;width:340px;padding:14px}label{display:block;margin:9px
 <p class="hint">请先看网页：若报告已出现在你的消息中，选“确认已发送”；若仍在输入框或确实没有发送，选“重新发送”。</p></div>
 <div class="group"><strong>操作记录</strong>
 <button id="viewLog" class="wide">查看最近操作记录</button>
-<p class="hint">扩展和桥接器自动写入项目 logs/bridge.jsonl；记录阶段、控件数量和错误类别，不记录令牌、指令或报告正文。</p>
+<p class="hint">当前 Codex 任务的操作记录保存在项目 logs/ 下的独立文件；记录阶段、控件数量和错误类别，不记录令牌、指令或报告正文。</p>
 <pre id="operationLog" style="white-space:pre-wrap;max-height:260px;overflow:auto;font-size:11px"></pre></div>
 <p id="status"></p><script src="popup.js"></script></html>

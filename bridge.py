@@ -4,27 +4,42 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import json
 import os
 import secrets
 import shutil
 import sqlite3
+import socket
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-LOG_FIELDS = {"phase", "round", "reportId", "assistantMessages", "userMessages",
+class BridgeHTTPServer(ThreadingHTTPServer):
+    # Windows permits duplicate listeners when SO_REUSEADDR is enabled, which
+    # can send a request to the wrong task's bridge and reject its token.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+LOG_FIELDS = {"phase", "round", "reportId", "port", "portAutoSelected", "assistantMessages", "userMessages",
               "conversationTurns", "articles", "copyButtons", "stopButtons", "mainFound",
               "composerFound", "composerTag", "composerLength", "sendButtonFound",
-              "sendButtonDisabled", "cardChoices", "instructionLength", "reportLength",
+              "sendButtonDisabled", "cardChoices", "strictChoiceCount", "manualCandidateCount",
+              "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength", "reportLength",
               "filledLength", "latestCardLength", "confirmed", "reason", "method", "baselineAvailable",
               "visibleDelta", "domDelta", "mode", "errorType", "status"}
 
@@ -64,18 +79,29 @@ def error_code(exc):
 
 
 class EventLog:
-    def __init__(self, path: Path, max_bytes: int = 5_000_000):
+    def __init__(self, path: Path, max_bytes: int = 5_000_000, task_id: str | None = None):
         self.path = path
         self.max_bytes = max_bytes
+        self.task_id = self._clean_task_id(task_id)
         self.lock = threading.Lock()
         self.session_id = secrets.token_hex(6)
 
-    def write(self, source: str, event: str, data=None, occurred_at: str | None = None):
+    @staticmethod
+    def _clean_task_id(value):
+        if not isinstance(value, str):
+            return ""
+        return "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:100]
+
+    def write(self, source: str, event: str, data=None, occurred_at: str | None = None,
+              task_id: str | None = None):
         entry = {"time": datetime.now(timezone.utc).isoformat(),
                  "session": self.session_id,
                  "source": source if source in {"bridge", "content", "popup"} else "unknown",
                  "event": "".join(c for c in event if c.isascii() and (c.isalnum() or c in "_-"))[:50],
                  "data": safe_log_data(data)}
+        record_task_id = self._clean_task_id(task_id) or self.task_id
+        if record_task_id:
+            entry["taskId"] = record_task_id
         if isinstance(occurred_at, str):
             try:
                 parsed = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
@@ -86,18 +112,23 @@ class EventLog:
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists() and self.path.stat().st_size + len(line.encode("utf-8")) > self.max_bytes:
-                self.path.replace(self.path.with_suffix(".jsonl.1"))
-            with self.path.open("a", encoding="utf-8") as output:
-                output.write(line)
+            with process_file_lock(self.path.with_suffix(".jsonl.lock")):
+                if self.path.exists() and self.path.stat().st_size + len(line.encode("utf-8")) > self.max_bytes:
+                    rotated = self.path.with_suffix(".jsonl.1")
+                    if rotated.exists():
+                        rotated.unlink()
+                    self.path.replace(rotated)
+                with self.path.open("a", encoding="utf-8") as output:
+                    output.write(line)
 
     def tail(self, count: int = 100):
         with self.lock:
             lines = deque(maxlen=count)
-            for path in (self.path.with_suffix(".jsonl.1"), self.path):
-                if path.exists():
-                    with path.open("r", encoding="utf-8") as source:
-                        lines.extend(source)
+            with process_file_lock(self.path.with_suffix(".jsonl.lock")):
+                for path in (self.path.with_suffix(".jsonl.1"), self.path):
+                    if path.exists():
+                        with path.open("r", encoding="utf-8") as source:
+                            lines.extend(source)
         records = []
         for line in lines:
             if line.strip():
@@ -106,6 +137,33 @@ class EventLog:
                 except json.JSONDecodeError:
                     continue
         return records
+
+
+@contextmanager
+def process_file_lock(path: Path):
+    """Serialize log append/rotation across the separate bridge processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def read_clipboard_text():
@@ -272,6 +330,44 @@ def print_session_list(sessions):
         print(f"{number:2}. {label} [{sid}]\n    {path}")
 
 
+def task_log_title(name: str | None, first_message: str | None = None, thread_id: str = ""):
+    if isinstance(name, str) and name.strip():
+        return " ".join(name.split())
+    excerpt = " ".join((first_message or "").split())[:60]
+    if excerpt:
+        return f"未命名任务_{excerpt}"
+    return f"未命名任务_{thread_id[:8]}" if thread_id else "未命名任务"
+
+
+def safe_log_title(title: str):
+    title = unicodedata.normalize("NFC", str(title or "未命名任务"))
+    invalid = set('<>:"/\\|?*')
+    characters = []
+    separator = False
+    for character in title:
+        if character.isspace() or character in invalid or unicodedata.category(character).startswith("C"):
+            if not separator:
+                characters.append("_")
+            separator = True
+        else:
+            characters.append(character)
+            separator = False
+    cleaned = "".join(characters).strip(" ._")[:100].rstrip(" ._")
+    if not cleaned:
+        cleaned = "未命名任务"
+    if cleaned.split(".", 1)[0].upper() in {
+        "CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10))
+    }:
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def task_log_path(directory: Path, title: str, started_at: datetime):
+    timestamp = started_at.astimezone().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    return Path(directory) / f"{safe_log_title(title)}__{timestamp}.jsonl"
+
+
 def select_session(thread_id: str | None, cwd_override: Path | None):
     sessions = []
     try:
@@ -293,7 +389,8 @@ def select_session(thread_id: str | None, cwd_override: Path | None):
     if not matched and not cwd_override:
         raise ValueError("本机索引中找不到该任务；请确认 UUID 或从列表选择")
     cwd = cwd_override or Path(matched[2])
-    return thread_id, Path(os.path.abspath(cwd))
+    title = task_log_title(matched[1], matched[3], thread_id) if matched else task_log_title(None, None, thread_id)
+    return thread_id, Path(os.path.abspath(cwd)), title
 
 
 def resolve_codex_executable(command: str):
@@ -377,7 +474,7 @@ class Bridge:
 
     def snapshot(self):
         with self.lock:
-            return {"runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
+            return {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
                     "report": self.report if self.phase == "report_ready" else "",
                     "reportId": self.report_id, "detail": self.detail}
 
@@ -534,7 +631,7 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                     for entry in events:
                         event_log.write(entry.get("source", "unknown"),
                                         str(entry.get("event", "unknown")), entry.get("data"),
-                                        entry.get("time"))
+                                        entry.get("time"), entry.get("taskId"))
                     self.send_json(200, {"accepted": len(events)})
                     return
                 if self.path == "/instruction":
@@ -561,14 +658,23 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
     return Handler
 
 
+def create_bridge_server(port: int, handler, auto_fallback: bool):
+    try:
+        return BridgeHTTPServer(("127.0.0.1", port), handler), False
+    except OSError as exc:
+        if not auto_fallback or exc.errno != errno.EADDRINUSE:
+            raise
+        return BridgeHTTPServer(("127.0.0.1", 0), handler), True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--thread-id", help="可选：直接指定现有 Codex 桌面任务 UUID；省略则显示任务列表")
     parser.add_argument("--cwd", type=Path, help="兼容旧命令；新版本仅用任务 UUID 定位，不需要工作目录")
     parser.add_argument("--codex", default="codex", help="Codex CLI 可执行文件")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, help="本机端口；默认 8765 被占用时自动选择空闲端口")
     parser.add_argument("--max-rounds", type=int, default=20)
-    parser.add_argument("--timeout", type=int, default=3600, help="每轮 Codex 超时秒数")
+    parser.add_argument("--timeout", type=int, default=7200, help="每轮 Codex 超时秒数（默认 7200）")
     parser.add_argument("--list-tasks", action="store_true", help="仅列出本机任务，不启动桥接或发送消息")
     start = parser.add_mutually_exclusive_group()
     start.add_argument("--initial-report-file", type=Path, help="首次启动时要发给 ChatGPT 的既有 Codex 最终报告")
@@ -584,14 +690,18 @@ def main():
         return
     if args.max_rounds < 1 or args.timeout < 1:
         parser.error("max-rounds/timeout must be positive")
+    if args.port is not None and not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
     try:
-        thread_id, cwd = select_session(args.thread_id, args.cwd)
+        thread_id, cwd, title = select_session(args.thread_id, args.cwd)
         codex_executable = resolve_codex_executable(args.codex)
         codex_version = probe_codex_executable(codex_executable, Path.cwd())
     except (ValueError, RuntimeError) as exc:
         parser.error(str(exc))
     token = secrets.token_urlsafe(24)
-    event_log = EventLog(Path(__file__).resolve().parent / "logs" / "bridge.jsonl")
+    started_at = datetime.now().astimezone()
+    log_path = task_log_path(Path(__file__).resolve().parent / "logs", title, started_at)
+    event_log = EventLog(log_path, task_id=thread_id)
     bridge = Bridge(thread_id, cwd, codex_executable, args.max_rounds, args.timeout, event_log)
     if args.start_from_codex_final:
         try:
@@ -627,14 +737,22 @@ def main():
         bridge.phase = "report_ready"
     elif args.start_from_existing_card:
         bridge.phase = "await_instruction"
+    requested_port = args.port if args.port is not None else 8765
+    handler = make_handler(bridge, token, event_log)
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(bridge, token, event_log))
+        server, auto_selected = create_bridge_server(requested_port, handler, args.port is None)
     except OSError as exc:
-        parser.error(f"无法监听本机端口 {args.port}；可能已有桥接器在运行：{exc}")
-    print(f"已选任务 {thread_id}；任务记录中的工作目录 {cwd}（仅供核对，无需填写）", flush=True)
+        parser.error(f"无法监听本机端口 {requested_port}；可能已有桥接器在运行：{exc}")
+    actual_port = server.server_address[1]
+    print(f"已选任务「{safe_log_title(title)}」[{thread_id}]；任务记录中的工作目录 {cwd}（仅供核对，无需填写）", flush=True)
     print(f"Codex CLI 检查通过：{codex_executable}（{codex_version}）", flush=True)
-    print(f"监听 http://127.0.0.1:{args.port}；把以下令牌填入 Edge 扩展：\n{token}", flush=True)
-    event_log.write("bridge", "server_started", {"phase": bridge.phase})
+    if auto_selected:
+        print(f"默认端口 {requested_port} 已占用，已自动选择空闲端口", flush=True)
+    print(f"监听 http://127.0.0.1:{actual_port}", flush=True)
+    print("扩展连接信息（请复制下一行到对应 ChatGPT 标签页）:", flush=True)
+    print(f"{actual_port}|{token}", flush=True)
+    event_log.write("bridge", "server_started", {"phase": bridge.phase, "port": actual_port,
+                                                    "portAutoSelected": auto_selected})
     print(f"操作记录：{event_log.path}", flush=True)
     print("按 Ctrl+C 停止。绑定 Edge 标签页后，在扩展里点 A 或 B 选择起点。", flush=True)
     try:

@@ -73,6 +73,12 @@
     return result.data;
   }
 
+  async function bridgeSettings() {
+    const result = await chrome.runtime.sendMessage({type: "bridgeGetConfig"});
+    if (!result?.ok) throw new Error(result?.error || "无法读取当前标签页的桥接配置");
+    return result;
+  }
+
   function renderStatus() {
     let bar = document.getElementById("codex-bridge-status");
     if (!bar) {
@@ -195,6 +201,21 @@
     return lines.join("\n").trim();
   }
 
+  function looseCardText(card, titleText) {
+    const lines = (card.innerText || card.textContent || "").split(/\r?\n/)
+      .map(line => line.trim()).filter(line => line && !/^(复制|copy|展开|expand)$/i.test(line));
+    const heading = normalize(titleText).replace(/^#+\s*/, "");
+    const titleIndex = lines.findIndex(line => {
+      const normalized = normalize(line).replace(/^#+\s*/, "");
+      return normalized === heading || (normalized.startsWith(heading) &&
+        /^[\s|｜:：]/.test(normalized.slice(heading.length)));
+    });
+    if (titleIndex < 0) return "";
+    const nextTitle = lines.findIndex((line, index) => index > titleIndex &&
+      /^(?:给\s*Codex\s*的指令|Instructions?\s+for\s+Codex|Codex\s*指令卡)/i.test(line));
+    return lines.slice(titleIndex + 1, nextTitle < 0 ? undefined : nextTitle).join("\n").trim();
+  }
+
   function extractCard(message, titleRegex, selector) {
     let candidates = [];
     if (selector) {
@@ -232,17 +253,16 @@
   // Manual fallback only: expose likely card-shaped blocks when strict
   // matching found nothing. This is never used by the automatic tick loop.
   function looseCardEntries(message, titleRegex) {
-    const candidates = [];
+    const candidates = new Map();
     const copyButton = node => [...node.querySelectorAll("button")].some(button => {
       const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.innerText || ""}`;
       return isVisible(button) && /(copy|复制)/i.test(label);
     });
     const titleNodes = looseTitleElements(message, titleRegex);
 
-    // Anchor on the card title, then stop at the nearest ancestor that also
-    // contains its copy control and actual body. Do not promote it to MAIN or
-    // to the whole assistant turn just because those ancestors contain the
-    // same descendants.
+    // Anchor on the card title and the nearest ancestor with a copy control.
+    // That ancestor may still be the full assistant response, so the final
+    // text extraction below starts after the title instead of taking it whole.
     for (const titleNode of titleNodes) {
       const titleText = (titleNode.innerText || titleNode.textContent || "").trim();
       for (let depth = 0, current = titleNode.parentElement;
@@ -251,41 +271,29 @@
         const text = (current.innerText || current.textContent || "").trim();
         if (isVisible(current) && text.length >= titleText.length + 20 &&
             text.length <= 20000 && copyButton(current)) {
-          candidates.push(current);
+          if (!candidates.has(current)) candidates.set(current, titleText);
           break;
         }
       }
     }
 
-    // If there is no title-anchored card, retain a conservative manual
-    // fallback for copyable blocks. Take the nearest useful wrapper, not its
-    // largest ancestor (which may be the whole conversation page).
-    if (!candidates.length) {
-      for (const button of [...message.querySelectorAll("button")].filter(isVisible)) {
-        const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.innerText || ""}`;
-        if (!/(copy|复制)/i.test(label)) continue;
-        for (let depth = 0, current = button.parentElement;
-             current && current !== message && depth < 12;
-             depth++, current = current.parentElement) {
-          const text = (current.innerText || current.textContent || "").trim();
-          if (isVisible(current) && text.length >= 30 && text.length <= 20000) {
-            candidates.push(current);
-            break;
-          }
-        }
-      }
+    // If the heading wrapper only reaches a whole message-level Copy button,
+    // extract the body after the actual heading instead of sending the
+    // surrounding assistant response as the candidate.
+    if (candidates.size === 0) {
+      // With no recognized card heading, only expose a bounded code/pre block.
+      // A generic message Copy button's ancestors can be the entire latest turn.
       for (const node of [...message.querySelectorAll("pre,code")].filter(isVisible)) {
         const text = (node.innerText || node.textContent || "").trim();
-        if (text.length >= 10 && text.length <= 20000) candidates.push(node);
+        if (text.length >= 10 && text.length <= 20000) candidates.set(node, "");
       }
     }
 
-    // Candidates were selected at their card boundary; only remove duplicates
-    // here. Keeping a parent over a child is what previously swallowed MAIN.
-    const unique = [...new Set(candidates)];
+    // Candidates were selected at their card boundary; only remove duplicate
+    // nodes here. Keeping a parent over a child is what previously swallowed MAIN.
     const entries = [];
-    for (const card of unique) {
-      const instruction = cardText(card, titleRegex);
+    for (const [card, titleText] of candidates) {
+      const instruction = titleText ? looseCardText(card, titleText) : cardText(card, titleRegex);
       if (instruction.includes(REPORT_PREFIX) && instruction.includes("Codex 最终报告：")) continue;
       if (instruction && !entries.some(entry => normalize(entry.instruction) === normalize(instruction)))
         entries.push({instruction, preview: instruction.slice(0, 120), relaxed: true});
@@ -432,7 +440,7 @@
     if (sentReport === reportId) { await api("/ack", "POST", {reportId, runId}); return; }
     record("report_ready", {reportId, reportLength: report.length}, `report_ready:${reportId}`);
     if (baselinedReport !== reportId) {
-      const config = await chrome.storage.local.get(["title", "card"]);
+      const config = await bridgeSettings();
       rememberVisibleCards(new RegExp(config.title || DEFAULT_TITLE.source, "i"), config.card || "");
       baselinedReport = reportId;
       sessionStorage.setItem("bridge.baselinedReport", String(reportId));
@@ -442,7 +450,7 @@
       record("composer_missing", {reportId}, `composer_missing:${reportId}`);
       throw new Error("找不到 ChatGPT 输入框");
     }
-    const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。\n\nCodex 最终报告：\n${report}`;
+    const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
     if (reportWasSent(report, reportId)) { await acknowledgeReport(reportId, attemptedReport === reportId); return; }
     const existing = (editor.innerText || editor.textContent || "").trim();
     const ownDraft = normalize(existing).startsWith(normalize(message).slice(0, 90)) &&
@@ -532,7 +540,8 @@
     if (busy) throw new Error("桥接器仍在检查页面，请稍后重试");
     busy = true;
     try {
-      const config = await chrome.storage.local.get(["title", "card"]);
+      const config = await bridgeSettings();
+      if (!config.bound) throw new Error("当前 ChatGPT 标签页未绑定桥接任务");
       if (isGenerating()) throw new Error("ChatGPT 当前回复仍在生成，请等待停止生成按钮消失");
       const title = new RegExp(config.title || DEFAULT_TITLE.source, "i");
       const roots = assistantMessages();
@@ -559,24 +568,38 @@
       }
 
       let choices = strictChoices;
-      if (!choices.length && !mainFallback) {
-        const looseTitle = /^\s*Codex\s*指令卡\s*[|｜:：]/i;
+      const manualFallbackUsed = !strictChoices.length;
+      if (manualFallbackUsed) {
+        // ChatUI no longer consistently marks assistant messages. The manual
+        // viewer still needs to search MAIN for likely cards so the user can
+        // inspect and confirm them; this relaxed path is never auto-submitted.
+        const looseTitle = new RegExp(`(?:${config.title || DEFAULT_TITLE.source}|Codex\\s*指令卡)`, "i");
         choices = [];
         for (const root of candidateRoots)
           for (const choice of looseCardEntries(root, looseTitle)) addUnique(choices, choice);
       }
+      const manualCandidateCount = choices.length;
       let scopedLatestOnly = false;
       choices = choices.filter(choice => !seenCards.has(cardKey(choice.instruction)));
       if (mainFallback) {
-        if (!seenCards.size && choices.length > 1) {
+        // MAIN contains the whole conversation. Without message boundaries,
+        // expose only the last unseen candidate so old cards are not offered
+        // as if they belonged to the latest reply.
+        if (choices.length > 1) {
           choices = [choices.at(-1)];
           scopedLatestOnly = true;
         }
       }
       if (selectedIndex === null) {
         record("card_choices_viewed", {cardChoices: choices.length,
+          strictChoiceCount: strictChoices.length,
+          manualCandidateCount,
+          relaxedChoiceCount: choices.filter(choice => choice.relaxed).length,
+          latestOnly: scopedLatestOnly,
           latestCardLength: choices.at(-1)?.instruction.length || 0,
-          method: mainFallback ? "main_latest" : "assistant_role"});
+          method: mainFallback
+            ? (manualFallbackUsed ? "main_manual_loose" : "main_latest")
+            : (manualFallbackUsed ? "assistant_manual_loose" : "assistant_role")});
         return choices.map(({instruction, preview, relaxed}, index) =>
           ({index, key: cardKey(instruction), preview, relaxed: !!relaxed,
             latestOnly: scopedLatestOnly}));
@@ -650,11 +673,8 @@
     if (busy) return;
     busy = true;
     try {
-      const config = await chrome.storage.local.get(["tabId", "title", "card"]);
-      if (!config.tabId) return;
-      const binding = await chrome.runtime.sendMessage({type: "bridgeIsBound"});
-      if (!binding?.ok) throw new Error(binding?.error || "无法核对绑定标签页");
-      if (!binding.bound) {
+      const config = await bridgeSettings();
+      if (!config.bound) {
         const bar = document.getElementById("codex-bridge-status");
         if (bar?.dataset.bridgeInstance === scriptInstance) bar.remove();
         return;
@@ -724,6 +744,12 @@
           return;
         }
         status(`${found.error}；可在扩展弹窗查看并人工选择卡片`, true); return;
+      }
+      if (seenCards.has(cardKey(found.instruction))) {
+        lastSubmitted = signature;
+        sessionStorage.setItem("bridge.lastSubmitted", signature);
+        status("当前指令卡片已处理，等待新卡片");
+        return;
       }
       await api("/instruction", "POST", {instruction: found.instruction, runId});
       seenCards.add(cardKey(found.instruction));

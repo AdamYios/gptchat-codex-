@@ -1,22 +1,76 @@
 import ctypes
+import errno
 import json
+import multiprocessing
 import sqlite3
 import tempfile
 import threading
 import unittest
 import urllib.request
 from contextlib import closing
-from http.server import ThreadingHTTPServer
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bridge import (Bridge, EventLog, latest_turn, local_sessions, make_handler,
+from bridge import (Bridge, EventLog, create_bridge_server, latest_turn, local_sessions, make_handler,
                     probe_codex_executable, read_clipboard_text, read_latest_codex_final,
-                    resolve_codex_executable, select_session)
+                    resolve_codex_executable, safe_log_title, select_session, task_log_path,
+                    task_log_title)
+
+
+def _write_log_records(path, prefix):
+    log = EventLog(Path(path), max_bytes=1_000_000)
+    for index in range(40):
+        log.write("bridge", "parallel_write", {"status": f"{prefix}_{index}"})
 
 
 class BridgeTests(unittest.TestCase):
+    def test_log_appends_are_safe_across_bridge_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "logs" / "bridge.jsonl")
+            writers = [multiprocessing.Process(target=_write_log_records, args=(path, prefix))
+                       for prefix in ("first", "second")]
+            for writer in writers:
+                writer.start()
+            for writer in writers:
+                writer.join(10)
+                self.assertEqual(writer.exitcode, 0)
+            records = EventLog(Path(path)).tail(100)
+            statuses = {record["data"]["status"] for record in records}
+            self.assertEqual(len(records), 80)
+            self.assertEqual(len(statuses), 80)
+            self.assertEqual(len({record["session"] for record in records}), 2)
+
+    def test_default_port_falls_back_when_occupied(self):
+        fallback_server = SimpleNamespace(server_address=("127.0.0.1", 49152))
+        with patch("bridge.BridgeHTTPServer", side_effect=[
+                OSError(errno.EADDRINUSE, "occupied"), fallback_server]) as server_factory:
+            server, auto_selected = create_bridge_server(8765, object(), True)
+        self.assertIs(server, fallback_server)
+        self.assertTrue(auto_selected)
+        self.assertEqual(server_factory.call_args_list[0].args[0], ("127.0.0.1", 8765))
+        self.assertEqual(server_factory.call_args_list[1].args[0], ("127.0.0.1", 0))
+
+    def test_explicit_port_does_not_silently_change(self):
+        with patch("bridge.BridgeHTTPServer", side_effect=OSError(errno.EADDRINUSE, "occupied")) as factory:
+            with self.assertRaises(OSError):
+                create_bridge_server(8766, object(), False)
+        factory.assert_called_once()
+
+    def test_default_port_falls_back_when_another_local_server_owns_it(self):
+        first = create_bridge_server(0, BaseHTTPRequestHandler, False)[0]
+        try:
+            second, auto_selected = create_bridge_server(first.server_address[1], BaseHTTPRequestHandler, True)
+            try:
+                self.assertTrue(auto_selected)
+                self.assertNotEqual(first.server_address[1], second.server_address[1])
+            finally:
+                second.server_close()
+        finally:
+            first.server_close()
+
     def test_operation_log_sanitizes_and_rotates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "logs" / "bridge.jsonl"
@@ -34,7 +88,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_extension_events_reach_same_local_log(self):
         with tempfile.TemporaryDirectory() as directory:
-            log = EventLog(Path(directory) / "logs" / "bridge.jsonl")
+            log = EventLog(Path(directory) / "logs" / "bridge.jsonl", task_id="task")
             bridge = Bridge("task", Path(directory), "codex", 2, 10, log)
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(bridge, "test-token", log))
             worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -42,8 +96,10 @@ class BridgeTests(unittest.TestCase):
             base = f"http://127.0.0.1:{server.server_port}"
             try:
                 body = json.dumps({"events": [{"time": "2026-09-26T09:00:00Z",
-                    "source": "content", "event": "card_scan",
-                    "data": {"cardChoices": 3, "token": "secret"}}]}).encode()
+                    "source": "content", "event": "card_choices_viewed", "taskId": "previous-task",
+                    "data": {"cardChoices": 1, "strictChoiceCount": 0, "manualCandidateCount": 2,
+                             "relaxedChoiceCount": 1, "latestOnly": True,
+                             "method": "main_manual_loose", "token": "secret"}}]}).encode()
                 request = urllib.request.Request(base + "/events", body, method="POST",
                     headers={"X-Bridge-Token": "test-token", "Content-Type": "application/json"})
                 with urllib.request.urlopen(request) as response:
@@ -55,11 +111,67 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual([entry["source"] for entry in records], ["content", "bridge"])
                 self.assertEqual(records[0]["occurredAt"], "2026-09-26T09:00:00+00:00")
                 self.assertEqual(records[0]["session"], records[1]["session"])
+                self.assertEqual(records[0]["taskId"], "previous-task")
+                self.assertEqual(records[0]["data"]["manualCandidateCount"], 2)
+                self.assertTrue(records[0]["data"]["latestOnly"])
+                self.assertEqual(records[0]["data"]["method"], "main_manual_loose")
+                self.assertEqual(records[1]["taskId"], "task")
                 self.assertNotIn("secret", log.path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
                 worker.join(timeout=2)
+
+    def test_task_log_paths_use_safe_title_and_unique_start_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_started = datetime(2026, 9, 27, 1, 2, 3, 123456, tzinfo=timezone.utc)
+            second_started = datetime(2026, 9, 27, 1, 2, 3, 654321, tzinfo=timezone.utc)
+            first = task_log_path(Path(directory), '研究 / Agent: Bug?', first_started)
+            second = task_log_path(Path(directory), '研究 / Agent: Bug?', second_started)
+            self.assertNotEqual(first, second)
+            self.assertIn("研究_Agent_Bug", first.name)
+            self.assertTrue(first.name.endswith(".jsonl"))
+            self.assertEqual(safe_log_title("CON"), "_CON")
+            self.assertEqual(task_log_title("  Task  title ", "ignored", "thread"), "Task title")
+            self.assertEqual(task_log_title(None, "first\nmessage", "thread"), "未命名任务_first message")
+
+    def test_two_bridge_servers_keep_task_logs_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_directory = Path(directory) / "logs"
+            start = datetime.now(timezone.utc)
+            log_paths = [task_log_path(log_directory, "task-one", start),
+                         task_log_path(log_directory, "task-two", start)]
+            servers = []
+            workers = []
+            tokens = ["token-one", "token-two"]
+            for index, (thread_id, token) in enumerate((("task-one", tokens[0]), ("task-two", tokens[1]))):
+                log = EventLog(log_paths[index], task_id=thread_id)
+                bridge = Bridge(thread_id, Path(directory), "codex", 2, 10, log)
+                log.write("bridge", "server_started", {})
+                server, _ = create_bridge_server(0, make_handler(bridge, token, log), False)
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                servers.append(server)
+                workers.append(worker)
+            try:
+                states = []
+                for server, token in zip(servers, tokens):
+                    base = f"http://127.0.0.1:{server.server_port}"
+                    request = urllib.request.Request(base + "/state", headers={"X-Bridge-Token": token})
+                    with urllib.request.urlopen(request) as response:
+                        states.append(json.load(response))
+                self.assertEqual([state["threadId"] for state in states], ["task-one", "task-two"])
+                self.assertNotEqual(states[0]["runId"], states[1]["runId"])
+                records = [EventLog(path).tail(10) for path in log_paths]
+                self.assertEqual([[record["taskId"] for record in rows] for rows in records],
+                                 [["task-one"], ["task-two"]])
+                self.assertNotEqual(log_paths[0], log_paths[1])
+            finally:
+                for server in servers:
+                    server.shutdown()
+                    server.server_close()
+                for worker in workers:
+                    worker.join(timeout=2)
 
     def test_codex_executable_resolution_and_probe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,9 +252,10 @@ class BridgeTests(unittest.TestCase):
             task_id = "01a0d19b-00f4-7613-91b0-eb70ca06602d"
             with patch("bridge.local_sessions", return_value=[(task_id, "Example", directory, "First message")]), \
                  patch("builtins.input", return_value="1"):
-                selected, cwd = select_session(None, None)
+                selected, cwd, title = select_session(None, None)
             self.assertEqual(selected, task_id)
             self.assertEqual(cwd, Path(directory))
+            self.assertEqual(title, "Example")
 
     def test_only_completed_turn_exposes_final_report(self):
         with tempfile.TemporaryDirectory() as directory:

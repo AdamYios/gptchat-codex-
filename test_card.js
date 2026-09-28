@@ -51,9 +51,9 @@ const context = {sessionStorage: {
   getComputedStyle: node => ({display: node.cssDisplay || "block",
     visibility: node.cssVisibility || "visible", contentVisibility: "visible"}),
   chrome: {
-    storage: {local: {get: async () => ({tabId: 7, title: "给\\s*Codex\\s*的指令"})}},
     runtime: {onMessage: {addListener: callback => { contentMessageListener = callback; }}, sendMessage: async message => {
       if (message.type === "bridgeLog") { logged.push(message); return {ok: true}; }
+      if (message.type === "bridgeGetConfig") return {ok: true, bound, title: "给\\s*Codex\\s*的指令", card: ""};
       if (message.type === "bridgeIsBound") return {ok: true, bound};
       if (message.path === "/state") {
         stateRequests += 1;
@@ -168,19 +168,21 @@ context.document = {
   await context.tickForTest();
   context.forceStableForTest();
   await context.tickForTest();
-  assert.equal(submitted, "");
-  assert.ok(logged.some(entry => entry.event === "auto_submit_blocked" && entry.data.reason === "unscoped_main"));
+  assert.match(submitted, /继续修 Stage 5A3b/);
+  assert.ok(logged.some(entry => entry.event === "card_submit"));
   context.document.querySelectorAll = selector =>
     selector === '[data-message-author-role="assistant"]' ? [message] : [];
   await context.tickForTest();
   context.forceStableForTest();
   await context.tickForTest();
   assert.match(submitted, /继续修 Stage 5A3b/);
+  assert.equal(logged.filter(entry => entry.event === "card_submit").length, 1);
   bound = false;
   const beforeUnboundTick = stateRequests;
   await context.tickForTest();
   assert.equal(stateRequests, beforeUnboundTick);
   bound = true;
+  body.children[0].ownText = "当前尚未处理的新指令卡片。";
   const request = value => new Promise(resolve => contentMessageListener(value, null, resolve));
   const choices = await request({type: "bridgeCardChoices"});
   assert.equal(choices.data.length, 1);
@@ -190,6 +192,66 @@ context.document = {
   assert.equal(changed.ok, false);
   assert.match(changed.error, /指令卡片已变化/);
   assert.equal(submitted, previousSubmission);
+
+  // Current ChatUI may expose neither assistant-role markers nor the strict
+  // configured title. The manual viewer must extract only the titled card,
+  // even when the nearest message-level Copy control makes its parent too broad.
+  const markerlessMain = new Element("main");
+  const addLooseCard = bodyText => {
+    const response = markerlessMain.append(new Element("div"));
+    response.append(new Element("p", "这段对话背景不能混进发送给 Codex 的候选内容。"));
+    const block = response.append(new Element("div"));
+    block.append(new Element("span", "Codex 指令卡"));
+    block.append(new Element("p", bodyText));
+    response.append(new Element("button", "", {"aria-label": "复制"}));
+  };
+  addLooseCard("这是已经处理过的旧任务指令内容，不应该继续显示给当前任务。");
+  addLooseCard("这是最新对话里的待确认指令内容，查看卡片时应该能看到它。");
+  context.document = {
+    querySelector: selector => selector === "main" ? markerlessMain : null,
+    querySelectorAll: selector => selector === "button" ? markerlessMain.querySelectorAll("button") : [],
+    getElementById: () => null,
+    createElement: () => ({style: {}, dataset: {}, textContent: ""}),
+    body: {appendChild: () => {}}
+  };
+  const markerlessChoices = await request({type: "bridgeCardChoices"});
+  assert.equal(markerlessChoices.ok, true);
+  assert.equal(markerlessChoices.data.length, 1);
+  assert.equal(markerlessChoices.data[0].relaxed, true);
+  assert.equal(markerlessChoices.data[0].latestOnly, true);
+  assert.match(markerlessChoices.data[0].preview, /最新对话里的待确认指令/);
+  assert.doesNotMatch(markerlessChoices.data[0].preview, /对话背景/);
+  assert.doesNotMatch(markerlessChoices.data[0].preview, /已经处理过的旧任务/);
+  const viewLog = logged.filter(entry => entry.event === "card_choices_viewed").at(-1);
+  assert.equal(viewLog.data.method, "main_manual_loose");
+  assert.equal(viewLog.data.strictChoiceCount, 0);
+  assert.equal(viewLog.data.manualCandidateCount, 2);
+  assert.equal(viewLog.data.relaxedChoiceCount, 1);
+  assert.equal(viewLog.data.latestOnly, true);
+  const manuallyChosen = await request({type: "bridgeChooseCard", index: 0, key: markerlessChoices.data[0].key});
+  assert.equal(manuallyChosen.ok, true);
+  assert.match(submitted, /最新对话里的待确认指令/);
+
+  // An unmarked response with only a generic message Copy control is not a
+  // card-shaped candidate; do not promote the whole response as a fallback.
+  const unmarkedResponse = new Element("div");
+  unmarkedResponse.append(new Element("p", "没有卡片标题的长回复正文，不能作为整条消息发给 Codex。"));
+  unmarkedResponse.append(new Element("button", "", {"aria-label": "复制"}));
+  const unmarkedMain = new Element("main").append(unmarkedResponse);
+  context.document.querySelector = selector => selector === "main" ? unmarkedMain : null;
+  const unmarkedChoices = await request({type: "bridgeCardChoices"});
+  assert.deepEqual(Array.from(unmarkedChoices.data), []);
+  const codeResponse = new Element("div");
+  codeResponse.append(new Element("p", "回复里的普通说明不能一起发送。"));
+  codeResponse.append(new Element("pre", "只发送这个代码块里的候选指令正文。"));
+  codeResponse.append(new Element("button", "", {"aria-label": "复制代码"}));
+  const codeMain = new Element("main").append(codeResponse);
+  context.document.querySelector = selector => selector === "main" ? codeMain : null;
+  const codeChoices = await request({type: "bridgeCardChoices"});
+  assert.equal(codeChoices.data.length, 1);
+  assert.match(codeChoices.data[0].preview, /只发送这个代码块/);
+  assert.doesNotMatch(codeChoices.data[0].preview, /普通说明/);
+
   const bar = {style: {}, dataset: {}, textContent: ""};
   context.document.getElementById = () => bar;
   contentMessageListener({type: "bridgeUiAction", text: "按钮操作已完成"}, null, () => {});
