@@ -364,6 +364,70 @@ class BridgeTests(unittest.TestCase):
                 bridge.submit(report, original["runId"])
             self.assertEqual(bridge.snapshot(), original)
 
+    def test_instruction_id_is_idempotent_across_retry_and_new_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", 3, 10)
+            bridge.start("A")
+            instruction_id = "v1:/c/test:thread:turn-1:assistant:11:abc"
+            with patch("bridge.threading.Thread") as thread_factory:
+                self.assertTrue(bridge.submit("执行一次", bridge.run_id, instruction_id))
+                self.assertFalse(bridge.submit(" 执行一次\n", bridge.run_id, instruction_id))
+                thread_factory.assert_called_once()
+                self.assertEqual(bridge.snapshot()["round"], 1)
+
+                bridge.phase = "await_instruction"
+                bridge.start("A")
+                self.assertFalse(bridge.submit("执行一次", bridge.run_id, instruction_id))
+                thread_factory.assert_called_once()
+                self.assertEqual(bridge.snapshot()["round"], 0)
+
+                new_turn_id = "v1:/c/test:thread:turn-2:assistant:11:abc"
+                self.assertTrue(bridge.submit("执行一次", bridge.run_id, new_turn_id))
+                self.assertEqual(thread_factory.call_count, 2)
+                self.assertEqual(bridge.snapshot()["round"], 1)
+                self.assertFalse(bridge.submit("执行一次", bridge.run_id, new_turn_id))
+                self.assertEqual(thread_factory.call_count, 2)
+
+                with self.assertRaisesRegex(ValueError, "已用于不同指令"):
+                    bridge.submit("不同正文", bridge.run_id, instruction_id)
+
+    def test_instruction_endpoint_returns_idempotent_duplicate_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event_log = EventLog(Path(directory) / "logs" / "bridge.jsonl", task_id="task")
+            bridge = Bridge("task", Path(directory), "codex", 3, 10, event_log)
+            bridge.start("A")
+            bridge.run_codex = lambda *_args: None
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(bridge, "test-token"))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            request_body = json.dumps({
+                "instruction": "执行一次",
+                "instructionId": "v1:/c/test:thread:turn-1:assistant:11:abc",
+                "runId": bridge.run_id
+            }).encode()
+            try:
+                replies = []
+                for _ in range(2):
+                    request = urllib.request.Request(base + "/instruction", request_body, method="POST",
+                        headers={"X-Bridge-Token": "test-token", "Content-Type": "application/json"})
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(response.status, 200)
+                        replies.append(json.load(response))
+                self.assertFalse(replies[0]["duplicate"])
+                self.assertTrue(replies[1]["duplicate"])
+                self.assertEqual(bridge.snapshot()["round"], 1)
+                records = [record for record in event_log.tail()
+                    if record["event"] in {"instruction_accepted", "instruction_duplicate"}]
+                self.assertEqual([record["data"]["instructionId"] for record in records], [
+                    "v1:/c/test:thread:turn-1:assistant:11:abc",
+                    "v1:/c/test:thread:turn-1:assistant:11:abc"
+                ])
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

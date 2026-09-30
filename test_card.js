@@ -18,6 +18,12 @@ class Element {
   getAttribute(key) { return this.attributes[key] || null; }
   getClientRects() { for (let node = this; node; node = node.parentElement) if (node.hidden) return []; return [{}]; }
   contains(other) { for (let node = other; node; node = node.parentElement) if (node === this) return true; return false; }
+  closest(selector) {
+    if (selector !== "[data-content-search-unit-key]") return null;
+    for (let node = this; node; node = node.parentElement)
+      if (node.getAttribute("data-content-search-unit-key")) return node;
+    return null;
+  }
   querySelectorAll(selector) {
     const tags = selector.split(",").map(s => s.trim().toLowerCase());
     const result = [];
@@ -35,15 +41,19 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  tickInterval = setInterval\(tick, 2000\);\s*tick\(\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
+let runId = "";
+let failNextInstructionAfterAccept = false;
+let pendingWasWrittenBeforeRequest = false;
+const instructionRequests = [];
 const logged = [];
 let bound = true;
 let stateRequests = 0;
 let contentMessageListener;
-const context = {sessionStorage: {
+const context = {location: {pathname: "/c/test"}, sessionStorage: {
   getItem: key => saved[key] || null,
   setItem: (key, value) => { saved[key] = value; },
   removeItem: key => { delete saved[key]; }
@@ -57,9 +67,19 @@ const context = {sessionStorage: {
       if (message.type === "bridgeIsBound") return {ok: true, bound};
       if (message.path === "/state") {
         stateRequests += 1;
-        return {ok: true, data: {runId: "", phase: "await_instruction", round: 0}};
+        return {ok: true, data: {runId, phase: "await_instruction", round: 0}};
       }
-      if (message.path === "/instruction") { submitted = message.body.instruction; return {ok: true, data: {}}; }
+      if (message.path === "/instruction") {
+        instructionRequests.push({...message.body});
+        submitted = message.body.instruction;
+        if (failNextInstructionAfterAccept) {
+          failNextInstructionAfterAccept = false;
+          pendingWasWrittenBeforeRequest = JSON.parse(saved["bridge.instructionStates"] || "[]")
+            .some(([id, state]) => id === message.body.instructionId && state === "pending");
+          throw new Error("simulated lost response after server acceptance");
+        }
+        return {ok: true, data: {}};
+      }
       return {ok: true, data: {}};
     }}
   }, console};
@@ -294,6 +314,8 @@ context.document = {
   const manuallyChosen = await request({type: "bridgeChooseCard", index: 0, key: markerlessChoices.data[0].key});
   assert.equal(manuallyChosen.ok, true);
   assert.match(submitted, /最新对话里的待确认指令/);
+  assert.equal(instructionRequests.at(-1).instructionId, markerlessChoices.data[0].key,
+    "manual instruction submission sends the same stable ID used by the choice");
 
   // An unmarked response with only a generic message Copy control is not a
   // card-shaped candidate; do not promote the whole response as a fallback.
@@ -322,6 +344,128 @@ context.document = {
   assert.equal(codeChoices.data.length, 1);
   assert.match(codeChoices.data[0].preview, /只发送这个代码块/);
   assert.doesNotMatch(codeChoices.data[0].preview, /普通说明/);
+
+  const makeStrictMessage = (unitKey, instruction, analysis = "") => {
+    const root = new Element("div", "", {"data-content-search-unit-key": unitKey});
+    if (analysis) root.append(new Element("p", analysis));
+    const card = root.append(new Element("div"));
+    card.append(new Element("span", "给 Codex 的指令"));
+    card.append(new Element("button", "", {"aria-label": "复制"}));
+    card.append(new Element("p", instruction));
+    return root;
+  };
+  const showAssistant = root => {
+    context.document.querySelector = selector => selector === "main" ? root : null;
+    context.document.querySelectorAll = selector => {
+      if (selector === '[data-content-search-unit-key$=":assistant"]') return [root];
+      if (selector === "[data-content-search-unit-key]") return [root];
+      if (selector === '[data-message-author-role="assistant"]') return [];
+      return [];
+    };
+  };
+
+  const stableBody = "重启桥接后，这张旧卡片不能再次投递。";
+  const stableTurn = makeStrictMessage("thread:stable-turn:assistant", stableBody, "初始分析");
+  const stableId = context.instructionIdForTest(stableBody, stableTurn);
+  const remountedStableTurn = makeStrictMessage("thread:stable-turn:assistant", `  ${stableBody}  `, "重挂后的分析");
+  assert.equal(context.instructionIdForTest(stableBody, stableTurn),
+    context.instructionIdForTest(stableBody, remountedStableTurn), "same turn and body yield the same ID after remount");
+  const nextTurn = makeStrictMessage("thread:next-turn:assistant", stableBody, "下一轮分析");
+  assert.notEqual(context.instructionIdForTest(stableBody, stableTurn),
+    context.instructionIdForTest(stableBody, nextTurn), "the same body in a new turn gets a new ID");
+  const noKey = new Element("div");
+  assert.equal(context.instructionIdForTest(stableBody, noKey), context.instructionIdForTest(stableBody, new Element("div")),
+    "without a content-unit key, the existing body hash is the fallback ID");
+  const originalPathId = context.instructionIdForTest(stableBody, stableTurn);
+  context.location.pathname = "/c/another-conversation";
+  assert.notEqual(context.instructionIdForTest(stableBody, stableTurn), originalPathId,
+    "conversation pathname scopes keyed IDs");
+  context.location.pathname = "/c/test";
+
+  showAssistant(stableTurn);
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.at(-1).instruction, stableBody);
+  assert.equal(instructionRequests.at(-1).instructionId, stableId);
+  assert.equal(JSON.parse(saved["bridge.instructionStates"]).find(entry => entry[0] === stableId)[1], "seen");
+
+  const afterFirstStableSend = instructionRequests.length;
+  runId = "new-bridge-run";
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, afterFirstStableSend,
+    "runId changes do not clear the seen instruction ID");
+
+  showAssistant(remountedStableTurn);
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, afterFirstStableSend,
+    "a remounted DOM node with the same unit key does not resend");
+
+  showAssistant(nextTurn);
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, afterFirstStableSend + 1,
+    "the same instruction text on a new turn is allowed");
+  assert.notEqual(instructionRequests.at(-1).instructionId, stableId);
+
+  const uncertainBody = "服务器可能已接受，但客户端丢失响应时不要自动重试。";
+  const uncertainTurn = makeStrictMessage("thread:uncertain-turn:assistant", uncertainBody);
+  const uncertainId = context.instructionIdForTest(uncertainBody, uncertainTurn);
+  showAssistant(uncertainTurn);
+  failNextInstructionAfterAccept = true;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  const afterUncertainAttempt = instructionRequests.length;
+  assert.equal(instructionRequests.at(-1).instructionId, uncertainId);
+  assert.equal(pendingWasWrittenBeforeRequest, true, "pending is durable before the network request starts");
+  assert.equal(JSON.parse(saved["bridge.instructionStates"]).find(entry => entry[0] === uncertainId)[1], "pending");
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, afterUncertainAttempt,
+    "an uncertain pending instruction is not automatically resent");
+
+  const afterReloadRequests = [];
+  runId = "post-reload-run";
+  const reloadedContext = {
+    location: {pathname: "/c/test"},
+    sessionStorage: {
+      getItem: key => saved[key] || null,
+      setItem: (key, value) => { saved[key] = value; },
+      removeItem: key => { delete saved[key]; }
+    },
+    getComputedStyle: node => ({display: node.cssDisplay || "block",
+      visibility: node.cssVisibility || "visible", contentVisibility: "visible"}),
+    chrome: {runtime: {
+      onMessage: {addListener() {}},
+      sendMessage: async message => {
+        if (message.type === "bridgeLog") return {ok: true};
+        if (message.type === "bridgeGetConfig") return {ok: true, bound: true,
+          title: "给\\s*Codex\\s*的指令", card: ""};
+        if (message.path === "/state") return {ok: true,
+          data: {runId, phase: "await_instruction", round: 0}};
+        if (message.path === "/instruction") {
+          afterReloadRequests.push({...message.body});
+          return {ok: true, data: {}};
+        }
+        return {ok: true, data: {}};
+      }
+    }},
+    console
+  };
+  vm.runInNewContext(source, reloadedContext, {filename: `${file}:reloaded`});
+  showAssistant(uncertainTurn);
+  reloadedContext.document = context.document;
+  await reloadedContext.tickForTest();
+  reloadedContext.forceStableForTest();
+  await reloadedContext.tickForTest();
+  assert.equal(afterReloadRequests.length, 0,
+    "pending instruction IDs survive content-script reload and stay blocked");
 
   const bar = {style: {}, dataset: {}, textContent: ""};
   context.document.getElementById = () => bar;

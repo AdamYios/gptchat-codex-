@@ -39,7 +39,7 @@ LOG_FIELDS = {"phase", "round", "reportId", "port", "portAutoSelected", "assista
               "conversationTurns", "articles", "copyButtons", "stopButtons", "mainFound",
               "composerFound", "composerTag", "composerLength", "sendButtonFound",
               "sendButtonDisabled", "cardChoices", "strictChoiceCount", "manualCandidateCount",
-              "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength", "reportLength",
+              "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength", "instructionId", "reportLength",
               "filledLength", "latestCardLength", "confirmed", "reason", "method", "baselineAvailable",
               "visibleDelta", "domDelta", "mode", "errorType", "status"}
 
@@ -54,6 +54,8 @@ def safe_log_data(data):
         if isinstance(value, bool) or (isinstance(value, (int, float)) and not isinstance(value, bool)
                                        and abs(value) < 1_000_000_000):
             result[key] = value
+        elif isinstance(value, str) and key == "instructionId":
+            result[key] = value[:4096]
         elif isinstance(value, str) and key in {"phase", "composerTag", "reason", "method",
                                                        "mode", "errorType", "status"}:
             result[key] = "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:50]
@@ -440,6 +442,7 @@ class Bridge:
         self.report_id = 0
         self.detail = ""
         self.last_instruction = ""
+        self.accepted_instruction_ids: dict[str, tuple[str, int]] = {}
         self.event_log = event_log
 
     def log(self, event: str, data=None):
@@ -478,28 +481,50 @@ class Bridge:
                     "report": self.report if self.phase == "report_ready" else "",
                     "reportId": self.report_id, "detail": self.detail}
 
-    def submit(self, instruction: str, run_id: str):
+    def submit(self, instruction: str, run_id: str, instruction_id: str = "") -> bool:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 20_000:
             raise ValueError("指令长度必须为 1–20000 字符（Windows 命令行长度限制）")
+        normalized_instruction = " ".join(instruction.split())
+        instruction_id = str(instruction_id or "").strip()
+        if len(instruction_id) > 4096:
+            raise ValueError("instructionId 超过长度上限")
         if ("以下是 Codex 上一轮的最终报告" in instruction and
                 "Codex 最终报告：" in instruction):
             raise ValueError("检测到发往 ChatGPT 的 Codex 报告格式；已拒绝把报告投递给 Codex")
         with self.lock:
-            if run_id != self.run_id:
-                raise ValueError("桥接运行编号已变化；请等待页面同步后重试")
-            if self.phase != "await_instruction":
-                raise ValueError(f"not accepting instructions in phase {self.phase}")
-            if self.round >= self.max_rounds:
-                self.phase = "stopped"
-                self.detail = "已达到最大轮数"
-                raise ValueError(self.detail)
-            self.phase = "codex_running"
-            self.round += 1
-            self.last_instruction = instruction
-            number = self.round
+            accepted = self.accepted_instruction_ids.get(instruction_id) if instruction_id else None
+            if accepted:
+                accepted_instruction, accepted_round = accepted
+                if accepted_instruction != normalized_instruction:
+                    raise ValueError("instructionId 已用于不同指令")
+                duplicate_round = accepted_round
+            else:
+                duplicate_round = None
+            if duplicate_round is not None:
+                number = duplicate_round
+            else:
+                if run_id != self.run_id:
+                    raise ValueError("桥接运行编号已变化；请等待页面同步后重试")
+                if self.phase != "await_instruction":
+                    raise ValueError(f"not accepting instructions in phase {self.phase}")
+                if self.round >= self.max_rounds:
+                    self.phase = "stopped"
+                    self.detail = "已达到最大轮数"
+                    raise ValueError(self.detail)
+                self.phase = "codex_running"
+                self.round += 1
+                self.last_instruction = instruction
+                number = self.round
+                if instruction_id:
+                    self.accepted_instruction_ids[instruction_id] = (normalized_instruction, number)
+        if duplicate_round is not None:
+            self.log("instruction_duplicate", {"round": number, "instructionId": instruction_id})
+            return False
         threading.Thread(target=self.run_codex, args=(instruction, number), daemon=True).start()
-        self.log("instruction_accepted", {"round": number, "instructionLength": len(instruction)})
+        self.log("instruction_accepted", {"round": number, "instructionLength": len(instruction),
+                                           "instructionId": instruction_id or None})
+        return True
 
     def run_codex(self, instruction: str, number: int):
         try:
@@ -634,8 +659,11 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                                         entry.get("time"), entry.get("taskId"))
                     self.send_json(200, {"accepted": len(events)})
                     return
+                duplicate_instruction = False
                 if self.path == "/instruction":
-                    bridge.submit(data["instruction"], str(data["runId"]))
+                    duplicate_instruction = not bridge.submit(
+                        data["instruction"], str(data["runId"]),
+                        str(data.get("instructionId") or ""))
                 elif self.path == "/start":
                     bridge.start(str(data["mode"]))
                 elif self.path == "/ack":
@@ -645,7 +673,10 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                 else:
                     self.send_json(404, {"error": "not found"})
                     return
-                self.send_json(200, bridge.snapshot())
+                response = bridge.snapshot()
+                if self.path == "/instruction":
+                    response["duplicate"] = duplicate_instruction
+                self.send_json(200, response)
             except (ValueError, RuntimeError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
                 if event_log:
                     try:

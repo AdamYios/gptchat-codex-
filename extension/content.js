@@ -19,9 +19,14 @@
   let confirmationBaselineCounts;
   try { confirmationBaselineCounts = JSON.parse(sessionStorage.getItem("bridge.confirmationBaselineCounts") || "null"); }
   catch { confirmationBaselineCounts = null; }
-  let seenCards;
-  try { seenCards = new Set(JSON.parse(sessionStorage.getItem("bridge.seenCards") || "[]")); }
-  catch { seenCards = new Set(); }
+  let instructionStates;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("bridge.instructionStates") || "[]");
+    instructionStates = new Map(Array.isArray(saved)
+      ? saved.filter(entry => Array.isArray(entry) && entry.length === 2 &&
+        typeof entry[0] === "string" && ["pending", "seen"].includes(entry[1]))
+      : []);
+  } catch { instructionStates = new Map(); }
   let lastPhase = "";
   const recordedEvents = new Set();
   let phaseStatus = "等待桥接器状态";
@@ -402,13 +407,41 @@
     return `${text.length}:${hash.toString(16)}`;
   }
 
+  function contentUnitKey(anchor) {
+    const unit = anchor?.closest?.("[data-content-search-unit-key]");
+    return unit?.getAttribute("data-content-search-unit-key") || "";
+  }
+
+  function instructionId(instruction, anchor) {
+    const bodyHash = cardKey(instruction);
+    const unitKey = contentUnitKey(anchor);
+    if (!unitKey) return bodyHash;
+    return `v1:${encodeURIComponent(location.pathname || "/")}:${encodeURIComponent(unitKey)}:${bodyHash}`;
+  }
+
+  function persistInstructionStates() {
+    sessionStorage.setItem("bridge.instructionStates", JSON.stringify([...instructionStates]));
+  }
+
+  function setInstructionState(id, state) {
+    instructionStates.set(id, state);
+    persistInstructionStates();
+  }
+
+  function instructionIsHandled(id) {
+    return instructionStates.has(id);
+  }
+
   function rememberVisibleCards(title, selector) {
     if (assistantMessages().length) return;
     for (const unit of visibleContentSearchUnits()) {
       const found = extractCard(unit, title, selector);
-      for (const entry of cardEntries(found)) seenCards.add(cardKey(entry.instruction));
+      for (const entry of cardEntries(found)) {
+        const id = instructionId(entry.instruction, unit);
+        if (!instructionStates.has(id)) instructionStates.set(id, "seen");
+      }
     }
-    sessionStorage.setItem("bridge.seenCards", JSON.stringify([...seenCards]));
+    persistInstructionStates();
   }
 
   function currentAssistantSignature() {
@@ -564,17 +597,17 @@
 
       // Search only the latest message unit, whether it was found by role or content key.
       const strictChoices = [];
-      const addUnique = (list, entry) => {
+      const addUnique = (list, entry, anchor) => {
         if (entry?.instruction && !list.some(item => normalize(item.instruction) === normalize(entry.instruction)))
-          list.push(entry);
+          list.push({...entry, anchor});
       };
       const candidateRoots = roots.slice(-1);
       for (const root of candidateRoots) {
         const found = extractCard(root, title, config.card || "");
-        if (found.choices?.length) for (const choice of found.choices) addUnique(strictChoices, choice);
+        if (found.choices?.length) for (const choice of found.choices) addUnique(strictChoices, choice, root);
         else if (found.instruction) addUnique(strictChoices, {
           instruction: found.instruction, preview: found.instruction.slice(0, 120)
-        });
+        }, root);
       }
 
       let choices = strictChoices;
@@ -585,11 +618,11 @@
         const looseTitle = new RegExp(`(?:${config.title || DEFAULT_TITLE.source}|Codex\\s*指令卡)`, "i");
         choices = [];
         for (const root of candidateRoots)
-          for (const choice of looseCardEntries(root, looseTitle)) addUnique(choices, choice);
+          for (const choice of looseCardEntries(root, looseTitle)) addUnique(choices, choice, root);
       }
       const manualCandidateCount = choices.length;
       let scopedLatestOnly = unitFallback && roots.length > 0;
-      choices = choices.filter(choice => !seenCards.has(cardKey(choice.instruction)));
+      choices = choices.filter(choice => !instructionIsHandled(instructionId(choice.instruction, choice.anchor)));
       if (selectedIndex === null) {
         record("card_choices_viewed", {cardChoices: choices.length,
           strictChoiceCount: strictChoices.length,
@@ -600,8 +633,8 @@
           method: unitFallback
             ? (manualFallbackUsed ? "content_search_unit_manual_loose" : "content_search_unit_latest")
             : (manualFallbackUsed ? "assistant_manual_loose" : "assistant_role")});
-        return choices.map(({instruction, preview, relaxed}, index) =>
-          ({index, key: cardKey(instruction), preview, relaxed: !!relaxed,
+        return choices.map(({instruction, preview, relaxed, anchor}, index) =>
+          ({index, key: instructionId(instruction, anchor), preview, relaxed: !!relaxed,
             latestOnly: scopedLatestOnly}));
       }
       const state = await api("/state");
@@ -610,17 +643,24 @@
         throw new Error(`当前状态 ${state.phase}；若先前因卡片歧义已停止，请先在扩展点 A 重新开始`);
       if (!Number.isInteger(selectedIndex) || typeof selectedKey !== "string" ||
           !choices[selectedIndex] ||
-          cardKey(choices[selectedIndex].instruction) !== selectedKey)
+          instructionId(choices[selectedIndex].instruction, choices[selectedIndex].anchor) !== selectedKey)
         throw new Error("指令卡片已变化，请重新查看卡片");
       const text = roots.map(root => (root.innerText || root.textContent || "").trim()).join("\n");
       const signature = `${roots.length}:${text}`;
-      await api("/instruction", "POST", {instruction: choices[selectedIndex].instruction, runId: state.runId});
+      const selected = choices[selectedIndex];
+      const id = instructionId(selected.instruction, selected.anchor);
+      if (instructionIsHandled(id)) throw new Error("这张指令卡已提交或结果待确认，不会自动重发");
+      setInstructionState(id, "pending");
+      await api("/instruction", "POST", {
+        instruction: selected.instruction,
+        instructionId: id,
+        runId: state.runId
+      });
+      setInstructionState(id, "seen");
       record("manual_card_submit", {instructionLength: choices[selectedIndex].instruction.length,
         cardChoices: choices.length});
       lastSubmitted = signature;
       sessionStorage.setItem("bridge.lastSubmitted", signature);
-      seenCards.add(cardKey(choices[selectedIndex].instruction));
-      sessionStorage.setItem("bridge.seenCards", JSON.stringify([...seenCards]));
       status(`已将第 ${selectedIndex + 1} 张指令卡片送往 Codex`);
       return `已发送第 ${selectedIndex + 1} 张指令卡片。`;
     } finally { busy = false; }
@@ -648,7 +688,6 @@
   function syncRun(state) {
     if (state.runId === runId) return;
     runId = state.runId;
-    lastSubmitted = "";
     sentReport = 0;
     attemptedReport = 0;
     attemptedAt = 0;
@@ -659,13 +698,11 @@
     baselinedReport = 0;
     confirmationBaselineId = 0;
     confirmationBaselineCounts = null;
-    seenCards = new Set();
-    lastSignature = "";
     lastPhase = "";
     recordedEvents.clear();
     stableSince = Date.now();
     sessionStorage.setItem("bridge.runId", runId);
-    for (const key of ["lastSubmitted", "sentReport", "attemptedReport", "attemptedAt", "preSendAssistant", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "baselinedReport", "seenCards", "confirmationBaselineId", "confirmationBaselineCounts"])
+    for (const key of ["sentReport", "attemptedReport", "attemptedAt", "preSendAssistant", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "baselinedReport", "confirmationBaselineId", "confirmationBaselineCounts"])
       sessionStorage.removeItem(`bridge.${key}`);
   }
 
@@ -706,9 +743,12 @@
       }
       const text = (latest.innerText || "").trim();
       if (!text) { status("等待 ChatGPT 回复内容"); return; }
-      const signature = unitFallback
-        ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(text)}`
-        : `${messages.length}:${text}`;
+      const unitKey = contentUnitKey(latest);
+      const signature = unitKey
+        ? `${location.pathname || "/"}:${unitKey}:${normalize(text)}`
+        : unitFallback
+          ? `content-search-unit:${normalize(text)}`
+          : `${messages.length}:${text}`;
       if (signature !== lastSignature) { lastSignature = signature; stableSince = Date.now(); status("等待页面内容稳定"); return; }
       if (Date.now() - stableSince < 1800) { status("等待页面内容稳定"); return; }
       if (signature === lastSubmitted) { status("已处理当前指令，等待 ChatGPT 新回复"); return; }
@@ -720,10 +760,10 @@
       let found = extractCard(latest, title, config.card || "");
       let fallbackCandidateCount = 0;
       if (unitFallback) {
-        const fresh = cardEntries(found).filter(entry => !seenCards.has(cardKey(entry.instruction)));
+        const fresh = cardEntries(found).filter(entry => !instructionIsHandled(instructionId(entry.instruction, latest)));
         fallbackCandidateCount = fresh.length;
         if (found.instruction) {
-          if (seenCards.has(cardKey(found.instruction)))
+          if (instructionIsHandled(instructionId(found.instruction, latest)))
             found = {error: "未找到新的严格匹配指令卡片"};
         } else if (found.choices?.length && fresh.length === 1) {
           found = {instruction: fresh[0].instruction};
@@ -752,15 +792,21 @@
         }
         status(`${found.error}；可在扩展弹窗查看并人工选择卡片`, true); return;
       }
-      if (seenCards.has(cardKey(found.instruction))) {
+      const id = instructionId(found.instruction, latest);
+      const instructionState = instructionStates.get(id);
+      if (instructionState) {
+        if (instructionState === "pending") {
+          status("指令请求结果待确认；为避免重复投递，自动重试已暂停", true);
+          return;
+        }
         lastSubmitted = signature;
         sessionStorage.setItem("bridge.lastSubmitted", signature);
         status("当前指令卡片已处理，等待新卡片");
         return;
       }
-      await api("/instruction", "POST", {instruction: found.instruction, runId});
-      seenCards.add(cardKey(found.instruction));
-      sessionStorage.setItem("bridge.seenCards", JSON.stringify([...seenCards]));
+      setInstructionState(id, "pending");
+      await api("/instruction", "POST", {instruction: found.instruction, instructionId: id, runId});
+      setInstructionState(id, "seen");
       record("card_submit", {instructionLength: found.instruction.length});
       lastSubmitted = signature;
       sessionStorage.setItem("bridge.lastSubmitted", signature);
