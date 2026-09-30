@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  const CHANNEL = "CGO_V08";
-  const SETTINGS_KEY = "cgo_v08_settings";
+  const CHANNEL = "CHATGPT_LONG_CHAT_OPTIMIZER";
+  const SETTINGS_KEY = "optimizer.settings";
   const DEFAULTS = {
     enabled: true,
     keepRounds: 10,
