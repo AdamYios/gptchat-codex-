@@ -46,7 +46,11 @@ const source = fs.readFileSync(file, "utf8").replace(
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
 let runId = "";
+let autoPaused = false;
+let bridgePhase = "await_instruction";
+let bridgeReport = "";
 let failNextInstructionAfterAccept = false;
+let pauseOnNextAutomaticInstruction = false;
 let pendingWasWrittenBeforeRequest = false;
 const instructionRequests = [];
 const logged = [];
@@ -67,9 +71,16 @@ const context = {location: {pathname: "/c/test"}, sessionStorage: {
       if (message.type === "bridgeIsBound") return {ok: true, bound};
       if (message.path === "/state") {
         stateRequests += 1;
-        return {ok: true, data: {runId, phase: "await_instruction", round: 0}};
+        return {ok: true, data: {runId, phase: bridgePhase, round: 0, report: bridgeReport,
+          reportId: 1, autoPaused}};
       }
       if (message.path === "/instruction") {
+        if (pauseOnNextAutomaticInstruction && message.body.automatic) {
+          pauseOnNextAutomaticInstruction = false;
+          autoPaused = true;
+          return {ok: false, error: "AUTO_TRANSFER_PAUSED"};
+        }
+        if (autoPaused && message.body.automatic) return {ok: false, error: "AUTO_TRANSFER_PAUSED"};
         instructionRequests.push({...message.body});
         submitted = message.body.instruction;
         if (failNextInstructionAfterAccept) {
@@ -466,6 +477,54 @@ context.document = {
   await reloadedContext.tickForTest();
   assert.equal(afterReloadRequests.length, 0,
     "pending instruction IDs survive content-script reload and stay blocked");
+
+  const pausedBody = "暂停期间的卡片不应生成去重状态，恢复后再自动发送。";
+  const pausedTurn = makeStrictMessage("thread:paused-turn:assistant", pausedBody);
+  const pausedId = context.instructionIdForTest(pausedBody, pausedTurn);
+  showAssistant(pausedTurn);
+  bridgePhase = "await_instruction";
+  autoPaused = true;
+  const beforePausedRequests = instructionRequests.length;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforePausedRequests,
+    "paused automation keeps polling state but does not post new instructions");
+  assert.equal(JSON.parse(saved["bridge.instructionStates"] || "[]").some(([id]) => id === pausedId), false,
+    "a card observed while paused is not marked seen or pending");
+
+  autoPaused = false;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforePausedRequests + 1,
+    "the original scan flow sends the card after automation resumes");
+
+  bridgePhase = "report_ready";
+  bridgeReport = "Codex 报告应在恢复后再回传。";
+  autoPaused = true;
+  const composerErrorsBeforePause = logged.filter(entry => entry.event === "composer_missing").length;
+  await context.tickForTest();
+  assert.equal(logged.filter(entry => entry.event === "composer_missing").length, composerErrorsBeforePause,
+    "paused report_ready state does not invoke automatic sendReport");
+  bridgePhase = "await_instruction";
+  bridgeReport = "";
+  autoPaused = false;
+
+  const racedBody = "暂停请求与指令投递竞态时不可留下假 pending。";
+  const racedTurn = makeStrictMessage("thread:pause-race:assistant", racedBody);
+  const racedId = context.instructionIdForTest(racedBody, racedTurn);
+  showAssistant(racedTurn);
+  pauseOnNextAutomaticInstruction = true;
+  const beforeRacedRequests = instructionRequests.length;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforeRacedRequests,
+    "the bridge rejects an automatic instruction when pause wins the request race");
+  assert.equal(JSON.parse(saved["bridge.instructionStates"] || "[]").some(([id]) => id === racedId), false,
+    "a definite pause rejection removes pending instead of treating the card as handled");
+  autoPaused = false;
 
   const bar = {style: {}, dataset: {}, textContent: ""};
   context.document.getElementById = () => bar;

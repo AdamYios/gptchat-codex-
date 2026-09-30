@@ -424,7 +424,8 @@
   }
 
   function setInstructionState(id, state) {
-    instructionStates.set(id, state);
+    if (state === null) instructionStates.delete(id);
+    else instructionStates.set(id, state);
     persistInstructionStates();
   }
 
@@ -482,7 +483,11 @@
     status("最终报告已发往 ChatGPT，等待下一轮");
   }
 
-  async function sendReport(report, reportId) {
+  async function sendReport(report, reportId, automatic = true) {
+    if (automatic && (await api("/state")).autoPaused) {
+      status("自动传递已暂停；Codex 报告保留待发送");
+      return;
+    }
     if (sentReport === reportId) { await api("/ack", "POST", {reportId, runId}); return; }
     record("report_ready", {reportId, reportLength: report.length}, `report_ready:${reportId}`);
     if (baselinedReport !== reportId) {
@@ -523,6 +528,10 @@
     if (!buttonReady) {
       record("send_button_unavailable", {reportId}, `send_button_unavailable:${reportId}`);
       throw new Error("报告已在输入框中，但发送按钮未启用；请检查页面，桥接不会重复填入");
+    }
+    if (automatic && (await api("/state")).autoPaused) {
+      status("自动传递已暂停；Codex 报告保留待发送");
+      return;
     }
     preSendAssistant = currentAssistantSignature();
     sessionStorage.setItem("bridge.preSendAssistant", preSendAssistant);
@@ -574,7 +583,7 @@
         attemptedAt = 0;
         sessionStorage.removeItem("bridge.attemptedReport");
         sessionStorage.removeItem("bridge.attemptedAt");
-        await sendReport(state.report, state.reportId);
+        await sendReport(state.report, state.reportId, false);
         return sentReport === state.reportId ? "已重新发送并确认网页收到报告。" : "已重新点击发送；扩展会继续核对网页消息。";
       }
       throw new Error("未知恢复操作");
@@ -654,7 +663,8 @@
       await api("/instruction", "POST", {
         instruction: selected.instruction,
         instructionId: id,
-        runId: state.runId
+        runId: state.runId,
+        automatic: false
       });
       setInstructionState(id, "seen");
       record("manual_card_submit", {instructionLength: choices[selectedIndex].instruction.length,
@@ -709,6 +719,7 @@
   async function tick() {
     if (busy) return;
     busy = true;
+    let pendingAutomaticInstructionId = "";
     try {
       const config = await bridgeSettings();
       if (!config.bound) {
@@ -721,6 +732,13 @@
       if (state.phase !== lastPhase) {
         lastPhase = state.phase;
         record("phase", {phase: state.phase, round: state.round, reportId: state.reportId});
+      }
+      if (state.autoPaused) {
+        const pauseDetail = state.phase === "codex_running"
+          ? `Codex 第 ${state.round} 轮继续运行`
+          : state.phase === "report_ready" ? "Codex 报告保留待回传" : "等待恢复后处理页面指令卡片";
+        status(`自动传递已暂停；${pauseDetail}`);
+        return;
       }
       if (state.phase === "stopped") { status(state.detail || "已停止", true); return; }
       if (state.phase === "setup") { status("已连接；请在扩展弹窗选择 A 或 B 起点"); return; }
@@ -805,8 +823,11 @@
         return;
       }
       setInstructionState(id, "pending");
-      await api("/instruction", "POST", {instruction: found.instruction, instructionId: id, runId});
+      pendingAutomaticInstructionId = id;
+      await api("/instruction", "POST", {instruction: found.instruction, instructionId: id,
+        runId, automatic: true});
       setInstructionState(id, "seen");
+      pendingAutomaticInstructionId = "";
       record("card_submit", {instructionLength: found.instruction.length});
       lastSubmitted = signature;
       sessionStorage.setItem("bridge.lastSubmitted", signature);
@@ -814,6 +835,11 @@
         ? "已自动识别并发送最新的未处理指令卡片"
         : "指令卡片已送往 Codex");
     } catch (error) {
+      if (String(error).includes("AUTO_TRANSFER_PAUSED")) {
+        if (pendingAutomaticInstructionId) setInstructionState(pendingAutomaticInstructionId, null);
+        status("自动传递已暂停；当前指令卡片尚未提交，恢复后会继续处理");
+        return;
+      }
       if (/Extension context invalidated/i.test(String(error))) {
         stopInvalidatedScript();
         return;

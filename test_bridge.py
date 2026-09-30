@@ -329,6 +329,82 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "正在执行"):
                 bridge.start("A")
 
+    def test_pause_and_resume_only_change_auto_paused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", 2, 10)
+            bridge.start("A")
+            bridge.phase = "codex_running"
+            bridge.round = 1
+            before = bridge.snapshot()
+            bridge.set_auto_paused(True)
+            paused = bridge.snapshot()
+            self.assertTrue(paused["autoPaused"])
+            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
+                self.assertEqual(paused[key], before[key], key)
+
+            bridge.phase = "report_ready"
+            bridge.report = "保留中的报告"
+            report_before = bridge.snapshot()
+            bridge.set_auto_paused(False)
+            resumed = bridge.snapshot()
+            self.assertFalse(resumed["autoPaused"])
+            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
+                self.assertEqual(resumed[key], report_before[key], key)
+            bridge.set_auto_paused(True)
+            paused_report = bridge.snapshot()
+            self.assertTrue(paused_report["autoPaused"])
+            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
+                self.assertEqual(paused_report[key], resumed[key], key)
+
+    def test_pause_rejects_automatic_instruction_without_marking_it_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", 2, 10)
+            bridge.start("A")
+            bridge.set_auto_paused(True)
+            before = bridge.snapshot()
+            with patch("bridge.threading.Thread") as thread_factory:
+                with self.assertRaisesRegex(ValueError, "AUTO_TRANSFER_PAUSED"):
+                    bridge.submit("自动指令", bridge.run_id, "automatic-id", automatic=True)
+                thread_factory.assert_not_called()
+                self.assertEqual(bridge.snapshot(), before)
+
+                # An explicit manual card choice remains available while automation is paused.
+                self.assertTrue(bridge.submit("手动指令", bridge.run_id, "manual-id", automatic=False))
+                thread_factory.assert_called_once()
+
+    def test_pause_and_resume_http_endpoints_preserve_running_bridge_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", 2, 10)
+            bridge.start("A")
+            bridge.phase = "codex_running"
+            bridge.round = 1
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(bridge, "test-token"))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, body=None):
+                data = None if body is None else json.dumps(body).encode()
+                req = urllib.request.Request(base + path, data, method="GET" if body is None else "POST",
+                    headers={"X-Bridge-Token": "test-token", "Content-Type": "application/json"})
+                with urllib.request.urlopen(req) as response:
+                    return json.load(response)
+
+            try:
+                before = request("/state")
+                paused = request("/pause", {})
+                self.assertTrue(paused["autoPaused"])
+                for key in ("threadId", "runId", "phase", "round"):
+                    self.assertEqual(paused[key], before[key], key)
+                resumed = request("/resume", {})
+                self.assertFalse(resumed["autoPaused"])
+                for key in ("threadId", "runId", "phase", "round"):
+                    self.assertEqual(resumed[key], before[key], key)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_old_run_cannot_acknowledge_new_report(self):
         with tempfile.TemporaryDirectory() as directory:
             bridge = Bridge("task", Path(directory), "codex", 2, 10)

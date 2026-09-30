@@ -5,7 +5,7 @@ const path = require("node:path");
 
 async function main() {
   const elements = new Map();
-  for (const id of ["connectionCode", "title", "card", "status", "bind", "unbind", "startA", "startB",
+  for (const id of ["connectionCode", "title", "card", "status", "autoTransferToggle", "autoTransferStatus", "bind", "unbind", "startA", "startB",
     "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
     "optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     elements.set(id, {value: "", checked: false, textContent: "", onclick: null, children: [], listeners: {},
@@ -13,6 +13,8 @@ async function main() {
       replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
       append(...children) { this.children.push(...children); }});
   const popupHtml = fs.readFileSync(path.join(__dirname, "extension", "popup.html"), "utf8");
+  assert.match(popupHtml, /id="autoTransferToggle"/);
+  assert.match(popupHtml, /id="autoTransferStatus"/);
   for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     assert.match(popupHtml, new RegExp(`id="${id}"`));
   assert.match(popupHtml, /应用并刷新当前 ChatGPT/);
@@ -33,6 +35,7 @@ async function main() {
   const optimizerMessages = [];
   const reloadedTabs = [];
   let activeId = 7;
+  const autoPausedByPort = new Map([[8765, false], [8766, false]]);
   const chrome = {
     runtime: {sendMessage: async message => {
       if (message.type === "bridgeBind") {
@@ -104,10 +107,13 @@ async function main() {
   const fetch = async (url, options = {}) => {
     const endpoint = new URL(url);
     routed.push({port: Number(endpoint.port), path: endpoint.pathname, method: options.method || "GET"});
+    if (endpoint.pathname === "/pause") autoPausedByPort.set(Number(endpoint.port), true);
+    if (endpoint.pathname === "/resume") autoPausedByPort.set(Number(endpoint.port), false);
     if (endpoint.pathname === "/log") return {ok: true, json: async () => ({path: "logs/bridge.jsonl",
       records: [{time: "2026-09-26T00:00:00Z", source: "bridge", event: "start", data: {mode: "A"}}]})};
     if (endpoint.pathname === "/start") starts.push({port: Number(endpoint.port), mode: JSON.parse(options.body).mode});
-    return {ok: true, json: async () => ({phase: "report_ready", round: 1})};
+    return {ok: true, json: async () => ({threadId: `task-${endpoint.port}`, runId: "run", phase: "report_ready",
+      round: 1, autoPaused: autoPausedByPort.get(Number(endpoint.port)) || false})};
   };
   const source = fs.readFileSync(path.join(__dirname, "extension", "popup.js"), "utf8");
   const document = {getElementById: id => elements.get(id), createElement: () => ({
@@ -122,6 +128,15 @@ async function main() {
   assert.equal(elements.get("optimizerLiveWindow").checked, true);
   assert.match(elements.get("optimizerStatus").textContent, /页面脚本已连接/);
   assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_STATUS"));
+  assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
+  await elements.get("autoTransferToggle").onclick();
+  assert.equal(autoPausedByPort.get(8765), true);
+  assert.equal(elements.get("autoTransferToggle").textContent, "恢复自动传递");
+  assert.match(elements.get("autoTransferStatus").textContent, /已暂停/);
+  assert.match(elements.get("status").textContent, /自动传递已暂停/);
+  await elements.get("autoTransferToggle").onclick();
+  assert.equal(autoPausedByPort.get(8765), false);
+  assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
   await elements.get("recheck").onclick();
   assert.equal(injected.has(7), true);
   assert.equal(recoveryCalls, 1);
@@ -152,6 +167,11 @@ async function main() {
   assert.equal(state.connections["8"].port, 8766);
   await elements.get("startA").onclick();
   assert.deepEqual(starts, [{port: 8766, mode: "A"}]);
+  await elements.get("autoTransferToggle").onclick();
+  assert.equal(autoPausedByPort.get(8766), true,
+    "the toggle controls the bridge bound to the active ChatGPT tab");
+  assert.equal(autoPausedByPort.get(8765), false,
+    "pausing one task does not affect another connected task");
   assert.match(routed.filter(item => item.path === "/state").map(item => item.port).join(","), /8765.*8766|8766.*8765/);
   await elements.get("unbind").onclick();
   assert.equal(state.connections["8"], undefined);

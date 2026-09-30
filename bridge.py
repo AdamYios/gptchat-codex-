@@ -437,6 +437,7 @@ class Bridge:
         self.run_id = secrets.token_hex(8)
         self.lock = threading.Lock()
         self.phase = "setup"
+        self.auto_paused = False
         self.round = 0
         self.report = ""
         self.report_id = 0
@@ -479,9 +480,16 @@ class Bridge:
         with self.lock:
             return {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
                     "report": self.report if self.phase == "report_ready" else "",
-                    "reportId": self.report_id, "detail": self.detail}
+                    "reportId": self.report_id, "detail": self.detail, "autoPaused": self.auto_paused}
 
-    def submit(self, instruction: str, run_id: str, instruction_id: str = "") -> bool:
+    def set_auto_paused(self, paused: bool):
+        with self.lock:
+            changed = self.auto_paused != bool(paused)
+            self.auto_paused = bool(paused)
+        if changed:
+            self.log("auto_transfer_paused" if paused else "auto_transfer_resumed", {})
+
+    def submit(self, instruction: str, run_id: str, instruction_id: str = "", automatic: bool = False) -> bool:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 20_000:
             raise ValueError("指令长度必须为 1–20000 字符（Windows 命令行长度限制）")
@@ -504,6 +512,8 @@ class Bridge:
             if duplicate_round is not None:
                 number = duplicate_round
             else:
+                if automatic and self.auto_paused:
+                    raise ValueError("AUTO_TRANSFER_PAUSED")
                 if run_id != self.run_id:
                     raise ValueError("桥接运行编号已变化；请等待页面同步后重试")
                 if self.phase != "await_instruction":
@@ -663,9 +673,14 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                 if self.path == "/instruction":
                     duplicate_instruction = not bridge.submit(
                         data["instruction"], str(data["runId"]),
-                        str(data.get("instructionId") or ""))
+                        str(data.get("instructionId") or ""),
+                        automatic=data.get("automatic") is True)
                 elif self.path == "/start":
                     bridge.start(str(data["mode"]))
+                elif self.path == "/pause":
+                    bridge.set_auto_paused(True)
+                elif self.path == "/resume":
+                    bridge.set_auto_paused(False)
                 elif self.path == "/ack":
                     bridge.acknowledge(int(data["reportId"]), str(data["runId"]))
                 elif self.path == "/stop":
