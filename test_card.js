@@ -626,6 +626,10 @@ context.document = {
     assert.equal(keepChannelOpen, true, "report-ready notification waits for the page-side wake tick");
   });
   assert.equal((await wakeForReport()).ok, true);
+  assert.ok(reportLog.some(entry => entry.event === "content_wake_received" &&
+    entry.data.reportId === 1), "content logs the received wake with its report ID");
+  assert.ok(reportLog.some(entry => entry.event === "report_send_started" &&
+    entry.data.reportId === 1), "content logs when automatic report sending begins");
   assert.match(reportEditorText, /Codex 最终报告：/,
     "an event wake sends the report without waiting for the content-script interval");
   assert.equal(reportLog.some(entry => entry.event === "send_button_unavailable"), true);

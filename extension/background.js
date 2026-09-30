@@ -57,6 +57,7 @@ function pollPendingReports() {
     await Promise.all(connections.map(async connection => {
       const tabId = Number(connection.tabId);
       if (!Number.isInteger(tabId) || !connection.port || !connection.token) return;
+      recordBackgroundEvent(connection, "alarm_fired");
       try {
         const response = await fetch(`http://127.0.0.1:${connection.port}/state`, {
           headers: {"X-Bridge-Token": connection.token}, signal: AbortSignal.timeout(4000)
@@ -65,13 +66,16 @@ function pollPendingReports() {
         const state = await response.json();
         const reportId = Number(state.reportId);
         if (state.phase !== "report_ready" || !Number.isSafeInteger(reportId) || reportId <= 0) return;
+        recordBackgroundEvent(connection, "report_ready_detected", reportId);
 
         // A tab can be rebound while a poll is in flight. Only wake it if the
         // same task still owns this binding; sending a message never activates it.
         const current = await getConnection(tabId);
         if (!current || current.id !== connection.id || current.port !== connection.port ||
             current.token !== connection.token) return;
-        await chrome.tabs.sendMessage(tabId, {type: "bridgeReportReady", reportId});
+        const wake = chrome.tabs.sendMessage(tabId, {type: "bridgeReportReady", reportId});
+        recordBackgroundEvent(connection, "wake_message_sent", reportId);
+        await wake;
       } catch { /* The next alarm retries if the bridge or tab is temporarily unavailable. */ }
     }));
   })().catch(() => {}).finally(() => { reportPollPromise = null; });
@@ -153,6 +157,21 @@ async function flushPending(tabId) {
 function scheduleLog(task) {
   logQueue = logQueue.catch(() => {}).then(task);
   return logQueue;
+}
+
+function recordBackgroundEvent(connection, event, reportId = null) {
+  const data = Number.isSafeInteger(reportId) && reportId > 0 ? {reportId} : {};
+  const entry = safeEvent({event, data}, "background", connection);
+  const tabId = Number(connection.tabId);
+  const task = scheduleLog(async () => {
+    const key = connectionLogKey(connection);
+    const stored = await chrome.storage.local.get(key);
+    const pending = Array.isArray(stored[key]) ? stored[key] : [];
+    pending.push(entry);
+    await chrome.storage.local.set({[key]: pending.slice(-LOG_LIMIT)});
+    await flushPending(tabId);
+  });
+  void task.catch(() => {});
 }
 
 async function unbindConnection(tabId, fallbackTaskId = "", source = "popup") {

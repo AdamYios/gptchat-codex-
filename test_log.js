@@ -129,10 +129,26 @@ async function main() {
   assert.equal(alarmRecords.get("bridge-report-ready-wake")?.periodInMinutes, 0.5,
     "the MV3 worker installs a minimum-period report wake alarm");
   await alarmListener({name: "bridge-report-ready-wake"});
+  await send({type: "bridgeLog", event: "wake_log_flush", data: {}}, reboundTabA);
   assert.deepEqual(reportWakeMessages.map(({tabId, message}) => ({tabId,
     message: {type: message.type, reportId: message.reportId}})), [{tabId: 7,
     message: {type: "bridgeReportReady", reportId: 4}}],
   "the alarm polls bound tasks and wakes only the tab whose Codex report is ready");
+  const wakeEvents = written.get(8767).filter(entry =>
+    ["alarm_fired", "report_ready_detected", "wake_message_sent"].includes(entry.event)
+  );
+  assert.deepEqual(wakeEvents.map(entry => entry.event),
+    ["alarm_fired", "report_ready_detected", "wake_message_sent"]);
+  for (const event of wakeEvents) {
+    assert.equal(event.source, "background");
+    assert.equal(event.taskId, "taskA");
+    assert.match(event.time, /^\d{4}-\d\d-\d\dT/);
+  }
+  assert.equal(wakeEvents[0].data.reportId, undefined);
+  assert.equal(wakeEvents[1].data.reportId, 4);
+  assert.equal(wakeEvents[2].data.reportId, 4);
+  assert.ok(written.get(8766).some(entry => entry.event === "alarm_fired" &&
+    entry.taskId === "taskB"), "alarm events are logged separately per bound task");
   assert.deepEqual(apiRouted.slice(2), [8767, 8766, 8770]);
 
   online = false;
@@ -144,13 +160,14 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_tab_8[0].taskId, "taskB");
 
   assert.equal(written.get(8765).length, 0);
-  assert.equal(written.get(8767).length, 208);
-  assert.equal(written.get(8766).length, 3);
-  assert.equal(written.get(8770).length, 3);
+  assert.equal(written.get(8767).length, 212);
+  assert.equal(written.get(8766).length, 4);
+  assert.equal(written.get(8770).length, 4);
   assert.deepEqual(written.get(8767).slice(0, 2).map(entry => entry.event), ["send_click", "offline_step"]);
   assert.equal(written.get(8767)[0].taskId, "taskA");
   assert.equal(written.get(8767).at(-1).taskId, "taskA");
-  assert.equal(written.get(8767).at(-1).event, "connected");
+  assert.ok(written.get(8767).some(entry => entry.event === "connected"));
+  assert.equal(written.get(8767).at(-1).event, "wake_log_flush");
   assert.equal(written.get(8766)[0].event, "bind_error");
   assert.equal(written.get(8770)[0].event, "queued_before_upgrade");
   assert.ok(batchSizes.every(size => size <= 100));

@@ -539,6 +539,7 @@
       return;
     }
     if (sentReport === reportId) { await api("/ack", "POST", {reportId, runId}); return; }
+    record("report_send_started", {reportId}, `report_send_started:${reportId}`);
     record("report_ready", {reportId, reportLength: report.length}, `report_ready:${reportId}`);
     if (baselinedReport !== reportId) {
       const config = await bridgeSettings();
@@ -732,6 +733,7 @@
       if (!Number.isSafeInteger(reportId) || reportId <= 0) {
         respond({ok: false, error: "无效的报告编号"}); return false;
       }
+      record("content_wake_received", {reportId});
       if (busy) {
         reportWakeQueued = true;
         respond({ok: true, queued: true}); return false;
