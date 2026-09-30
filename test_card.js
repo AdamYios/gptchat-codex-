@@ -553,6 +553,7 @@ context.document = {
   let reportEditorText = "";
   let reportSendButtonAvailable = false;
   let reportAckCount = 0;
+  let reportGenerating = false;
   const reportMain = {innerText: "对话已有内容", textContent: "对话已有内容"};
   const reportUserBefore = new Element("div", "之前的用户消息", {
     "data-content-search-unit-key": "report:before:user"
@@ -568,7 +569,7 @@ context.document = {
     getAttribute: () => null,
     click() {
       reportEditorText = "";
-      reportUserUnits = [reportUserAfter];
+      reportGenerating = true;
     }
   };
   const reportForm = {querySelectorAll: () => reportSendButtonAvailable ? [reportButton] : []};
@@ -611,8 +612,12 @@ context.document = {
     document: {
       querySelector: selector => selector === "main" ? reportMain :
         selector === '#prompt-textarea[contenteditable="true"]' ? reportEditor : null,
-      querySelectorAll: selector => selector === '[data-content-search-unit-key$=":user"]'
-        ? reportUserUnits : [],
+      querySelectorAll: selector => {
+        if (selector === '[data-content-search-unit-key$=":user"]') return reportUserUnits;
+        if (selector.includes('data-testid="stop-button"'))
+          return reportGenerating ? [{getAttribute: () => null}] : [];
+        return [];
+      },
       getElementById: id => id === "codex-bridge-status" ? reportStatusBar : null,
       createElement: () => reportStatusBar,
       body: {appendChild() {}},
@@ -637,9 +642,20 @@ context.document = {
     "a temporarily missing send button is retried without becoming a tick error");
   reportSendButtonAvailable = true;
   assert.equal((await wakeForReport()).ok, true);
+  assert.equal(reportAckCount, 0,
+    "an empty composer and started generation do not confirm delivery without a new user message");
+  assert.equal(reportPhase, "report_ready",
+    "unconfirmed sends leave the bridge report pending");
+  const unconfirmed = reportLog.find(entry => entry.event === "report_unconfirmed");
+  assert.equal(unconfirmed.data.composerEmpty, true);
+  assert.equal(unconfirmed.data.generationStarted, true,
+    "the formerly permissive signals remain diagnostic but cannot acknowledge the report");
+  reportUserUnits = [reportUserAfter];
+  assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1,
-    "a later event wake retries the filled report and acknowledges it after the new user unit appears");
-  assert.equal(reportLog.some(entry => entry.event === "report_unconfirmed"), false);
+    "a new user message unit key confirms delivery and allows the bridge acknowledgement");
+  assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
+    "the failed early confirmation remains recorded for diagnosis");
   assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1, "a stale repeated wake after acknowledgement does not resend the report");
   assert.equal(reportLog.filter(entry => entry.event === "send_click").length, 1);

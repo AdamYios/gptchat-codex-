@@ -370,8 +370,7 @@
   function reportWasSent(report, reportId) {
     if (attemptedReport !== reportId) return false;
     const signals = reportConfirmationSignals(report, reportId);
-    return signals.newUserUnitKey || signals.latestUserContainsReport ||
-      (signals.composerEmpty && signals.generationStarted);
+    return signals.newUserUnitKey || signals.latestUserContainsReport;
   }
 
   function reportConfirmationSignals(report, reportId) {
