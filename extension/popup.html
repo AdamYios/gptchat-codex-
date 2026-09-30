@@ -9,7 +9,37 @@
 <body>
   <header class="app-header"><h1>ChatGPT ↔ Codex</h1></header>
   <main>
-    <section class="card current-task">
+    <section id="connectionConfigSection" class="card connection-config-section">
+      <h2>连接配置</h2>
+      <label>桥接连接信息
+        <input id="connectionCode" type="text" placeholder="端口|终端显示的令牌">
+      </label>
+      <label>指令卡片标题（正则）
+        <input id="title" value="给\s*Codex\s*的指令|Instructions?\s+for\s+Codex">
+      </label>
+      <label>可选：卡片 CSS 选择器
+        <input id="card" placeholder="留空则按标题和复制按钮识别">
+      </label>
+      <button id="bind" class="button primary full">绑定当前 ChatGPT 标签页</button>
+    </section>
+
+    <section id="startSection" class="card start-section" hidden>
+      <div class="section-heading">
+        <h2>选择起点</h2>
+        <span id="startConnectionStatus" class="connection-status"></span>
+      </div>
+      <div class="inline-controls">
+        <select id="startMode" aria-label="本次起点">
+          <option value="A">A · 网页现有指令卡片</option>
+          <option value="B">B · Codex 最新最终报告</option>
+        </select>
+        <button id="startSelected" class="button primary">开始</button>
+      </div>
+      <p class="hint">A 会重新执行当前卡片，确认不是旧指令；B 使用 Codex 最新报告。重选会替换待发报告。</p>
+      <div id="startTaskPhase" class="task-phase"></div>
+    </section>
+
+    <section id="currentTaskSection" class="card current-task" hidden>
       <div class="section-heading">
         <h2>当前任务</h2>
         <span id="connectionStatus" class="connection-status">正在检查连接</span>
@@ -18,8 +48,9 @@
       <div id="taskPhase" class="task-phase">读取任务状态…</div>
       <p id="autoTransferStatus" class="hint">读取自动传递状态…</p>
       <button id="autoTransferToggle" class="button primary full" disabled>暂停自动传递</button>
-      <p id="status" class="feedback" role="status" aria-live="polite"></p>
     </section>
+
+    <p id="status" class="feedback global-feedback" role="status" aria-live="polite"></p>
 
     <section class="card optimizer-card">
       <h2>长对话加速</h2>
@@ -43,26 +74,14 @@
       <summary>更多操作</summary>
       <div class="details-content">
         <section class="action-block">
-          <h3>选择本次起点</h3>
-          <div class="inline-controls">
-            <select id="startMode" aria-label="本次起点">
-              <option value="A">A · 网页现有指令卡片</option>
-              <option value="B">B · Codex 最新最终报告</option>
-            </select>
-            <button id="startSelected" class="button secondary">开始 / 重选</button>
-          </div>
-          <p class="hint">A 会重新执行当前卡片，确认不是旧指令；B 使用 Codex 最新报告。重选会替换待发报告。</p>
-        </section>
-
-        <section class="action-block">
           <h3>指令卡片</h3>
           <button id="viewCards" class="button secondary full">查看卡片</button>
           <div id="cardChoices" class="card-choices"></div>
         </section>
 
-        <section class="action-block">
+        <section id="reportRecoveryActions" class="action-block" hidden>
           <h3>报告恢复</h3>
-          <p class="hint">仅在报告发送未确认时使用。</p>
+          <p class="hint">仅在报告待确认时使用。</p>
           <div class="button-grid">
             <button id="recheck" class="button secondary">重新检查</button>
             <button id="confirmSent" class="button secondary">已发送，继续</button>
@@ -76,20 +95,6 @@
           <p class="hint">日志按 Codex 任务分别保存，不含令牌或消息正文。</p>
           <pre id="operationLog" class="operation-log"></pre>
         </section>
-
-        <details class="connection-config">
-          <summary>连接配置</summary>
-          <label>桥接连接信息
-            <input id="connectionCode" type="text" placeholder="端口|终端显示的令牌">
-          </label>
-          <label>指令卡片标题（正则）
-            <input id="title" value="给\s*Codex\s*的指令|Instructions?\s+for\s+Codex">
-          </label>
-          <label>可选：卡片 CSS 选择器
-            <input id="card" placeholder="留空则按标题和复制按钮识别">
-          </label>
-          <button id="bind" class="button secondary full">绑定当前 ChatGPT 标签页</button>
-        </details>
       </div>
     </details>
   </main>

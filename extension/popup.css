@@ -42,6 +42,7 @@ h3 { margin: 0 0 7px; font-size: 12px; font-weight: 650; }
 .task-phase { margin-top: 2px; color: #485467; }
 .hint { margin: 5px 0 0; color: #667184; font-size: 11px; }
 .feedback { margin: 6px 0 0; color: #4c5c70; font-size: 11px; white-space: pre-wrap; }
+.global-feedback:empty { display: none; }
 
 .button {
   min-height: 32px;

@@ -233,37 +233,48 @@ async function show() {
   const tab = await activeChatTab();
   const activeConnection = tab ? connections[String(tab.id)] : null;
   $("status").textContent = "";
+  const configSection = $("connectionConfigSection");
+  const startSection = $("startSection");
+  const currentTaskSection = $("currentTaskSection");
+  const recoveryActions = $("reportRecoveryActions");
+  configSection.hidden = false;
+  startSection.hidden = true;
+  currentTaskSection.hidden = true;
+  recoveryActions.hidden = true;
   const autoTransferButton = $("autoTransferToggle");
   const autoTransferStatus = $("autoTransferStatus");
-  autoTransferButton.hidden = !activeConnection;
   autoTransferButton.disabled = true;
+  $("startConnectionStatus").textContent = "";
+  $("startTaskPhase").textContent = "";
   if (!tab) {
-    $("connectionStatus").textContent = "未检测到 ChatGPT 标签页";
-    $("currentTaskName").textContent = "—";
-    $("taskPhase").textContent = "请切换到需要操作的 ChatGPT 标签页";
+    $("status").textContent = "请切换到 ChatGPT 标签页，再填写连接信息并绑定。";
   } else if (!activeConnection) {
-    $("connectionStatus").textContent = "未绑定";
-    $("currentTaskName").textContent = tab.title || `ChatGPT 标签页 ${tab.id}`;
-    $("taskPhase").textContent = "请在更多操作 → 连接配置中绑定桥接任务";
-  }
-  else {
-    $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${activeConnection.threadId || "任务"}`;
+    $("status").textContent = "当前标签页未绑定桥接任务；请填写连接信息并绑定。";
+  } else {
     try {
       const state = await bridgeApi("/state", "GET", undefined, activeConnection);
-      const paused = state.autoPaused === true;
-      $("connectionStatus").textContent = `已连接 · 端口 ${activeConnection.port}`;
-      $("taskPhase").textContent = phaseLabel(state);
-      autoTransferButton.textContent = paused ? "恢复自动传递" : "暂停自动传递";
-      autoTransferButton.disabled = false;
-      autoTransferStatus.textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
-        : "当前自动传递正在运行。";
+      configSection.hidden = true;
+      const startPhase = state.phase === "setup" || state.phase === "stopped";
+      if (startPhase) {
+        startSection.hidden = false;
+        $("startConnectionStatus").textContent = `${tab.title || "ChatGPT"} · Codex ${state.threadId || activeConnection.threadId || "任务"} · ${activeConnection.port}`;
+        $("startTaskPhase").textContent = phaseLabel(state);
+      } else {
+        currentTaskSection.hidden = false;
+        const paused = state.autoPaused === true;
+        $("connectionStatus").textContent = `已连接 · 端口 ${activeConnection.port}`;
+        $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${state.threadId || activeConnection.threadId || "任务"}`;
+        $("taskPhase").textContent = phaseLabel(state);
+        autoTransferButton.textContent = paused ? "恢复自动传递" : "暂停自动传递";
+        autoTransferButton.disabled = false;
+        autoTransferStatus.textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
+          : "当前自动传递正在运行。";
+      }
+      recoveryActions.hidden = state.phase !== "report_ready" || !state.reportId;
     } catch (error) {
-      $("connectionStatus").textContent = `已绑定 · 端口 ${activeConnection.port}，桥接无响应`;
-      $("taskPhase").textContent = String(error);
-      autoTransferStatus.textContent = "无法读取当前任务的自动传递状态";
+      $("status").textContent = `已保存的桥接连接无响应：${error}`;
     }
   }
-  if (!activeConnection) autoTransferStatus.textContent = "请切换到已绑定桥接任务的 ChatGPT 标签页";
 
   const list = $("connections");
   list.replaceChildren();
@@ -285,6 +296,42 @@ async function show() {
   }
   await refreshOptimizerStatus(tab);
 }
+
+let refreshingActiveTask = false;
+async function refreshActiveTaskState() {
+  if ($("currentTaskSection").hidden || refreshingActiveTask) return;
+  refreshingActiveTask = true;
+  try {
+    const tab = await activeChatTab();
+    const connections = await readConnections();
+    const connection = tab ? connections[String(tab.id)] : null;
+    if (!tab || !connection) {
+      await show();
+      return;
+    }
+    const state = await bridgeApi("/state", "GET", undefined, connection);
+    if (state.phase === "setup" || state.phase === "stopped") {
+      await show();
+      return;
+    }
+    if ($("currentTaskSection").hidden) return;
+    const paused = state.autoPaused === true;
+    $("connectionStatus").textContent = `已连接 · 端口 ${connection.port}`;
+    $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${state.threadId || connection.threadId || "任务"}`;
+    $("taskPhase").textContent = phaseLabel(state);
+    $("autoTransferToggle").textContent = paused ? "恢复自动传递" : "暂停自动传递";
+    $("autoTransferToggle").disabled = false;
+    $("autoTransferStatus").textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
+      : "当前自动传递正在运行。";
+    $("reportRecoveryActions").hidden = state.phase !== "report_ready" || !state.reportId;
+  } catch {
+    // A transient state request failure should not replace the user's current popup feedback.
+  } finally {
+    refreshingActiveTask = false;
+  }
+}
+
+setInterval(refreshActiveTaskState, 1500);
 
 $("autoTransferToggle").onclick = () => act(async tabId => {
   const connection = await connectionFor(tabId);
