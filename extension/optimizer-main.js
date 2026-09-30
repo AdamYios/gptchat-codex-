@@ -22,7 +22,11 @@
   let highestTurnIndexSeen = null;
   let lastUrl = location.href;
   let liveApplyTimer = null;
+  let liveApplyDueAt = 0;
+  let liveApplyReason = "";
   let liveObserver = null;
+  let anchoredScrollContainer = null;
+  let previousOverflowAnchor = "";
 
   const hiddenUnits = new Map();
   const recentRequests = [];
@@ -426,13 +430,18 @@
   function isPaginationSentinel(target) {
     if (!(target instanceof Element)) return false;
     const testId = target.getAttribute("data-testid") || "";
+    const ariaLabel = target.getAttribute("aria-label") || "";
+    const className = typeof target.className === "string" ? target.className : "";
+    const identity = `${testId} ${ariaLabel} ${className}`.toLowerCase();
+    const isBoundary =
+      (identity.includes("conversation") || identity.includes("history")) &&
+      (identity.includes("pagination") || identity.includes("sentinel") ||
+        identity.includes("spacer"));
 
-    if (testId.includes("conversation-pagination-sentinel")) return true;
-
-    return (
-      testId.includes("pagination") &&
-      (testId.includes("conversation") || testId.includes("history"))
-    );
+    if (isBoundary && target.getAttribute("data-cgo-history-boundary") !== "true") {
+      target.setAttribute("data-cgo-history-boundary", "true");
+    }
+    return isBoundary;
   }
 
   if (typeof NativeIntersectionObserver === "function") {
@@ -442,10 +451,7 @@
           const filtered = [];
 
           for (const entry of entries) {
-            const block =
-              settings.enabled &&
-              entry.isIntersecting &&
-              isPaginationSentinel(entry.target);
+            const block = settings.enabled && isPaginationSentinel(entry.target);
 
             if (block) {
               stats.blockedPaginationEntries += 1;
@@ -465,10 +471,7 @@
 
       takeRecords() {
         return this._observer.takeRecords().filter(entry => {
-          const block =
-            settings.enabled &&
-            entry.isIntersecting &&
-            isPaginationSentinel(entry.target);
+          const block = settings.enabled && isPaginationSentinel(entry.target);
 
           if (block) stats.blockedPaginationEntries += 1;
           return !block;
@@ -504,8 +507,10 @@
 
     const apply = () => {
       let style = document.getElementById(styleId);
+      const needsStyle = settings.renderOptimize ||
+        (settings.enabled && settings.liveWindow);
 
-      if (!settings.renderOptimize) {
+      if (!needsStyle) {
         style?.remove();
         return;
       }
@@ -513,23 +518,28 @@
       if (!style) {
         style = document.createElement("style");
         style.id = styleId;
-        style.textContent = `
-          [data-content-search-unit-key] {
-            content-visibility: auto;
-            contain-intrinsic-size: auto 700px;
-          }
-
-          [data-testid*="conversation-pagination-sentinel"],
-          [data-testid*="history-pagination-sentinel"] {
-            display: none !important;
-          }
-
-          [data-cgo-live-hidden="true"] {
-            display: none !important;
-          }
-        `;
         (document.head || document.documentElement).appendChild(style);
       }
+      style.textContent = `${settings.renderOptimize ? `
+        [data-content-search-unit-key] {
+          content-visibility: auto;
+          contain-intrinsic-size: auto 700px;
+        }
+      ` : ""}${settings.enabled && settings.liveWindow ? `
+        [data-testid*="conversation-pagination-sentinel"],
+        [data-testid*="history-pagination-sentinel"],
+        [data-cgo-history-boundary="true"] {
+          display: none !important;
+          height: 0 !important;
+          min-height: 0 !important;
+          margin: 0 !important;
+          padding: 0 !important;
+        }
+
+        [data-cgo-live-hidden="true"] {
+          display: none !important;
+        }
+      ` : ""}`;
     };
 
     if (document.documentElement) apply();
@@ -600,40 +610,91 @@
     return null;
   }
 
-  function rememberUnit(el) {
-    if (hiddenUnits.has(el)) return;
+  function layoutTargetForUnit(el) {
+    return el.closest?.('[data-testid*="conversation-turn"]') || el;
+  }
 
-    hiddenUnits.set(el, {
-      display: el.style.display,
-      ariaHidden: el.getAttribute("aria-hidden")
+  function rememberUnit(el) {
+    const target = layoutTargetForUnit(el);
+    if (hiddenUnits.has(target)) return;
+
+    hiddenUnits.set(target, {
+      display: target.style.display,
+      ariaHidden: target.getAttribute("aria-hidden")
     });
   }
 
   function hideUnit(el) {
-    rememberUnit(el);
-    el.style.display = "none";
-    el.setAttribute("data-cgo-live-hidden", "true");
-    el.setAttribute("aria-hidden", "true");
+    const target = layoutTargetForUnit(el);
+    rememberUnit(target);
+    target.style.display = "none";
+    target.setAttribute("data-cgo-live-hidden", "true");
+    target.setAttribute("aria-hidden", "true");
   }
 
   function showUnit(el) {
-    const previous = hiddenUnits.get(el);
+    const target = layoutTargetForUnit(el);
+    const previous = hiddenUnits.get(target);
 
     if (!previous) {
-      el.removeAttribute("data-cgo-live-hidden");
+      target.removeAttribute("data-cgo-live-hidden");
       return;
     }
 
-    el.style.display = previous.display;
+    target.style.display = previous.display;
 
     if (previous.ariaHidden === null) {
-      el.removeAttribute("aria-hidden");
+      target.removeAttribute("aria-hidden");
     } else {
-      el.setAttribute("aria-hidden", previous.ariaHidden);
+      target.setAttribute("aria-hidden", previous.ariaHidden);
     }
 
-    el.removeAttribute("data-cgo-live-hidden");
-    hiddenUnits.delete(el);
+    target.removeAttribute("data-cgo-live-hidden");
+    hiddenUnits.delete(target);
+  }
+
+  function applyUnitVisibility(units, shouldHideUnit) {
+    const groups = new Map();
+    units.forEach((el, index) => {
+      const target = layoutTargetForUnit(el);
+      if (!groups.has(target)) groups.set(target, []);
+      groups.get(target).push({el, hide: shouldHideUnit(el, index)});
+    });
+
+    let hiddenCount = 0;
+    let visibleUserRounds = 0;
+    for (const [target, entries] of groups) {
+      const hide = entries.every(entry => entry.hide);
+      if (hide) {
+        hideUnit(target);
+        hiddenCount += entries.length;
+      } else {
+        showUnit(target);
+        visibleUserRounds += entries.filter(entry => unitRole(entry.el) === "user").length;
+      }
+    }
+    return {hiddenCount, visibleUserRounds};
+  }
+
+  function disableScrollAnchoring(container) {
+    if (!container) return;
+    if (anchoredScrollContainer && anchoredScrollContainer !== container) {
+      restoreScrollAnchoring();
+    }
+    if (!anchoredScrollContainer) {
+      anchoredScrollContainer = container;
+      previousOverflowAnchor = container.style.overflowAnchor || "";
+    }
+    container.style.overflowAnchor = "none";
+  }
+
+  function restoreScrollAnchoring() {
+    if (!anchoredScrollContainer) return;
+    if (anchoredScrollContainer.isConnected) {
+      anchoredScrollContainer.style.overflowAnchor = previousOverflowAnchor;
+    }
+    anchoredScrollContainer = null;
+    previousOverflowAnchor = "";
   }
 
   function restoreAllUnits() {
@@ -642,20 +703,20 @@
       else hiddenUnits.delete(el);
     }
     stats.liveHiddenUnits = 0;
+    restoreScrollAnchoring();
   }
 
   function isNearBottom(container) {
     if (!container) return false;
-
-    return (
-      container.scrollHeight -
-      container.scrollTop -
-      container.clientHeight
-    ) < 320;
+    const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    if (maxScrollTop <= 1) return true;
+    return container.scrollTop > 0 && maxScrollTop - container.scrollTop < 320;
   }
 
   function applyLiveWindow(reason = "mutation") {
     liveApplyTimer = null;
+    liveApplyDueAt = 0;
+    liveApplyReason = "";
     stats.liveScans += 1;
     stats.liveLastReason = reason;
 
@@ -677,6 +738,8 @@
       .filter(item => Number.isInteger(item.index));
 
     const scroll = getThreadScrollContainer();
+    if (scroll) disableScrollAnchoring(scroll);
+    else restoreScrollAnchoring();
     const stayAtBottom = isNearBottom(scroll);
     let hiddenCount = 0;
     let visibleUserRounds = 0;
@@ -690,39 +753,26 @@
       }
 
       cutoffTurnIndex = highestTurnIndexSeen - keep + 1;
-
-      for (const el of units) {
+      const visibility = applyUnitVisibility(units, el => {
         const index = turnIndexOf(el);
-
-        if (Number.isInteger(index) && index < cutoffTurnIndex) {
-          hideUnit(el);
-          hiddenCount += 1;
-        } else {
-          showUnit(el);
-          if (unitRole(el) === "user") visibleUserRounds += 1;
-        }
-      }
-
-      visibleUserRounds = Math.min(keep, visibleUserRounds);
+        return Number.isInteger(index) && index < cutoffTurnIndex;
+      });
+      hiddenCount = visibility.hiddenCount;
+      visibleUserRounds = Math.min(keep, visibility.visibleUserRounds);
     } else if (userUnits.length > keep) {
       const cutoffUser = userUnits[userUnits.length - keep];
       const cutoffIndex = units.indexOf(cutoffUser);
 
       if (cutoffIndex >= 0) {
-        for (let i = 0; i < units.length; i++) {
-          if (i < cutoffIndex) {
-            hideUnit(units[i]);
-            hiddenCount += 1;
-          } else {
-            showUnit(units[i]);
-          }
-        }
+        const visibility = applyUnitVisibility(units, (_el, index) => index < cutoffIndex);
+        hiddenCount = visibility.hiddenCount;
+        visibleUserRounds = visibility.visibleUserRounds;
       }
 
-      visibleUserRounds = keep;
+      visibleUserRounds = Math.min(keep, visibleUserRounds);
     } else {
-      for (const el of units) showUnit(el);
-      visibleUserRounds = userUnits.length;
+      const visibility = applyUnitVisibility(units, () => false);
+      visibleUserRounds = visibility.visibleUserRounds;
     }
 
     for (const el of [...hiddenUnits.keys()]) {
@@ -744,8 +794,12 @@
   }
 
   function scheduleLiveWindow(reason = "mutation", delay = 100) {
+    const dueAt = Date.now() + Math.max(0, delay);
+    if (liveApplyTimer !== null && liveApplyDueAt <= dueAt) return;
     if (liveApplyTimer !== null) clearTimeout(liveApplyTimer);
-    liveApplyTimer = setTimeout(() => applyLiveWindow(reason), delay);
+    liveApplyDueAt = dueAt;
+    liveApplyReason = reason;
+    liveApplyTimer = setTimeout(() => applyLiveWindow(liveApplyReason), Math.max(0, dueAt - Date.now()));
   }
 
   function startLiveObserver() {
@@ -844,7 +898,7 @@
       toolUnits: roles.filter(role => role === "tool").length,
       unknownUnits: roles.filter(role => !role).length,
       hiddenUnits: units.filter(
-        el => el.getAttribute("data-cgo-live-hidden") === "true"
+        el => layoutTargetForUnit(el).getAttribute("data-cgo-live-hidden") === "true"
       ).length,
       highestTurnIndexSeen,
       cutoffTurnIndex: stats.liveCutoffTurnIndex,
