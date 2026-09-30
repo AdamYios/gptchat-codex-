@@ -35,7 +35,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  tickInterval = setInterval\(tick, 2000\);\s*tick\(\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -65,7 +65,7 @@ const context = {sessionStorage: {
   }, console};
 vm.runInNewContext(source, context, {filename: file});
 
-const message = new Element("div");
+const message = new Element("div", "", {"data-content-search-unit-key": "thread:latest:assistant"});
 message.append(new Element("p", "所以我建议先检查现有 schema。"));
 const card = message.append(new Element("div"));
 const header = card.append(new Element("div"));
@@ -135,6 +135,26 @@ assert.equal(context.reportWasSentForTest("完整报告正文", 1), false);
 assert.equal(context.reportWasSentForTest("完整报告正文", 2), false);
 users.push({innerText: "以下是 Codex 上一轮的最终报告。 [长消息已折叠]"});
 assert.equal(context.reportWasSentForTest("完整报告正文", 1), false);
+const currentAssistantUnit = new Element("div", "当前助手消息", {"data-content-search-unit-key": "thread:assistant"});
+const legacyAssistantMessage = new Element("div", "旧标记助手消息", {"data-message-author-role": "assistant"});
+const currentUserUnit = new Element("div", "当前用户消息", {"data-content-search-unit-key": "thread:user"});
+const legacyUserMessage = new Element("div", "旧标记用户消息", {"data-message-author-role": "user"});
+context.document.querySelectorAll = selector => {
+  if (selector === '[data-content-search-unit-key$=":assistant"]') return [currentAssistantUnit];
+  if (selector === '[data-content-search-unit-key$=":user"]') return [currentUserUnit];
+  if (selector === '[data-message-author-role="assistant"]') return [legacyAssistantMessage];
+  if (selector === '[data-message-author-role="user"]') return [legacyUserMessage];
+  return [];
+};
+assert.equal(context.assistantMessagesForTest()[0], currentAssistantUnit);
+assert.equal(context.userMessagesForTest()[0], currentUserUnit);
+context.document.querySelectorAll = selector => {
+  if (selector === '[data-message-author-role="assistant"]') return [legacyAssistantMessage];
+  if (selector === '[data-message-author-role="user"]') return [legacyUserMessage];
+  return [];
+};
+assert.equal(context.assistantMessagesForTest()[0], legacyAssistantMessage);
+assert.equal(context.userMessagesForTest()[0], legacyUserMessage);
 const genericTurn = new Element("article", "用户消息");
 context.document.querySelectorAll = selector => {
   if (selector === '[data-message-author-role="user"]') return users;
@@ -159,7 +179,11 @@ mainForReport.textContent += `\n折叠消息的 DOM 正文：${repeatedReport}`;
 assert.equal(context.reportWasSentForTest(repeatedReport, 1), true);
 context.document = {
   querySelector: selector => selector === "main" ? message : null,
-  querySelectorAll: selector => selector === "button" ? [header.children[1]] : [],
+  querySelectorAll: selector => {
+    if (selector === '[data-content-search-unit-key$=":assistant"]') return [message];
+    if (selector === "[data-content-search-unit-key]") return [message];
+    return selector === "button" ? [header.children[1]] : [];
+  },
   getElementById: () => null,
   createElement: () => ({style: {}, dataset: {}, textContent: ""}),
   body: {appendChild: () => {}}
@@ -177,11 +201,47 @@ context.document = {
   await context.tickForTest();
   assert.match(submitted, /继续修 Stage 5A3b/);
   assert.equal(logged.filter(entry => entry.event === "card_submit").length, 1);
+  const outOfUnitMain = new Element("main");
+  const staleUnit = outOfUnitMain.append(new Element("div", "", {"data-content-search-unit-key": "opaque:older"}));
+  const latestUnit = outOfUnitMain.append(new Element("div", "", {"data-content-search-unit-key": "opaque:latest"}));
+  const addStrictCard = (unit, instruction) => {
+    const card = unit.append(new Element("div"));
+    card.append(new Element("span", "给 Codex 的指令"));
+    card.append(new Element("button", "", {"aria-label": "复制"}));
+    card.append(new Element("p", instruction));
+  };
+  addStrictCard(staleUnit, "旧单元中的卡片不应该参与自动扫描。");
+  addStrictCard(latestUnit, "无角色标记时只扫描最新可见单元里的卡片。");
+  context.document = {
+    querySelector: selector => selector === "main" ? outOfUnitMain : null,
+    querySelectorAll: selector => selector === "[data-content-search-unit-key]" ? [staleUnit, latestUnit] : [],
+    getElementById: () => null,
+    createElement: () => ({style: {}, dataset: {}, textContent: ""}),
+    body: {appendChild: () => {}}
+  };
+  const beforeUnitFallback = submitted;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.notEqual(submitted, beforeUnitFallback);
+  assert.match(submitted, /只扫描最新可见单元/);
+  assert.doesNotMatch(submitted, /旧单元/);
   bound = false;
   const beforeUnboundTick = stateRequests;
   await context.tickForTest();
   assert.equal(stateRequests, beforeUnboundTick);
   bound = true;
+  context.document = {
+    querySelector: selector => selector === "main" ? message : null,
+    querySelectorAll: selector => {
+      if (selector === '[data-content-search-unit-key$=":assistant"]') return [message];
+      if (selector === "[data-content-search-unit-key]") return [message];
+      return selector === "button" ? message.querySelectorAll("button") : [];
+    },
+    getElementById: () => null,
+    createElement: () => ({style: {}, dataset: {}, textContent: ""}),
+    body: {appendChild: () => {}}
+  };
   body.children[0].ownText = "当前尚未处理的新指令卡片。";
   const request = value => new Promise(resolve => contentMessageListener(value, null, resolve));
   const choices = await request({type: "bridgeCardChoices"});
@@ -193,23 +253,26 @@ context.document = {
   assert.match(changed.error, /指令卡片已变化/);
   assert.equal(submitted, previousSubmission);
 
-  // Current ChatUI may expose neither assistant-role markers nor the strict
-  // configured title. The manual viewer must extract only the titled card,
-  // even when the nearest message-level Copy control makes its parent too broad.
+  // With missing role markers, manual viewing searches the latest visible
+  // content-search unit instead of the whole conversation in MAIN.
   const markerlessMain = new Element("main");
-  const addLooseCard = bodyText => {
-    const response = markerlessMain.append(new Element("div"));
+  const addLooseCard = (unit, bodyText) => {
+    const response = unit.append(new Element("div"));
     response.append(new Element("p", "这段对话背景不能混进发送给 Codex 的候选内容。"));
     const block = response.append(new Element("div"));
     block.append(new Element("span", "Codex 指令卡"));
     block.append(new Element("p", bodyText));
     response.append(new Element("button", "", {"aria-label": "复制"}));
   };
-  addLooseCard("这是已经处理过的旧任务指令内容，不应该继续显示给当前任务。");
-  addLooseCard("这是最新对话里的待确认指令内容，查看卡片时应该能看到它。");
+  const oldUnit = markerlessMain.append(new Element("div", "", {"data-content-search-unit-key": "opaque:older-unit"}));
+  const latestManualUnit = markerlessMain.append(new Element("div", "", {"data-content-search-unit-key": "opaque:latest-unit"}));
+  addLooseCard(oldUnit, "这是已经处理过的旧任务指令内容，不应该继续显示给当前任务。");
+  addLooseCard(latestManualUnit, "这是最新对话里的待确认指令内容，查看卡片时应该能看到它。");
   context.document = {
     querySelector: selector => selector === "main" ? markerlessMain : null,
-    querySelectorAll: selector => selector === "button" ? markerlessMain.querySelectorAll("button") : [],
+    querySelectorAll: selector => selector === "[data-content-search-unit-key]"
+      ? [oldUnit, latestManualUnit]
+      : selector === "button" ? markerlessMain.querySelectorAll("button") : [],
     getElementById: () => null,
     createElement: () => ({style: {}, dataset: {}, textContent: ""}),
     body: {appendChild: () => {}}
@@ -223,9 +286,9 @@ context.document = {
   assert.doesNotMatch(markerlessChoices.data[0].preview, /对话背景/);
   assert.doesNotMatch(markerlessChoices.data[0].preview, /已经处理过的旧任务/);
   const viewLog = logged.filter(entry => entry.event === "card_choices_viewed").at(-1);
-  assert.equal(viewLog.data.method, "main_manual_loose");
+  assert.equal(viewLog.data.method, "content_search_unit_manual_loose");
   assert.equal(viewLog.data.strictChoiceCount, 0);
-  assert.equal(viewLog.data.manualCandidateCount, 2);
+  assert.equal(viewLog.data.manualCandidateCount, 1);
   assert.equal(viewLog.data.relaxedChoiceCount, 1);
   assert.equal(viewLog.data.latestOnly, true);
   const manuallyChosen = await request({type: "bridgeChooseCard", index: 0, key: markerlessChoices.data[0].key});
@@ -237,16 +300,24 @@ context.document = {
   const unmarkedResponse = new Element("div");
   unmarkedResponse.append(new Element("p", "没有卡片标题的长回复正文，不能作为整条消息发给 Codex。"));
   unmarkedResponse.append(new Element("button", "", {"aria-label": "复制"}));
-  const unmarkedMain = new Element("main").append(unmarkedResponse);
+  const unmarkedUnit = new Element("div", "", {"data-content-search-unit-key": "opaque:unmarked"}).append(unmarkedResponse);
+  const unmarkedMain = new Element("main").append(unmarkedUnit);
   context.document.querySelector = selector => selector === "main" ? unmarkedMain : null;
+  context.document.querySelectorAll = selector => selector === "[data-content-search-unit-key]"
+    ? [unmarkedUnit]
+    : selector === "button" ? unmarkedMain.querySelectorAll("button") : [];
   const unmarkedChoices = await request({type: "bridgeCardChoices"});
   assert.deepEqual(Array.from(unmarkedChoices.data), []);
   const codeResponse = new Element("div");
   codeResponse.append(new Element("p", "回复里的普通说明不能一起发送。"));
   codeResponse.append(new Element("pre", "只发送这个代码块里的候选指令正文。"));
   codeResponse.append(new Element("button", "", {"aria-label": "复制代码"}));
-  const codeMain = new Element("main").append(codeResponse);
+  const codeUnit = new Element("div", "", {"data-content-search-unit-key": "opaque:code"}).append(codeResponse);
+  const codeMain = new Element("main").append(codeUnit);
   context.document.querySelector = selector => selector === "main" ? codeMain : null;
+  context.document.querySelectorAll = selector => selector === "[data-content-search-unit-key]"
+    ? [codeUnit]
+    : selector === "button" ? codeMain.querySelectorAll("button") : [];
   const codeChoices = await request({type: "bridgeCardChoices"});
   assert.equal(codeChoices.data.length, 1);
   assert.match(codeChoices.data[0].preview, /只发送这个代码块/);
@@ -259,5 +330,5 @@ context.document = {
   assert.match(bar.textContent, /连接检查/);
   context.stopInvalidatedForTest();
   assert.match(bar.textContent, /请刷新当前 ChatGPT 标签页/);
-  console.log("Card extraction and marker-free main fallback OK");
+  console.log("Card extraction and content-search-unit fallback OK");
 })().catch(error => { console.error(error); process.exitCode = 1; });

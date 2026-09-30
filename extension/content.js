@@ -127,6 +127,9 @@
   }
 
   function assistantMessages() {
+    const current = [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')]
+      .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
+    if (current.length) return current;
     const direct = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
       .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
     if (direct.length) return direct;
@@ -308,7 +311,14 @@
   }
 
   function userMessages() {
+    const current = [...document.querySelectorAll('[data-content-search-unit-key$=":user"]')];
+    if (current.length) return current;
     return [...document.querySelectorAll('[data-message-author-role="user"]')];
+  }
+
+  function visibleContentSearchUnits() {
+    return [...document.querySelectorAll("[data-content-search-unit-key]")]
+      .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
   }
 
   function latestUserContains(report) {
@@ -394,18 +404,21 @@
 
   function rememberVisibleCards(title, selector) {
     if (assistantMessages().length) return;
-    const main = document.querySelector("main");
-    if (!main) return;
-    const found = extractCard(main, title, selector);
-    for (const entry of cardEntries(found)) seenCards.add(cardKey(entry.instruction));
+    for (const unit of visibleContentSearchUnits()) {
+      const found = extractCard(unit, title, selector);
+      for (const entry of cardEntries(found)) seenCards.add(cardKey(entry.instruction));
+    }
     sessionStorage.setItem("bridge.seenCards", JSON.stringify([...seenCards]));
   }
 
   function currentAssistantSignature() {
     const messages = assistantMessages();
     if (messages.length) return `${messages.length}:${(messages.at(-1).innerText || "").trim()}`;
-    const main = document.querySelector("main");
-    return main ? `main:${normalize(main.innerText || main.textContent || "")}` : "";
+    const units = visibleContentSearchUnits();
+    const latest = units.at(-1);
+    return latest
+      ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(latest.innerText || latest.textContent || "")}`
+      : "";
   }
 
   function sendButton(editor) {
@@ -545,20 +558,17 @@
       if (isGenerating()) throw new Error("ChatGPT 当前回复仍在生成，请等待停止生成按钮消失");
       const title = new RegExp(config.title || DEFAULT_TITLE.source, "i");
       const roots = assistantMessages();
-      const mainFallback = roots.length === 0;
-      if (!roots.length) {
-        const main = document.querySelector("main");
-        if (main) roots.push(main);
-      }
+      const unitFallback = roots.length === 0;
+      if (unitFallback) roots.push(...visibleContentSearchUnits());
       if (!roots.length) throw new Error("找不到 ChatGPT 内容区域；页面结构可能已更新");
 
-      // Viewing is scoped to the latest assistant turn when author markers exist.
+      // Search only the latest message unit, whether it was found by role or content key.
       const strictChoices = [];
       const addUnique = (list, entry) => {
         if (entry?.instruction && !list.some(item => normalize(item.instruction) === normalize(entry.instruction)))
           list.push(entry);
       };
-      const candidateRoots = mainFallback ? roots : roots.slice(-1);
+      const candidateRoots = roots.slice(-1);
       for (const root of candidateRoots) {
         const found = extractCard(root, title, config.card || "");
         if (found.choices?.length) for (const choice of found.choices) addUnique(strictChoices, choice);
@@ -570,26 +580,16 @@
       let choices = strictChoices;
       const manualFallbackUsed = !strictChoices.length;
       if (manualFallbackUsed) {
-        // ChatUI no longer consistently marks assistant messages. The manual
-        // viewer still needs to search MAIN for likely cards so the user can
-        // inspect and confirm them; this relaxed path is never auto-submitted.
+        // ChatUI may omit assistant-role markers. Search the latest visible
+        // content unit for likely cards; this relaxed path is never auto-submitted.
         const looseTitle = new RegExp(`(?:${config.title || DEFAULT_TITLE.source}|Codex\\s*指令卡)`, "i");
         choices = [];
         for (const root of candidateRoots)
           for (const choice of looseCardEntries(root, looseTitle)) addUnique(choices, choice);
       }
       const manualCandidateCount = choices.length;
-      let scopedLatestOnly = false;
+      let scopedLatestOnly = unitFallback && roots.length > 0;
       choices = choices.filter(choice => !seenCards.has(cardKey(choice.instruction)));
-      if (mainFallback) {
-        // MAIN contains the whole conversation. Without message boundaries,
-        // expose only the last unseen candidate so old cards are not offered
-        // as if they belonged to the latest reply.
-        if (choices.length > 1) {
-          choices = [choices.at(-1)];
-          scopedLatestOnly = true;
-        }
-      }
       if (selectedIndex === null) {
         record("card_choices_viewed", {cardChoices: choices.length,
           strictChoiceCount: strictChoices.length,
@@ -597,8 +597,8 @@
           relaxedChoiceCount: choices.filter(choice => choice.relaxed).length,
           latestOnly: scopedLatestOnly,
           latestCardLength: choices.at(-1)?.instruction.length || 0,
-          method: mainFallback
-            ? (manualFallbackUsed ? "main_manual_loose" : "main_latest")
+          method: unitFallback
+            ? (manualFallbackUsed ? "content_search_unit_manual_loose" : "content_search_unit_latest")
             : (manualFallbackUsed ? "assistant_manual_loose" : "assistant_role")});
         return choices.map(({instruction, preview, relaxed}, index) =>
           ({index, key: cardKey(instruction), preview, relaxed: !!relaxed,
@@ -693,8 +693,9 @@
         await sendReport(state.report, state.reportId); return;
       }
       const messages = assistantMessages();
-      const mainFallback = messages.length ? null : document.querySelector("main");
-      const latest = messages.at(-1) || mainFallback;
+      const unitFallback = messages.length === 0;
+      const units = unitFallback ? visibleContentSearchUnits() : [];
+      const latest = messages.at(-1) || units.at(-1);
       if (!latest) {
         record("page_wait", {reason: "no_content"}, "page_wait:no_content");
         status("等待 ChatGPT 内容区域出现"); return;
@@ -705,34 +706,40 @@
       }
       const text = (latest.innerText || "").trim();
       if (!text) { status("等待 ChatGPT 回复内容"); return; }
-      const signature = mainFallback ? `main:${normalize(text)}` : `${messages.length}:${text}`;
+      const signature = unitFallback
+        ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(text)}`
+        : `${messages.length}:${text}`;
       if (signature !== lastSignature) { lastSignature = signature; stableSince = Date.now(); status("等待页面内容稳定"); return; }
       if (Date.now() - stableSince < 1800) { status("等待页面内容稳定"); return; }
       if (signature === lastSubmitted) { status("已处理当前指令，等待 ChatGPT 新回复"); return; }
-      if (!mainFallback && STOP.test(text)) {
+      if (!unitFallback && STOP.test(text)) {
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
         status("ChatGPT 表示任务完成或需要人工处理，已停止"); return;
       }
       const title = new RegExp(config.title || DEFAULT_TITLE.source, "i");
       let found = extractCard(latest, title, config.card || "");
       let fallbackCandidateCount = 0;
-      if (mainFallback) {
-        // New ChatUI builds may omit author-role markers. In that case MAIN is
-        // the only usable root. Older cards are baselined before each report
-        // is sent; select the last unseen, strict card match in DOM order.
+      if (unitFallback) {
         const fresh = cardEntries(found).filter(entry => !seenCards.has(cardKey(entry.instruction)));
         fallbackCandidateCount = fresh.length;
-        found = fresh.length
-          ? {instruction: fresh.at(-1).instruction}
-          : {error: "未找到新的严格匹配指令卡片"};
+        if (found.instruction) {
+          if (seenCards.has(cardKey(found.instruction)))
+            found = {error: "未找到新的严格匹配指令卡片"};
+        } else if (found.choices?.length && fresh.length === 1) {
+          found = {instruction: fresh[0].instruction};
+        } else if (found.choices?.length && fresh.length > 1) {
+          found = {choices: fresh};
+        } else {
+          found = {error: "未找到新的严格匹配指令卡片"};
+        }
       }
       record("card_scan", {cardChoices: found.choices?.length || (found.instruction ? 1 : 0),
         instructionLength: found.instruction?.length || 0,
         latestCardLength: found.choices?.at(-1)?.instruction.length || found.instruction?.length || 0,
         fallbackCandidateCount,
-        method: mainFallback ? "main" : "assistant_role",
+        method: unitFallback ? "content_search_unit" : "assistant_role",
         reason: found.instruction ? "matched" : "not_matched"}, `card_scan:${signature}`);
-      if (mainFallback) {
+      if (unitFallback) {
         if (!found.instruction) {
           status("等待当前回复中出现新的指令卡片");
           return;
@@ -757,7 +764,7 @@
       record("card_submit", {instructionLength: found.instruction.length});
       lastSubmitted = signature;
       sessionStorage.setItem("bridge.lastSubmitted", signature);
-      status(mainFallback
+      status(unitFallback
         ? "已自动识别并发送最新的未处理指令卡片"
         : "指令卡片已送往 Codex");
     } catch (error) {
