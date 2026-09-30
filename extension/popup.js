@@ -208,9 +208,11 @@ function makeConnectionRow(tabId, connection, title, stateLabel) {
   const label = document.createElement("div");
   label.textContent = `${title} · Codex ${connection.threadId || "任务"} · 端口 ${connection.port}\n${stateLabel}`;
   const focus = document.createElement("button");
+  focus.className = "button secondary";
   focus.textContent = "切换到此标签页";
   focus.onclick = () => chrome.tabs.update(Number(tabId), {active: true});
   const unbind = document.createElement("button");
+  unbind.className = "button secondary";
   unbind.textContent = "解除绑定";
   unbind.onclick = async () => {
     try { await unbindTab(Number(tabId)); await show(); }
@@ -224,24 +226,35 @@ async function show() {
   const connections = await readConnections();
   const tab = await activeChatTab();
   const activeConnection = tab ? connections[String(tab.id)] : null;
+  $("status").textContent = "";
   const autoTransferButton = $("autoTransferToggle");
   const autoTransferStatus = $("autoTransferStatus");
   autoTransferButton.hidden = !activeConnection;
   autoTransferButton.disabled = true;
-  if (!tab) $("status").textContent = "请切换到需要操作的 ChatGPT 标签页";
-  else if (!activeConnection) $("status").textContent = `当前标签页 ${tab.id} 尚未绑定桥接任务`;
+  if (!tab) {
+    $("connectionStatus").textContent = "未检测到 ChatGPT 标签页";
+    $("currentTaskName").textContent = "—";
+    $("taskPhase").textContent = "请切换到需要操作的 ChatGPT 标签页";
+  } else if (!activeConnection) {
+    $("connectionStatus").textContent = "未绑定";
+    $("currentTaskName").textContent = tab.title || `ChatGPT 标签页 ${tab.id}`;
+    $("taskPhase").textContent = "请在更多操作 → 连接配置中绑定桥接任务";
+  }
   else {
+    $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${activeConnection.threadId || "任务"}`;
     try {
       const state = await bridgeApi("/state", "GET", undefined, activeConnection);
       const paused = state.autoPaused === true;
+      $("connectionStatus").textContent = `已连接 · 端口 ${activeConnection.port}`;
+      $("taskPhase").textContent = phaseLabel(state);
       autoTransferButton.textContent = paused ? "恢复自动传递" : "暂停自动传递";
       autoTransferButton.disabled = false;
       autoTransferStatus.textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
         : "当前自动传递正在运行。";
-      $("status").textContent = `当前标签页 ${tab.id} 已绑定（Codex 任务 ${activeConnection.threadId || "未知"}，端口 ${activeConnection.port}）\n${phaseLabel(state)}`;
     } catch (error) {
+      $("connectionStatus").textContent = `已绑定 · 端口 ${activeConnection.port}，桥接无响应`;
+      $("taskPhase").textContent = String(error);
       autoTransferStatus.textContent = "无法读取当前任务的自动传递状态";
-      $("status").textContent = `当前标签页 ${tab.id} 已绑定（端口 ${activeConnection.port}）\n${error}`;
     }
   }
   if (!activeConnection) autoTransferStatus.textContent = "请切换到已绑定桥接任务的 ChatGPT 标签页";
@@ -359,13 +372,6 @@ $("bind").onclick = async () => {
   }
 };
 
-$("unbind").onclick = async () => {
-  const tab = await activeChatTab();
-  if (!tab) { $("status").textContent = "请切换到目标 ChatGPT 标签页"; return; }
-  try { await unbindTab(tab.id); await show(); }
-  catch (error) { $("status").textContent = String(error); }
-};
-
 $("viewLog").onclick = () => act(async tabId => {
   const connection = await connectionFor(tabId);
   const result = await bridgeApi("/log", "GET", undefined, connection);
@@ -373,14 +379,16 @@ $("viewLog").onclick = () => act(async tabId => {
   return `最近 ${result.records.length} 条操作记录，文件：${result.path}`;
 }, "view_log");
 
-for (const [id, mode] of [["startA", "A"], ["startB", "B"]]) {
-  $(id).onclick = () => act(async tabId => {
+$("startSelected").onclick = () => {
+  const mode = $("startMode").value === "B" ? "B" : "A";
+  const operation = mode === "A" ? "startA" : "startB";
+  return act(async tabId => {
     const connection = await connectionFor(tabId);
     if (!connection) throw new Error("当前标签页尚未绑定桥接任务");
     await ensureContent(tabId);
     await bridgeApi("/start", "POST", {mode}, connection);
-  }, id);
-}
+  }, operation);
+};
 
 $("viewCards").onclick = () => act(async tabId => {
   const connection = await connectionFor(tabId);
@@ -392,7 +400,7 @@ $("viewCards").onclick = () => act(async tabId => {
   container.replaceChildren();
   for (const choice of reply.data) {
     const button = document.createElement("button");
-    button.className = "wide";
+    button.className = "button secondary wide";
     button.textContent = `发送第 ${choice.index + 1} 张${choice.relaxed ? "（宽松匹配，请确认）" : ""}：${choice.preview}`;
     button.onclick = () => act(async currentTabId => {
       const result = await chrome.tabs.sendMessage(currentTabId,

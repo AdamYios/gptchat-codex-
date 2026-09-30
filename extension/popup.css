@@ -1,0 +1,100 @@
+:root {
+  color-scheme: light;
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #202735;
+  background: #f3f5f8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 380px;
+  max-height: 620px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 12px;
+}
+
+.app-header { padding: 0 2px 8px; }
+h1 { margin: 0; font-size: 16px; font-weight: 650; }
+h2 { margin: 0; font-size: 14px; font-weight: 650; }
+h3 { margin: 0 0 7px; font-size: 12px; font-weight: 650; }
+
+.card {
+  margin: 0 0 9px;
+  padding: 11px;
+  border: 1px solid #e0e4eb;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(18 30 50 / 4%);
+}
+
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.connection-status {
+  max-width: 190px;
+  overflow: hidden;
+  color: #526071;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-name { margin-top: 7px; font-weight: 600; overflow-wrap: anywhere; }
+.task-phase { margin-top: 2px; color: #485467; }
+.hint { margin: 5px 0 0; color: #667184; font-size: 11px; }
+.feedback { margin: 6px 0 0; color: #4c5c70; font-size: 11px; white-space: pre-wrap; }
+
+.button {
+  min-height: 32px;
+  padding: 6px 9px;
+  border: 1px solid #cbd2dc;
+  border-radius: 7px;
+  background: #fff;
+  color: #253247;
+  font: inherit;
+  cursor: pointer;
+}
+.button:hover:not(:disabled) { background: #f4f6f9; }
+.button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid #4b82e5;
+  outline-offset: 2px;
+}
+.button:disabled { cursor: not-allowed; opacity: .55; }
+.button.primary { border-color: #245bc5; background: #2867d7; color: #fff; font-weight: 650; }
+.button.primary:hover:not(:disabled) { background: #1f58bd; }
+.button.secondary { background: #f9fafc; }
+.full { width: 100%; }
+.current-task .primary { margin-top: 7px; }
+
+.check-row { display: flex; align-items: center; gap: 7px; margin: 6px 0; }
+.check-row input { margin: 0; accent-color: #2867d7; }
+.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 7px 0; }
+input, select {
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid #cbd2dc;
+  border-radius: 6px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+}
+#optimizerKeepRounds { width: 82px; }
+.optimizer-card > .button { margin-top: 4px; }
+
+details > summary { cursor: pointer; font-weight: 650; list-style-position: inside; }
+.details-content { margin-top: 10px; }
+.action-block { padding: 9px 0; border-top: 1px solid #edf0f4; }
+.action-block:first-child { padding-top: 0; border-top: 0; }
+.inline-controls { display: flex; gap: 7px; }
+.inline-controls select { flex: 1; }
+.button-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.button-grid .button:last-child { grid-column: 1 / -1; }
+.card-choices { display: grid; gap: 5px; margin-top: 5px; }
+.card-choices .wide { width: 100%; text-align: left; }
+.connection-list { margin-top: 7px; }
+.connection { padding: 7px 0; border-top: 1px solid #edf0f4; }
+.connection:first-child { border-top: 0; }
+.connection button { margin: 5px 5px 0 0; }
+.connection-config { margin-top: 4px; padding-top: 9px; border-top: 1px solid #edf0f4; }
+.connection-config label { display: block; margin: 8px 0; color: #485467; font-size: 11px; }
+.connection-config input { display: block; width: 100%; margin-top: 3px; }
+.operation-log { max-height: 180px; overflow: auto; margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.4 ui-monospace, monospace; }

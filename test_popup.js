@@ -5,7 +5,8 @@ const path = require("node:path");
 
 async function main() {
   const elements = new Map();
-  for (const id of ["connectionCode", "title", "card", "status", "autoTransferToggle", "autoTransferStatus", "bind", "unbind", "startA", "startB",
+  for (const id of ["connectionCode", "title", "card", "status", "connectionStatus", "currentTaskName", "taskPhase",
+    "autoTransferToggle", "autoTransferStatus", "bind", "startMode", "startSelected", "moreActions",
     "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
     "optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     elements.set(id, {value: "", checked: false, textContent: "", onclick: null, children: [], listeners: {},
@@ -13,11 +14,16 @@ async function main() {
       replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
       append(...children) { this.children.push(...children); }});
   const popupHtml = fs.readFileSync(path.join(__dirname, "extension", "popup.html"), "utf8");
+  assert.match(popupHtml, /href="popup\.css"/);
+  assert.match(popupHtml, /当前任务/);
+  assert.match(popupHtml, /长对话加速/);
+  assert.match(popupHtml, /<summary>更多操作<\/summary>/);
+  assert.doesNotMatch(popupHtml, /id="unbind"|id="startA"|id="startB"/);
   assert.match(popupHtml, /id="autoTransferToggle"/);
   assert.match(popupHtml, /id="autoTransferStatus"/);
   for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     assert.match(popupHtml, new RegExp(`id="${id}"`));
-  assert.match(popupHtml, /应用并刷新当前 ChatGPT/);
+  assert.match(popupHtml, /应用并刷新/);
   const state = {
     connections: undefined,
     tabId: 7, port: 8765, token: "legacy", title: "给 Codex 的指令", card: "",
@@ -129,6 +135,8 @@ async function main() {
   assert.match(elements.get("optimizerStatus").textContent, /页面脚本已连接/);
   assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_STATUS"));
   assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
+  assert.match(elements.get("connectionStatus").textContent, /已连接/);
+  assert.match(elements.get("taskPhase").textContent, /report_ready/);
   await elements.get("autoTransferToggle").onclick();
   assert.equal(autoPausedByPort.get(8765), true);
   assert.equal(elements.get("autoTransferToggle").textContent, "恢复自动传递");
@@ -165,15 +173,22 @@ async function main() {
   await elements.get("bind").onclick();
   assert.ok(state.connections["7"]);
   assert.equal(state.connections["8"].port, 8766);
-  await elements.get("startA").onclick();
-  assert.deepEqual(starts, [{port: 8766, mode: "A"}]);
+  elements.get("startMode").value = "A";
+  await elements.get("startSelected").onclick();
+  elements.get("startMode").value = "B";
+  await elements.get("startSelected").onclick();
+  assert.deepEqual(starts, [{port: 8766, mode: "A"}, {port: 8766, mode: "B"}]);
   await elements.get("autoTransferToggle").onclick();
   assert.equal(autoPausedByPort.get(8766), true,
     "the toggle controls the bridge bound to the active ChatGPT tab");
   assert.equal(autoPausedByPort.get(8765), false,
     "pausing one task does not affect another connected task");
   assert.match(routed.filter(item => item.path === "/state").map(item => item.port).join(","), /8765.*8766|8766.*8765/);
-  await elements.get("unbind").onclick();
+  const chatBRow = elements.get("connections").children.find(row =>
+    row.children[0].textContent.startsWith("Chat B"));
+  assert.ok(chatBRow, "each connected task remains listed");
+  assert.equal(chatBRow.children[2].textContent, "解除绑定");
+  await chatBRow.children[2].onclick();
   assert.equal(state.connections["8"], undefined);
   assert.ok(state.connections["7"]);
   assert.equal(activeId, 8);
