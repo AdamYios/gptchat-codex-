@@ -6,13 +6,21 @@ const path = require("node:path");
 async function main() {
   const elements = new Map();
   for (const id of ["connectionCode", "title", "card", "status", "bind", "unbind", "startA", "startB",
-    "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog"])
-    elements.set(id, {value: "", textContent: "", onclick: null, children: [],
+    "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
+    "optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
+    elements.set(id, {value: "", checked: false, textContent: "", onclick: null, children: [], listeners: {},
+      addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); },
       replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
       append(...children) { this.children.push(...children); }});
+  const popupHtml = fs.readFileSync(path.join(__dirname, "extension", "popup.html"), "utf8");
+  for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
+    assert.match(popupHtml, new RegExp(`id="${id}"`));
+  assert.match(popupHtml, /应用并刷新当前 ChatGPT/);
   const state = {
     connections: undefined,
-    tabId: 7, port: 8765, token: "legacy", title: "给 Codex 的指令", card: ""
+    tabId: 7, port: 8765, token: "legacy", title: "给 Codex 的指令", card: "",
+    "optimizer.enabled": true, "optimizer.keepRounds": 18,
+    "optimizer.renderOptimize": false, "optimizer.liveWindow": true
   };
   const tabStates = new Map([[7, {url: "https://chatgpt.com/c/a", title: "Chat A"}],
     [8, {url: "https://chatgpt.com/c/b", title: "Chat B"}]]);
@@ -22,6 +30,8 @@ async function main() {
   let selectedKey = "";
   const starts = [];
   const pageNotifications = [];
+  const optimizerMessages = [];
+  const reloadedTabs = [];
   let activeId = 7;
   const chrome = {
     runtime: {sendMessage: async message => {
@@ -50,7 +60,14 @@ async function main() {
       get: async id => ({id, ...(tabStates.get(id) || {url: "", title: "Closed tab"})}),
       query: async () => [{id: activeId, ...(tabStates.get(activeId) || {})}],
       update: async (id, options) => { if (options.active) activeId = id; },
+      reload: async id => { reloadedTabs.push(id); },
       sendMessage: async (id, message) => {
+        if (message.type.startsWith("OPTIMIZER_")) {
+          optimizerMessages.push({tabId: id, type: message.type, settings: message.settings});
+          if (message.type === "OPTIMIZER_STATUS") return {ok: true,
+            mainStatus: {liveDiagnostic: {userUnits: 4, hiddenUnits: 6}}};
+          return {ok: true};
+        }
         if (message.type === "bridgePing") {
           if (!injected.has(id)) throw new Error("Could not establish connection. Receiving end does not exist.");
           return {ok: true};
@@ -69,8 +86,11 @@ async function main() {
           pageNotifications.push(message.text);
           return {ok: true};
         }
-        recoveryCalls += 1;
-        return {ok: true, message: "恢复成功"};
+        if (message.type === "bridgeRecover") {
+          recoveryCalls += 1;
+          return {ok: true, message: "恢复成功"};
+        }
+        return {ok: true};
       }
     },
     scripting: {executeScript: async ({target, files, func}) => {
@@ -95,6 +115,13 @@ async function main() {
     append(...children) { this.children.push(...children); }
   })};
   vm.runInNewContext(source, {chrome, fetch, document, console, URL, Date, Math, Number, String, Object, RegExp});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(elements.get("optimizerEnabled").checked, true);
+  assert.equal(elements.get("optimizerKeepRounds").value, 18);
+  assert.equal(elements.get("optimizerRenderOptimize").checked, false);
+  assert.equal(elements.get("optimizerLiveWindow").checked, true);
+  assert.match(elements.get("optimizerStatus").textContent, /页面脚本已连接/);
+  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_STATUS"));
   await elements.get("recheck").onclick();
   assert.equal(injected.has(7), true);
   assert.equal(recoveryCalls, 1);
@@ -130,7 +157,22 @@ async function main() {
   assert.equal(state.connections["8"], undefined);
   assert.ok(state.connections["7"]);
   assert.equal(activeId, 8);
-  console.log("Popup binds and operates independent per-tab bridge connections OK");
+
+  elements.get("optimizerEnabled").checked = false;
+  elements.get("optimizerKeepRounds").value = "24";
+  elements.get("optimizerLiveWindow").checked = false;
+  elements.get("optimizerRenderOptimize").checked = true;
+  await elements.get("optimizerKeepRounds").listeners.change[0]();
+  assert.equal(state["optimizer.enabled"], false);
+  assert.equal(state["optimizer.keepRounds"], 24);
+  assert.equal(state["optimizer.liveWindow"], false);
+  assert.equal(state["optimizer.renderOptimize"], true);
+  await elements.get("optimizerApply").onclick();
+  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_APPLY" &&
+    message.settings.keepRounds === 24 && message.settings.enabled === false));
+  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_LIVE_NOW"));
+  assert.deepEqual(reloadedTabs, [8]);
+  console.log("Popup preserves Codex bridge and applies long-chat optimizer settings");
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

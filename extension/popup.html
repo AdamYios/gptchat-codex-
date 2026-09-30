@@ -1,6 +1,13 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><style>
-body{font:14px system-ui;width:360px;padding:14px}label{display:block;margin:9px 0}input{box-sizing:border-box;width:100%;padding:7px}button{padding:8px;margin-top:8px;cursor:pointer}#status{white-space:pre-wrap;color:#555}.group{border-top:1px solid #ddd;margin-top:12px;padding-top:10px}.hint{font-size:12px;color:#555;margin:4px 0}.wide{width:100%;text-align:left}.connection{border-bottom:1px solid #ddd;padding:6px 0}.connection button{margin:4px}
+body{font:14px system-ui;width:360px;padding:14px}label{display:block;margin:9px 0}input{box-sizing:border-box;width:100%;padding:7px}button{padding:8px;margin-top:8px;cursor:pointer}#status{white-space:pre-wrap;color:#555}.group{border-top:1px solid #ddd;margin-top:12px;padding-top:10px}.hint{font-size:12px;color:#555;margin:4px 0}.wide{width:100%;text-align:left}.connection{border-bottom:1px solid #ddd;padding:6px 0}.connection button{margin:4px}.check-row{display:flex;align-items:center;gap:8px}.check-row input{width:auto;padding:0}#optimizerKeepRounds{width:90px}
 </style><h3>ChatGPT ↔ Codex</h3>
+<div class="group"><strong>长对话加速</strong>
+<label class="check-row"><input id="optimizerEnabled" type="checkbox">启用</label>
+<label>最近 N 轮<input id="optimizerKeepRounds" type="number" min="1" max="500" step="1"></label>
+<label class="check-row"><input id="optimizerLiveWindow" type="checkbox">实时滑动窗口</label>
+<label class="check-row"><input id="optimizerRenderOptimize" type="checkbox">屏幕外渲染优化</label>
+<button id="optimizerApply" class="wide">应用并刷新当前 ChatGPT</button>
+<p id="optimizerStatus" class="hint">读取加速器设置…</p></div>
 <label>桥接连接信息（从对应终端整行复制）<input id="connectionCode" type="text" placeholder="8765|终端显示的连接令牌"></label>
 <label>指令卡片标题（正则）<input id="title" value="给\s*Codex\s*的指令|Instructions?\s+for\s+Codex"></label>
 <label>可选：卡片 CSS 选择器<input id="card" placeholder="留空则按标题和复制按钮识别"></label>
