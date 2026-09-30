@@ -373,9 +373,15 @@ async function unbindTab(tabId) {
   const key = String(tabId);
   if (!connections[key]) throw new Error("当前标签页没有绑定桥接任务");
   let taskId = connections[key].threadId || "";
-  if (!taskId) {
-    try { taskId = (await bridgeApi("/state", "GET", undefined, connections[key])).threadId || ""; }
-    catch { /* Keep old offline events detached if their task cannot be identified. */ }
+  let state = null;
+  try {
+    state = await bridgeApi("/state", "GET", undefined, connections[key]);
+    taskId = taskId || state.threadId || "";
+  } catch { /* Keep old offline events detached if the bridge is unavailable. */ }
+  if (state && state.phase !== "setup" && state.phase !== "stopped") {
+    await bridgeApi("/stop", "POST", {
+      reason: "ChatGPT 标签页已解除绑定", runId: state.runId
+    }, connections[key]);
   }
   await notifyPage("已解除绑定；自动桥接已停止", false, Number(tabId), "unbound");
   const result = await chrome.runtime.sendMessage({type: "bridgeUnbind", tabId: Number(tabId), taskId});

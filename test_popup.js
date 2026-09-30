@@ -253,14 +253,34 @@ async function main() {
     row.children[0].textContent.startsWith("Chat B"));
   assert.ok(chatBRow, "each connected task remains listed");
   assert.equal(chatBRow.children[2].textContent, "解除绑定");
+  phaseByPort.set(8766, "codex_running");
+  codexInProgressByPort.set(8766, true);
   await chatBRow.children[2].onclick();
   assert.equal(state.connections["8"], undefined);
   assert.ok(state.connections["7"]);
+  assert.deepEqual(stopRequests[1], {port: 8766, body: {
+    reason: "ChatGPT 标签页已解除绑定", runId: "run"
+  }}, "unbinding ends the old bridge flow without changing its run ID");
+  assert.equal(phaseByPort.get(8766), "stopped");
   assert.equal(elements.get("connectionConfigSection").hidden, false,
     "an unbound active tab shows connection configuration");
   assert.equal(elements.get("startSection").hidden, true);
   assert.equal(elements.get("currentTaskSection").hidden, true);
   assert.equal(activeId, 8);
+
+  elements.get("connectionCode").value = "8766|abcdefghijklmnopqrstuvwxyz123456";
+  await elements.get("bind").onclick();
+  assert.equal(elements.get("connectionConfigSection").hidden, true);
+  assert.equal(elements.get("startSection").hidden, false,
+    "rebinding after unbind shows the start selector instead of the old task view");
+  assert.equal(elements.get("currentTaskSection").hidden, true);
+  assert.equal(elements.get("startSelected").disabled, true,
+    "the old Codex run keeps running and prevents a new flow from starting");
+  assert.match(elements.get("startTaskPhase").textContent, /Codex 仍在运行/);
+  codexInProgressByPort.set(8766, false);
+  await intervals[0].callback();
+  assert.equal(elements.get("startSelected").disabled, false,
+    "the new flow becomes available when the old Codex run finishes");
 
   elements.get("optimizerEnabled").checked = false;
   elements.get("optimizerKeepRounds").value = "24";
