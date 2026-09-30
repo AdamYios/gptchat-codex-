@@ -154,14 +154,15 @@
       if (url.origin !== location.origin) return null;
 
       const match = url.pathname.match(
-        /^\/backend-api\/conversations\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/messages)?\/?$/i
+        /^\/backend-api\/(conversations|conversation)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/messages)?\/?$/i
       );
       if (!match) return null;
 
       return {
         url,
-        conversationId: match[1],
-        kind: match[2] ? "messages" : "initial"
+        endpoint: match[1].toLowerCase() === "conversation" ? "singular" : "plural",
+        conversationId: match[2],
+        kind: match[3] ? "messages" : "initial"
       };
     } catch {
       return null;
@@ -223,7 +224,82 @@
     return response;
   }
 
-  async function lockInitialHistoryBoundary(response) {
+  function messageRole(item) {
+    return item?.message?.author?.role || item?.author?.role || item?.role || null;
+  }
+
+  function trimMessageArray(messages, keepRounds) {
+    if (!Array.isArray(messages)) return {messages, trimmed: false};
+    const userIndexes = [];
+    messages.forEach((message, index) => {
+      if (messageRole(message) === "user") userIndexes.push(index);
+    });
+    if (userIndexes.length <= keepRounds) return {messages, trimmed: false};
+    return {
+      messages: messages.slice(userIndexes[userIndexes.length - keepRounds]),
+      trimmed: true
+    };
+  }
+
+  function trimConversationMapping(data, keepRounds) {
+    const mapping = data?.mapping;
+    if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) return false;
+
+    let nodeId = data.current_node == null ? "" : String(data.current_node);
+    if (!nodeId || !Object.prototype.hasOwnProperty.call(mapping, nodeId)) return false;
+
+    const reversePath = [];
+    const visited = new Set();
+    while (nodeId && Object.prototype.hasOwnProperty.call(mapping, nodeId) && !visited.has(nodeId)) {
+      visited.add(nodeId);
+      reversePath.push(nodeId);
+      const parent = mapping[nodeId]?.parent;
+      nodeId = typeof parent === "string" ? parent : "";
+    }
+    const path = reversePath.reverse();
+    const userIndexes = [];
+    path.forEach((id, index) => {
+      if (messageRole(mapping[id]) === "user") userIndexes.push(index);
+    });
+    const startIndex = userIndexes.length > keepRounds
+      ? userIndexes[userIndexes.length - keepRounds]
+      : 0;
+    const retainedIds = path.slice(startIndex);
+    const retained = new Set(retainedIds);
+    const mappingHasOtherNodes = Object.keys(mapping).some(id => !retained.has(id));
+    const historyTrimmed = startIndex > 0 || mappingHasOtherNodes;
+    if (!historyTrimmed) return false;
+
+    const nextMapping = {};
+    retainedIds.forEach((id, index) => {
+      const node = mapping[id];
+      if (!node || typeof node !== "object") return;
+      nextMapping[id] = {
+        ...node,
+        parent: index === 0 ? null : node.parent,
+        children: Array.isArray(node.children)
+          ? node.children.filter(childId => retained.has(String(childId)))
+          : []
+      };
+    });
+    data.mapping = nextMapping;
+    return true;
+  }
+
+  function trimConversationHistory(data, keepRounds) {
+    if (!data || typeof data !== "object") return false;
+    let trimmed = trimConversationMapping(data, keepRounds);
+    if (Array.isArray(data.messages)) {
+      const result = trimMessageArray(data.messages, keepRounds);
+      if (result.trimmed) {
+        data.messages = result.messages;
+        trimmed = true;
+      }
+    }
+    return trimmed;
+  }
+
+  async function lockInitialHistoryBoundary(response, keepRounds = null) {
     if (!response?.ok) return response;
 
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -232,34 +308,34 @@
     try {
       const data = await response.clone().json();
 
-      if (
-        !data ||
-        typeof data !== "object" ||
-        !data.page_info ||
-        typeof data.page_info !== "object"
-      ) {
-        return response;
-      }
+      if (!data || typeof data !== "object") return response;
 
-      const alreadyLocked =
+      const historyTrimmed = Number.isInteger(keepRounds) &&
+        trimConversationHistory(data, clampRounds(keepRounds));
+      const hasPageInfo = data.page_info && typeof data.page_info === "object";
+      const alreadyLocked = hasPageInfo &&
         data.page_info.has_previous_page === false &&
         (data.page_info.start_cursor == null || data.page_info.start_cursor === "");
 
-      if (alreadyLocked) return response;
+      if (!historyTrimmed && (!hasPageInfo || alreadyLocked)) return response;
 
-      stats.initialResponsesLocked += 1;
-
-      return responseFromJson(
-        response,
-        {
+      let normalized = data;
+      if (hasPageInfo && !alreadyLocked) {
+        stats.initialResponsesLocked += 1;
+        normalized = {
           ...data,
           page_info: {
             ...data.page_info,
             has_previous_page: false,
             start_cursor: null
           }
-        },
-        "history-boundary-locked"
+        };
+      }
+
+      return responseFromJson(
+        response,
+        normalized,
+        historyTrimmed ? "history-response-trimmed" : "history-boundary-locked"
       );
     } catch {
       return response;
@@ -283,6 +359,7 @@
     }
 
     return {
+      endpoint: match.endpoint,
       kind: match.kind,
       originalUrl: match.url.href,
       rewrittenUrl: url.href,
@@ -332,7 +409,6 @@
             channel: "blocked-history-page",
             ...stats.lastBlockedPagination
           });
-
           emit("STATUS", snapshot());
           return buildEmptyHistoryResponse(rewritten.originalUrl);
         }
@@ -353,7 +429,10 @@
             let response = await originalFetch(nextInput, init);
 
             if (rewritten.kind === "initial") {
-              response = await lockInitialHistoryBoundary(response);
+              const keepRounds = rewritten.endpoint === "singular"
+                ? clampRounds(settings.keepRounds)
+                : null;
+              response = await lockInitialHistoryBoundary(response, keepRounds);
             }
 
             stats.lastConversationRequest = {
@@ -371,7 +450,6 @@
               channel: "conversation",
               ...stats.lastConversationRequest
             });
-
             emit("STATUS", snapshot());
             return response;
           } catch (error) {

@@ -219,6 +219,88 @@ const noPageInfo = await mainWindow.fetch(
 assert.deepEqual(await noPageInfo.json(), {messages: [4]},
   "responses without page_info keep their original shape");
 
+mainWindowListeners.message({source: mainWindow, data: {
+  source: channel,
+  direction: "TO_MAIN",
+  type: "REFRESH_SETTINGS",
+  payload: {enabled: true, keepRounds: 3, renderOptimize: true, liveWindow: true}
+}});
+
+const mapping = {};
+let parent = null;
+for (let turn = 0; turn < 5; turn += 1) {
+  const userId = `user-${turn}`;
+  const assistantId = `assistant-${turn}`;
+  mapping[userId] = {
+    id: userId,
+    parent,
+    children: [assistantId],
+    message: {author: {role: "user"}, content: {parts: [`old-or-current-user-${turn}`]}}
+  };
+  mapping[assistantId] = {
+    id: assistantId,
+    parent: userId,
+    children: [],
+    message: {author: {role: "assistant"}, content: {parts: [`old-or-current-assistant-${turn}`]}}
+  };
+  parent = assistantId;
+}
+responseBody = {
+  conversation_id: conversationId,
+  current_node: parent,
+  mapping,
+  page_info: {has_previous_page: true, start_cursor: "older-cursor"}
+};
+const singularEndpoint = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversation/${conversationId}`
+);
+assert.equal(new URL(networkRequests.at(-1).input).pathname,
+  `/backend-api/conversation/${conversationId}`,
+  "singular conversation endpoint is sent as the current conversation request");
+assert.equal(new URL(networkRequests.at(-1).input).searchParams.get("num_turns"), "3",
+  "singular endpoint receives the configured recent-turn limit");
+const singularData = await singularEndpoint.json();
+assert.deepEqual(Object.keys(singularData.mapping).sort(), [
+  "assistant-2", "assistant-3", "assistant-4", "user-2", "user-3", "user-4"
+]);
+assert.equal(singularData.mapping["user-2"].parent, null,
+  "trimmed mapping starts at a valid root node");
+assert.deepEqual(singularData.mapping["user-2"].children, ["assistant-2"]);
+assert.equal(singularData.mapping["assistant-4"].children.length, 0);
+assert.equal(singularData.current_node, "assistant-4");
+assert.equal(singularData.page_info.has_previous_page, false);
+assert.equal(singularData.page_info.start_cursor, null);
+assert.equal(singularEndpoint.headers.get("x-chatgpt-long-chat-optimizer"),
+  "history-response-trimmed");
+assert.doesNotMatch(JSON.stringify(singularData), /old-or-current-(?:user|assistant)-[01]/,
+  "a server response containing full history is clipped before reaching the page");
+
+responseBody = {messages: []};
+for (let turn = 0; turn < 5; turn += 1) {
+  responseBody.messages.push(
+    {author: {role: "user"}, content: {parts: [`array-user-${turn}`]}},
+    {author: {role: "assistant"}, content: {parts: [`array-assistant-${turn}`]}}
+  );
+}
+const singularArrayResponse = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversation/${conversationId}?num_turns=20`
+);
+assert.equal(new URL(networkRequests.at(-1).input).searchParams.get("num_turns"), "3",
+  "singular endpoint clamps an excessive num_turns value");
+const singularArrayData = await singularArrayResponse.json();
+assert.equal(singularArrayData.messages.length, 6,
+  "plain message arrays are also clipped to the latest three user turns");
+assert.match(JSON.stringify(singularArrayData), /array-user-2/);
+assert.doesNotMatch(JSON.stringify(singularArrayData), /array-(?:user|assistant)-[01]/);
+
+const requestCountBeforeSingularHistory = networkRequests.length;
+const singularBlockedHistory = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversation/${conversationId}/messages?before=older-cursor`
+);
+assert.equal(networkRequests.length, requestCountBeforeSingularHistory,
+  "older-history pagination on the singular endpoint is blocked too");
+assert.equal(singularBlockedHistory.status, 200);
+
 }
 
 testMainFetch().then(() => {
