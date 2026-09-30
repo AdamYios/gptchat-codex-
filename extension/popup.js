@@ -132,6 +132,10 @@ async function bridgeApi(path, method = "GET", body, connection) {
   if (!response.ok) {
     if (response.status === 404 && path === "/start")
       throw new Error("当前 PowerShell 仍运行旧版 bridge.py；请重启对应桥接器");
+    if (response.status === 404 && (path === "/pause" || path === "/resume")) {
+      const action = path === "/pause" ? "暂停" : "恢复";
+      throw new Error(`当前运行的 bridge.py 不支持${action}自动传递。请按 Ctrl+C 停止该桥接器，使用项目当前版本重新启动，再用新连接信息重新绑定此标签页。`);
+    }
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   return data;
@@ -197,8 +201,10 @@ async function act(callback, operation = "action", requestedTabId = null) {
     if (message) $("status").textContent = `${message}\n${$("status").textContent}`;
   } catch (error) {
     recordPopup(`${operation}_error`, {reason: popupErrorReason(error)}, tabId);
-    await notifyPage(`${label}：失败，请查看扩展弹窗`, true, tabId);
-    $("status").textContent = String(error);
+    const errorMessage = error?.message || String(error);
+    const pageError = operation === "auto_transfer" ? `${label}：${errorMessage}` : `${label}：失败，请查看扩展弹窗`;
+    await notifyPage(pageError, true, tabId);
+    $("status").textContent = errorMessage;
   }
 }
 

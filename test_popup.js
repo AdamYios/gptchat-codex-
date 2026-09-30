@@ -41,6 +41,7 @@ async function main() {
   const optimizerMessages = [];
   const reloadedTabs = [];
   let activeId = 7;
+  let unsupportedAutoTransfer = false;
   const autoPausedByPort = new Map([[8765, false], [8766, false]]);
   const chrome = {
     runtime: {sendMessage: async message => {
@@ -113,12 +114,14 @@ async function main() {
   const fetch = async (url, options = {}) => {
     const endpoint = new URL(url);
     routed.push({port: Number(endpoint.port), path: endpoint.pathname, method: options.method || "GET"});
+    if ((endpoint.pathname === "/pause" || endpoint.pathname === "/resume") && unsupportedAutoTransfer)
+      return {ok: false, status: 404, json: async () => ({error: "not found"})};
     if (endpoint.pathname === "/pause") autoPausedByPort.set(Number(endpoint.port), true);
     if (endpoint.pathname === "/resume") autoPausedByPort.set(Number(endpoint.port), false);
     if (endpoint.pathname === "/log") return {ok: true, json: async () => ({path: "logs/bridge.jsonl",
       records: [{time: "2026-09-26T00:00:00Z", source: "bridge", event: "start", data: {mode: "A"}}]})};
     if (endpoint.pathname === "/start") starts.push({port: Number(endpoint.port), mode: JSON.parse(options.body).mode});
-    return {ok: true, json: async () => ({threadId: `task-${endpoint.port}`, runId: "run", phase: "report_ready",
+    return {ok: true, status: 200, json: async () => ({threadId: `task-${endpoint.port}`, runId: "run", phase: "report_ready",
       round: 1, autoPaused: autoPausedByPort.get(Number(endpoint.port)) || false})};
   };
   const source = fs.readFileSync(path.join(__dirname, "extension", "popup.js"), "utf8");
@@ -145,6 +148,21 @@ async function main() {
   await elements.get("autoTransferToggle").onclick();
   assert.equal(autoPausedByPort.get(8765), false);
   assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
+  assert.deepEqual(routed.filter(item => item.path === "/pause" || item.path === "/resume")
+    .map(item => [item.path, item.method]), [["/pause", "POST"], ["/resume", "POST"]]);
+
+  unsupportedAutoTransfer = true;
+  await elements.get("autoTransferToggle").onclick();
+  assert.match(elements.get("status").textContent, /bridge\.py 不支持暂停自动传递/);
+  assert.match(elements.get("status").textContent, /Ctrl\+C.*重新启动.*新连接信息重新绑定/);
+  assert.ok(pageNotifications.some(text => /自动传递设置：当前运行的 bridge\.py 不支持暂停自动传递/.test(text)),
+    "the page action notice explains the bridge version mismatch");
+  autoPausedByPort.set(8765, true);
+  await elements.get("autoTransferToggle").onclick();
+  assert.match(elements.get("status").textContent, /bridge\.py 不支持恢复自动传递/);
+  unsupportedAutoTransfer = false;
+  autoPausedByPort.set(8765, false);
+
   await elements.get("recheck").onclick();
   assert.equal(injected.has(7), true);
   assert.equal(recoveryCalls, 1);
