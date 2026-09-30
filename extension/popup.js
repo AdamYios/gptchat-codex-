@@ -389,8 +389,6 @@ $("bind").onclick = async () => {
   let endpoint;
   try { endpoint = parseConnectionCode($("connectionCode").value); }
   catch (error) { $("status").textContent = String(error); return; }
-  try { new RegExp($("title").value, "i"); }
-  catch { $("status").textContent = "指令卡片标题正则无效"; return; }
   const connections = await readConnections();
   const existing = connections[String(tab.id)];
   if (existing && (existing.port !== endpoint.port || existing.token !== endpoint.token)) {
@@ -409,9 +407,9 @@ $("bind").onclick = async () => {
     if (duplicateTask)
       throw new Error(`Codex 任务 ${state.threadId} 已绑定到标签页 ${duplicateTask[0]}；每个任务请使用独立 Codex 任务`);
     await ensureContent(tab.id);
-    const connection = {id: connectionId(endpoint.port, endpoint.token),
+    const connection = {...(existing || {}), id: connectionId(endpoint.port, endpoint.token),
       tabId: tab.id, port: endpoint.port, token: endpoint.token,
-      threadId: state.threadId || "", title: $("title").value, card: $("card").value,
+      threadId: state.threadId || "",
       boundAt: new Date().toISOString()};
     const result = await chrome.runtime.sendMessage({type: "bridgeBind", connection});
     if (!result?.ok) throw new Error(result?.error || "保存桥接绑定失败");

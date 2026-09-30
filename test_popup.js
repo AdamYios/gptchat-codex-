@@ -5,7 +5,7 @@ const path = require("node:path");
 
 async function main() {
   const elements = new Map();
-  for (const id of ["connectionCode", "title", "card", "status", "connectionConfigSection", "startSection",
+  for (const id of ["connectionCode", "status", "connectionConfigSection", "startSection",
     "startConnectionStatus", "startTaskPhase", "currentTaskSection", "connectionStatus", "currentTaskName", "taskPhase",
     "endFlow", "bind", "startMode", "startSelected", "reportRecoveryActions", "moreActions",
     "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
@@ -27,12 +27,14 @@ async function main() {
   assert.doesNotMatch(popupHtml, /id="unbind"|id="startA"|id="startB"/);
   assert.match(popupHtml, /id="endFlow"[^>]*>结束当前流程/);
   assert.doesNotMatch(popupHtml, /autoPaused|暂停自动传递|恢复自动传递|autoTransfer/);
+  assert.doesNotMatch(popupHtml, /id="(?:title|card)"/,
+    "connection setup only asks for the bridge port and token");
   for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     assert.match(popupHtml, new RegExp(`id="${id}"`));
   assert.match(popupHtml, /应用并刷新/);
   const state = {
     connections: undefined,
-    tabId: 7, port: 8765, token: "legacy", title: "给 Codex 的指令", card: "",
+    tabId: 7, port: 8765, token: "abcdefghijklmnopqrstuvwxyz123456", title: "旧标题覆盖项", card: ".legacy-card",
     "optimizer.enabled": true, "optimizer.keepRounds": 18,
     "optimizer.renderOptimize": false, "optimizer.liveWindow": true
   };
@@ -176,6 +178,12 @@ async function main() {
   assert.ok(pageNotifications.some(text => text.includes("发送所选指令卡片：已完成")));
   await elements.get("viewLog").onclick();
   assert.match(elements.get("operationLog").textContent, /"event":"start"/);
+  elements.get("connectionCode").value = "8765|abcdefghijklmnopqrstuvwxyz123456";
+  await elements.get("bind").onclick();
+  assert.equal(state.connections["7"].title, "旧标题覆盖项",
+    "re-binding the same legacy connection preserves its card title override");
+  assert.equal(state.connections["7"].card, ".legacy-card",
+    "re-binding the same legacy connection preserves its selector override");
   staleBar = true;
   injected.delete(7);
   await elements.get("recheck").onclick();
@@ -185,10 +193,16 @@ async function main() {
   activeId = 8;
   staleBar = false;
   elements.get("connectionCode").value = "8766|abcdefghijklmnopqrstuvwxyz123456";
-  elements.get("title").value = "给 Codex 的指令";
   await elements.get("bind").onclick();
   assert.ok(state.connections["7"]);
+  assert.equal(state.connections["7"].title, "旧标题覆盖项",
+    "re-binding keeps an existing legacy card title override");
+  assert.equal(state.connections["7"].card, ".legacy-card",
+    "re-binding keeps existing legacy selector data");
   assert.equal(state.connections["8"].port, 8766);
+  assert.equal(Object.hasOwn(state.connections["8"], "title"), false,
+    "new connections use built-in card recognition defaults");
+  assert.equal(Object.hasOwn(state.connections["8"], "card"), false);
   assert.equal(elements.get("connectionConfigSection").hidden, true);
   assert.equal(elements.get("startSection").hidden, false,
     "a connected bridge in setup shows the start selector");
