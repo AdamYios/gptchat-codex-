@@ -7,10 +7,10 @@ async function main() {
   const elements = new Map();
   for (const id of ["connectionCode", "title", "card", "status", "connectionConfigSection", "startSection",
     "startConnectionStatus", "startTaskPhase", "currentTaskSection", "connectionStatus", "currentTaskName", "taskPhase",
-    "autoTransferToggle", "autoTransferStatus", "bind", "startMode", "startSelected", "reportRecoveryActions", "moreActions",
+    "endFlow", "bind", "startMode", "startSelected", "reportRecoveryActions", "moreActions",
     "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
     "optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
-    elements.set(id, {value: "", checked: false, textContent: "", onclick: null, children: [], listeners: {},
+    elements.set(id, {value: "", checked: false, disabled: false, textContent: "", onclick: null, children: [], listeners: {},
       addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); },
       replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
       append(...children) { this.children.push(...children); }});
@@ -21,9 +21,12 @@ async function main() {
   assert.match(popupHtml, /<summary>更多操作<\/summary>/);
   assert.ok(popupHtml.indexOf('id="connectionConfigSection"') < popupHtml.indexOf('id="startSection"'));
   assert.ok(popupHtml.indexOf('id="startSection"') < popupHtml.indexOf('id="currentTaskSection"'));
+  const currentTaskMarkup = popupHtml.slice(popupHtml.indexOf('id="currentTaskSection"'), popupHtml.indexOf("</section>", popupHtml.indexOf('id="currentTaskSection"')));
+  assert.equal((currentTaskMarkup.match(/<button\b/g) || []).length, 1,
+    "the current task card has only the end-flow action");
   assert.doesNotMatch(popupHtml, /id="unbind"|id="startA"|id="startB"/);
-  assert.match(popupHtml, /id="autoTransferToggle"/);
-  assert.match(popupHtml, /id="autoTransferStatus"/);
+  assert.match(popupHtml, /id="endFlow"[^>]*>结束当前流程/);
+  assert.doesNotMatch(popupHtml, /autoPaused|暂停自动传递|恢复自动传递|autoTransfer/);
   for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
     assert.match(popupHtml, new RegExp(`id="${id}"`));
   assert.match(popupHtml, /应用并刷新/);
@@ -44,9 +47,8 @@ async function main() {
   const optimizerMessages = [];
   const reloadedTabs = [];
   let activeId = 7;
-  let unsupportedAutoTransfer = false;
   const intervals = [];
-  const autoPausedByPort = new Map([[8765, false], [8766, false]]);
+  const codexInProgressByPort = new Map([[8765, false], [8766, false]]);
   const phaseByPort = new Map([[8765, "report_ready"], [8766, "setup"]]);
   const chrome = {
     runtime: {sendMessage: async message => {
@@ -116,24 +118,27 @@ async function main() {
     }}
   };
   const routed = [];
+  const stopRequests = [];
   const fetch = async (url, options = {}) => {
     const endpoint = new URL(url);
     routed.push({port: Number(endpoint.port), path: endpoint.pathname, method: options.method || "GET"});
-    if ((endpoint.pathname === "/pause" || endpoint.pathname === "/resume") && unsupportedAutoTransfer)
-      return {ok: false, status: 404, json: async () => ({error: "not found"})};
-    if (endpoint.pathname === "/pause") autoPausedByPort.set(Number(endpoint.port), true);
-    if (endpoint.pathname === "/resume") autoPausedByPort.set(Number(endpoint.port), false);
     if (endpoint.pathname === "/log") return {ok: true, json: async () => ({path: "logs/bridge.jsonl",
       records: [{time: "2026-09-26T00:00:00Z", source: "bridge", event: "start", data: {mode: "A"}}]})};
     if (endpoint.pathname === "/start") {
       const mode = JSON.parse(options.body).mode;
       starts.push({port: Number(endpoint.port), mode});
       phaseByPort.set(Number(endpoint.port), mode === "A" ? "await_instruction" : "report_ready");
+      codexInProgressByPort.set(Number(endpoint.port), false);
+    }
+    if (endpoint.pathname === "/stop") {
+      stopRequests.push({port: Number(endpoint.port), body: JSON.parse(options.body)});
+      phaseByPort.set(Number(endpoint.port), "stopped");
     }
     return {ok: true, status: 200, json: async () => ({threadId: `task-${endpoint.port}`, runId: "run",
       phase: phaseByPort.get(Number(endpoint.port)), round: 1,
       reportId: phaseByPort.get(Number(endpoint.port)) === "report_ready" ? 1 : 0,
-      autoPaused: autoPausedByPort.get(Number(endpoint.port)) || false})};
+      detail: phaseByPort.get(Number(endpoint.port)) === "stopped" ? "用户结束当前流程" : "",
+      codexInProgress: codexInProgressByPort.get(Number(endpoint.port)) || false})};
   };
   const source = fs.readFileSync(path.join(__dirname, "extension", "popup.js"), "utf8");
   const document = {getElementById: id => elements.get(id), createElement: () => ({
@@ -154,32 +159,8 @@ async function main() {
   assert.equal(elements.get("currentTaskSection").hidden, false);
   assert.equal(elements.get("reportRecoveryActions").hidden, false,
     "report recovery is available only for a report_ready task");
-  assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
   assert.match(elements.get("connectionStatus").textContent, /已连接/);
   assert.match(elements.get("taskPhase").textContent, /report_ready/);
-  await elements.get("autoTransferToggle").onclick();
-  assert.equal(autoPausedByPort.get(8765), true);
-  assert.equal(elements.get("autoTransferToggle").textContent, "恢复自动传递");
-  assert.match(elements.get("autoTransferStatus").textContent, /已暂停/);
-  assert.match(elements.get("status").textContent, /自动传递已暂停/);
-  await elements.get("autoTransferToggle").onclick();
-  assert.equal(autoPausedByPort.get(8765), false);
-  assert.equal(elements.get("autoTransferToggle").textContent, "暂停自动传递");
-  assert.deepEqual(routed.filter(item => item.path === "/pause" || item.path === "/resume")
-    .map(item => [item.path, item.method]), [["/pause", "POST"], ["/resume", "POST"]]);
-
-  unsupportedAutoTransfer = true;
-  await elements.get("autoTransferToggle").onclick();
-  assert.match(elements.get("status").textContent, /bridge\.py 不支持暂停自动传递/);
-  assert.match(elements.get("status").textContent, /Ctrl\+C.*重新启动.*新连接信息重新绑定/);
-  assert.ok(pageNotifications.some(text => /自动传递设置：当前运行的 bridge\.py 不支持暂停自动传递/.test(text)),
-    "the page action notice explains the bridge version mismatch");
-  autoPausedByPort.set(8765, true);
-  await elements.get("autoTransferToggle").onclick();
-  assert.match(elements.get("status").textContent, /bridge\.py 不支持恢复自动传递/);
-  unsupportedAutoTransfer = false;
-  autoPausedByPort.set(8765, false);
-
   await elements.get("recheck").onclick();
   assert.equal(injected.has(7), true);
   assert.equal(recoveryCalls, 1);
@@ -226,27 +207,33 @@ async function main() {
   assert.equal(elements.get("reportRecoveryActions").hidden, false,
     "report recovery appears for a pending report");
   phaseByPort.set(8766, "codex_running");
+  codexInProgressByPort.set(8766, true);
   await intervals[0].callback();
   assert.equal(elements.get("currentTaskSection").hidden, false,
     "codex_running remains in the current task view");
   assert.match(elements.get("taskPhase").textContent, /codex_running/);
   assert.equal(elements.get("reportRecoveryActions").hidden, true,
     "report recovery hides when the report is no longer pending");
-  phaseByPort.set(8766, "stopped");
   assert.equal(intervals[0].delay, 1500);
-  await intervals[0].callback();
+  await elements.get("endFlow").onclick();
+  assert.deepEqual(stopRequests, [{port: 8766, body: {reason: "用户结束当前流程", runId: "run"}}]);
+  assert.equal(state.connections["8"].port, 8766, "ending the flow keeps the tag bound");
+  assert.equal(elements.get("startSelected").disabled, true,
+    "a new flow cannot start while the previous Codex task is still running");
+  assert.match(elements.get("startTaskPhase").textContent, /Codex 仍在运行/);
   assert.equal(elements.get("startSection").hidden, false,
     "a stopped task returns to the start selector");
   assert.equal(elements.get("currentTaskSection").hidden, true);
   assert.equal(elements.get("reportRecoveryActions").hidden, true);
+  codexInProgressByPort.set(8766, false);
+  await intervals[0].callback();
+  assert.equal(elements.get("startSelected").disabled, false,
+    "the start button becomes available when the existing Codex task finishes");
   elements.get("startMode").value = "A";
   await elements.get("startSelected").onclick();
   assert.deepEqual(starts, [{port: 8766, mode: "A"}, {port: 8766, mode: "B"}, {port: 8766, mode: "A"}]);
-  await elements.get("autoTransferToggle").onclick();
-  assert.equal(autoPausedByPort.get(8766), true,
-    "the toggle controls the bridge bound to the active ChatGPT tab");
-  assert.equal(autoPausedByPort.get(8765), false,
-    "pausing one task does not affect another connected task");
+  assert.ok(routed.some(item => item.port === 8766 && item.path === "/stop" && item.method === "POST"));
+  assert.equal(routed.some(item => item.path === "/pause" || item.path === "/resume"), false);
   assert.match(routed.filter(item => item.path === "/state").map(item => item.port).join(","), /8765.*8766|8766.*8765/);
   const chatBRow = elements.get("connections").children.find(row =>
     row.children[0].textContent.startsWith("Chat B"));

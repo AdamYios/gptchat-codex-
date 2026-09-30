@@ -326,58 +326,50 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(bridge.snapshot()["phase"], "await_instruction")
             self.assertEqual(bridge.snapshot()["report"], "")
             bridge.phase = "codex_running"
-            with self.assertRaisesRegex(ValueError, "正在执行"):
+            with self.assertRaisesRegex(ValueError, "仍在执行"):
                 bridge.start("A")
 
-    def test_pause_and_resume_only_change_auto_paused(self):
+    def test_end_flow_during_codex_run_keeps_codex_and_suppresses_its_report(self):
         with tempfile.TemporaryDirectory() as directory:
             bridge = Bridge("task", Path(directory), "codex", 2, 10)
             bridge.start("A")
             bridge.phase = "codex_running"
             bridge.round = 1
-            before = bridge.snapshot()
-            bridge.set_auto_paused(True)
-            paused = bridge.snapshot()
-            self.assertTrue(paused["autoPaused"])
-            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
-                self.assertEqual(paused[key], before[key], key)
+            run_id = bridge.run_id
+            bridge.active_codex_run_id = run_id
+            bridge.stop("用户结束当前流程", run_id)
+            stopped = bridge.snapshot()
+            self.assertEqual(stopped["phase"], "stopped")
+            self.assertTrue(stopped["codexInProgress"])
+            self.assertNotIn("autoPaused", stopped)
+            self.assertEqual(stopped["report"], "")
+            self.assertIn("Codex 仍会继续运行", stopped["detail"])
+            with self.assertRaisesRegex(ValueError, "仍在执行"):
+                bridge.start("A")
 
-            bridge.phase = "report_ready"
-            bridge.report = "保留中的报告"
-            report_before = bridge.snapshot()
-            bridge.set_auto_paused(False)
-            resumed = bridge.snapshot()
-            self.assertFalse(resumed["autoPaused"])
-            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
-                self.assertEqual(resumed[key], report_before[key], key)
-            bridge.set_auto_paused(True)
-            paused_report = bridge.snapshot()
-            self.assertTrue(paused_report["autoPaused"])
-            for key in ("threadId", "runId", "phase", "round", "maxRounds", "report", "reportId", "detail"):
-                self.assertEqual(paused_report[key], resumed[key], key)
-
-    def test_pause_rejects_automatic_instruction_without_marking_it_accepted(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bridge = Bridge("task", Path(directory), "codex", 2, 10)
+            before = {"ordinal": 1, "status": "completed"}
+            completed = {"ordinal": 2, "status": "completed",
+                "user": {"type": "userMessage", "content": [{"type": "text", "text": "指令"}]},
+                "final": {"type": "agentMessage", "phase": "final_answer", "text": "结束后生成的报告"}}
+            with patch("bridge.latest_turn", side_effect=[before, completed]), \
+                 patch("bridge.queued_count", return_value=0), \
+                 patch("bridge.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+                bridge.run_codex("指令", 1, run_id)
+            self.assertTrue(run.called, "ending the flow does not cancel the Codex task")
+            after = bridge.snapshot()
+            self.assertEqual(after["phase"], "stopped")
+            self.assertFalse(after["codexInProgress"])
+            self.assertEqual(after["report"], "", "the completed report is not made available for automatic delivery")
             bridge.start("A")
-            bridge.set_auto_paused(True)
-            before = bridge.snapshot()
-            with patch("bridge.threading.Thread") as thread_factory:
-                with self.assertRaisesRegex(ValueError, "AUTO_TRANSFER_PAUSED"):
-                    bridge.submit("自动指令", bridge.run_id, "automatic-id", automatic=True)
-                thread_factory.assert_not_called()
-                self.assertEqual(bridge.snapshot(), before)
+            self.assertNotEqual(bridge.run_id, run_id)
 
-                # An explicit manual card choice remains available while automation is paused.
-                self.assertTrue(bridge.submit("手动指令", bridge.run_id, "manual-id", automatic=False))
-                thread_factory.assert_called_once()
-
-    def test_pause_and_resume_http_endpoints_preserve_running_bridge_state(self):
+    def test_stop_http_endpoint_ends_flow_without_closing_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
             bridge = Bridge("task", Path(directory), "codex", 2, 10)
             bridge.start("A")
             bridge.phase = "codex_running"
             bridge.round = 1
+            bridge.active_codex_run_id = bridge.run_id
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(bridge, "test-token"))
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()
@@ -392,14 +384,12 @@ class BridgeTests(unittest.TestCase):
 
             try:
                 before = request("/state")
-                paused = request("/pause", {})
-                self.assertTrue(paused["autoPaused"])
-                for key in ("threadId", "runId", "phase", "round"):
-                    self.assertEqual(paused[key], before[key], key)
-                resumed = request("/resume", {})
-                self.assertFalse(resumed["autoPaused"])
-                for key in ("threadId", "runId", "phase", "round"):
-                    self.assertEqual(resumed[key], before[key], key)
+                self.assertTrue(before["codexInProgress"])
+                stopped = request("/stop", {"reason": "用户结束当前流程", "runId": before["runId"]})
+                self.assertEqual(stopped["phase"], "stopped")
+                self.assertEqual(stopped["runId"], before["runId"])
+                self.assertTrue(stopped["codexInProgress"])
+                self.assertEqual(request("/state")["threadId"], "task", "the bridge stays connected")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -451,6 +441,7 @@ class BridgeTests(unittest.TestCase):
                 thread_factory.assert_called_once()
                 self.assertEqual(bridge.snapshot()["round"], 1)
 
+                bridge.active_codex_run_id = None  # The mocked worker did not run.
                 bridge.phase = "await_instruction"
                 bridge.start("A")
                 self.assertFalse(bridge.submit("执行一次", bridge.run_id, instruction_id))

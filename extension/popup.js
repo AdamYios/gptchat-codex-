@@ -4,7 +4,7 @@ const PHASE_HELP = {
   await_instruction: "等待 ChatGPT 页面识别下一张指令卡片",
   codex_running: "Codex 正在处理当前指令",
   report_ready: "Codex 最终报告已准备好，等待发送回 ChatGPT",
-  stopped: "桥接已停止，可检查原因或重新选择起点",
+  stopped: "当前流程已结束，可选择新起点",
 };
 const CHAT_URL = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//;
 const OPTIMIZER_KEYS = {
@@ -18,8 +18,7 @@ function phaseLabel(state) {
   const help = PHASE_HELP[state.phase] || "未知状态，请检查桥接器输出";
   const round = state.phase === "await_instruction" && state.round === 0
     ? "尚未投递第一条指令" : `第 ${state.round} 轮`;
-  const transfer = state.autoPaused ? " · 自动传递已暂停" : "";
-  return `${state.phase} · ${round}${state.detail ? ` · ${state.detail}` : ""} · ${help}${transfer}`;
+  return `${state.phase} · ${round}${state.detail ? ` · ${state.detail}` : ""} · ${help}`;
 }
 
 async function activeChatTab() {
@@ -132,10 +131,6 @@ async function bridgeApi(path, method = "GET", body, connection) {
   if (!response.ok) {
     if (response.status === 404 && path === "/start")
       throw new Error("当前 PowerShell 仍运行旧版 bridge.py；请重启对应桥接器");
-    if (response.status === 404 && (path === "/pause" || path === "/resume")) {
-      const action = path === "/pause" ? "暂停" : "恢复";
-      throw new Error(`当前运行的 bridge.py 不支持${action}自动传递。请按 Ctrl+C 停止该桥接器，使用项目当前版本重新启动，再用新连接信息重新绑定此标签页。`);
-    }
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   return data;
@@ -176,7 +171,7 @@ const OPERATION_NAMES = {
   startA: "选择 A 起点", startB: "选择 B 起点", view_cards: "查看指令卡片",
   choose_card: "发送所选指令卡片", view_log: "查看操作记录",
   recheck: "重新检查报告", confirmSent: "确认报告已发送", retrySend: "重新发送报告",
-  auto_transfer: "自动传递设置"
+  end_flow: "结束当前流程"
 };
 
 async function notifyPage(text, error = false, tabId = null, phase = "") {
@@ -202,7 +197,7 @@ async function act(callback, operation = "action", requestedTabId = null) {
   } catch (error) {
     recordPopup(`${operation}_error`, {reason: popupErrorReason(error)}, tabId);
     const errorMessage = error?.message || String(error);
-    const pageError = operation === "auto_transfer" ? `${label}：${errorMessage}` : `${label}：失败，请查看扩展弹窗`;
+    const pageError = `${label}：失败，请查看扩展弹窗`;
     await notifyPage(pageError, true, tabId);
     $("status").textContent = errorMessage;
   }
@@ -241,9 +236,9 @@ async function show() {
   startSection.hidden = true;
   currentTaskSection.hidden = true;
   recoveryActions.hidden = true;
-  const autoTransferButton = $("autoTransferToggle");
-  const autoTransferStatus = $("autoTransferStatus");
-  autoTransferButton.disabled = true;
+  const endFlowButton = $("endFlow");
+  endFlowButton.disabled = true;
+  $("startSelected").disabled = true;
   $("startConnectionStatus").textContent = "";
   $("startTaskPhase").textContent = "";
   if (!tab) {
@@ -258,17 +253,15 @@ async function show() {
       if (startPhase) {
         startSection.hidden = false;
         $("startConnectionStatus").textContent = `${tab.title || "ChatGPT"} · Codex ${state.threadId || activeConnection.threadId || "任务"} · ${activeConnection.port}`;
-        $("startTaskPhase").textContent = phaseLabel(state);
+        const codexInProgress = state.codexInProgress === true;
+        $("startSelected").disabled = codexInProgress;
+        $("startTaskPhase").textContent = `${phaseLabel(state)}${codexInProgress ? " · Codex 仍在运行，完成后可开始新流程" : ""}`;
       } else {
         currentTaskSection.hidden = false;
-        const paused = state.autoPaused === true;
         $("connectionStatus").textContent = `已连接 · 端口 ${activeConnection.port}`;
         $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${state.threadId || activeConnection.threadId || "任务"}`;
         $("taskPhase").textContent = phaseLabel(state);
-        autoTransferButton.textContent = paused ? "恢复自动传递" : "暂停自动传递";
-        autoTransferButton.disabled = false;
-        autoTransferStatus.textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
-          : "当前自动传递正在运行。";
+        endFlowButton.disabled = false;
       }
       recoveryActions.hidden = state.phase !== "report_ready" || !state.reportId;
     } catch (error) {
@@ -299,7 +292,7 @@ async function show() {
 
 let refreshingActiveTask = false;
 async function refreshActiveTaskState() {
-  if ($("currentTaskSection").hidden || refreshingActiveTask) return;
+  if (($("currentTaskSection").hidden && $("startSection").hidden) || refreshingActiveTask) return;
   refreshingActiveTask = true;
   try {
     const tab = await activeChatTab();
@@ -311,18 +304,25 @@ async function refreshActiveTaskState() {
     }
     const state = await bridgeApi("/state", "GET", undefined, connection);
     if (state.phase === "setup" || state.phase === "stopped") {
+      if (!$("currentTaskSection").hidden) {
+        await show();
+        return;
+      }
+      $("startConnectionStatus").textContent = `${tab.title || "ChatGPT"} · Codex ${state.threadId || connection.threadId || "任务"} · ${connection.port}`;
+      const codexInProgress = state.codexInProgress === true;
+      $("startSelected").disabled = codexInProgress;
+      $("startTaskPhase").textContent = `${phaseLabel(state)}${codexInProgress ? " · Codex 仍在运行，完成后可开始新流程" : ""}`;
+      return;
+    }
+    if (!$("startSection").hidden) {
       await show();
       return;
     }
     if ($("currentTaskSection").hidden) return;
-    const paused = state.autoPaused === true;
     $("connectionStatus").textContent = `已连接 · 端口 ${connection.port}`;
     $("currentTaskName").textContent = `${tab.title || "ChatGPT 对话"} · Codex ${state.threadId || connection.threadId || "任务"}`;
     $("taskPhase").textContent = phaseLabel(state);
-    $("autoTransferToggle").textContent = paused ? "恢复自动传递" : "暂停自动传递";
-    $("autoTransferToggle").disabled = false;
-    $("autoTransferStatus").textContent = paused ? "当前自动传递已暂停；Codex 任务和桥接连接保持运行。"
-      : "当前自动传递正在运行。";
+    $("endFlow").disabled = false;
     $("reportRecoveryActions").hidden = state.phase !== "report_ready" || !state.reportId;
   } catch {
     // A transient state request failure should not replace the user's current popup feedback.
@@ -333,15 +333,15 @@ async function refreshActiveTaskState() {
 
 setInterval(refreshActiveTaskState, 1500);
 
-$("autoTransferToggle").onclick = () => act(async tabId => {
+$("endFlow").onclick = () => act(async tabId => {
   const connection = await connectionFor(tabId);
   if (!connection) throw new Error("当前标签页尚未绑定桥接任务");
   const state = await bridgeApi("/state", "GET", undefined, connection);
-  const paused = state.autoPaused === true;
-  const updated = await bridgeApi(paused ? "/resume" : "/pause", "POST", {}, connection);
-  return updated.autoPaused ? "自动传递已暂停；Codex 任务和连接保持运行。"
-    : "自动传递已恢复。";
-}, "auto_transfer");
+  const stopped = await bridgeApi("/stop", "POST", {reason: "用户结束当前流程", runId: state.runId}, connection);
+  return stopped.codexInProgress
+    ? "当前流程已结束；Codex 仍会继续运行，后续报告不会自动发送到 ChatGPT。"
+    : "当前流程已结束；桥接连接和标签页绑定保持不变。";
+}, "end_flow");
 
 for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize"])
   $(id).addEventListener("change", async () => {

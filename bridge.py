@@ -437,7 +437,7 @@ class Bridge:
         self.run_id = secrets.token_hex(8)
         self.lock = threading.Lock()
         self.phase = "setup"
-        self.auto_paused = False
+        self.active_codex_run_id: str | None = None
         self.round = 0
         self.report = ""
         self.report_id = 0
@@ -457,15 +457,15 @@ class Bridge:
         if mode not in ("A", "B"):
             raise ValueError("起点只能选择 A 或 B")
         with self.lock:
-            if self.phase == "codex_running":
-                raise ValueError("Codex 本轮正在执行；请等它结束后再切换起点")
+            if self.phase == "codex_running" or self.active_codex_run_id is not None:
+                raise ValueError("Codex 本轮仍在执行；请等它结束后再开始新流程")
         # Read before changing state so a missing/incomplete final cannot discard a run.
         if mode == "B" and queued_count(self.thread_id):
             raise ValueError("目标 Codex 任务已有待处理消息；不能把上一轮报告作为当前报告发送")
         initial = read_latest_codex_final(self.thread_id) if mode == "B" else ""
         with self.lock:
-            if self.phase == "codex_running":
-                raise ValueError("Codex 本轮正在执行；请等它结束后再切换起点")
+            if self.phase == "codex_running" or self.active_codex_run_id is not None:
+                raise ValueError("Codex 本轮仍在执行；请等它结束后再开始新流程")
             self.run_id = secrets.token_hex(8)
             self.round = 0
             self.report = initial
@@ -480,16 +480,10 @@ class Bridge:
         with self.lock:
             return {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
                     "report": self.report if self.phase == "report_ready" else "",
-                    "reportId": self.report_id, "detail": self.detail, "autoPaused": self.auto_paused}
+                    "reportId": self.report_id, "detail": self.detail,
+                    "codexInProgress": self.active_codex_run_id is not None}
 
-    def set_auto_paused(self, paused: bool):
-        with self.lock:
-            changed = self.auto_paused != bool(paused)
-            self.auto_paused = bool(paused)
-        if changed:
-            self.log("auto_transfer_paused" if paused else "auto_transfer_resumed", {})
-
-    def submit(self, instruction: str, run_id: str, instruction_id: str = "", automatic: bool = False) -> bool:
+    def submit(self, instruction: str, run_id: str, instruction_id: str = "") -> bool:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 20_000:
             raise ValueError("指令长度必须为 1–20000 字符（Windows 命令行长度限制）")
@@ -512,10 +506,10 @@ class Bridge:
             if duplicate_round is not None:
                 number = duplicate_round
             else:
-                if automatic and self.auto_paused:
-                    raise ValueError("AUTO_TRANSFER_PAUSED")
                 if run_id != self.run_id:
                     raise ValueError("桥接运行编号已变化；请等待页面同步后重试")
+                if self.active_codex_run_id is not None:
+                    raise ValueError("Codex 上一轮仍在执行；请等待完成后再投递新指令")
                 if self.phase != "await_instruction":
                     raise ValueError(f"not accepting instructions in phase {self.phase}")
                 if self.round >= self.max_rounds:
@@ -526,17 +520,19 @@ class Bridge:
                 self.round += 1
                 self.last_instruction = instruction
                 number = self.round
+                self.active_codex_run_id = self.run_id
                 if instruction_id:
                     self.accepted_instruction_ids[instruction_id] = (normalized_instruction, number)
         if duplicate_round is not None:
             self.log("instruction_duplicate", {"round": number, "instructionId": instruction_id})
             return False
-        threading.Thread(target=self.run_codex, args=(instruction, number), daemon=True).start()
+        threading.Thread(target=self.run_codex, args=(instruction, number, run_id), daemon=True).start()
         self.log("instruction_accepted", {"round": number, "instructionLength": len(instruction),
                                            "instructionId": instruction_id or None})
         return True
 
-    def run_codex(self, instruction: str, number: int):
+    def run_codex(self, instruction: str, number: int, run_id: str | None = None):
+        run_id = self.run_id if run_id is None else run_id
         try:
             before = latest_turn(self.thread_id)
             if before and before["status"] != "completed":
@@ -569,24 +565,35 @@ class Bridge:
                     report = (final or {}).get("text", "").strip()
                     if (final or {}).get("type") != "agentMessage" or (final or {}).get("phase") != "final_answer" or not report:
                         raise RuntimeError("本轮已结束，但没有可转发的最终报告")
+                    published = False
                     with self.lock:
-                        if self.phase == "codex_running" and self.round == number:
+                        if self.active_codex_run_id == run_id:
+                            self.active_codex_run_id = None
+                        if self.run_id == run_id and self.phase == "codex_running" and self.round == number:
                             self.report = report
                             self.report_id += 1
                             self.phase = "report_ready"
                             self.detail = ""
+                            published = True
+                            report_id = self.report_id
+                    if not published:
+                        self.log("codex_completed_after_stop", {"round": number})
+                        return
                     print(f"第 {number} 轮：Codex 最终报告已就绪", flush=True)
                     self.log("report_ready", {"round": number, "reportLength": len(report),
-                                              "reportId": self.report_id})
+                                              "reportId": report_id})
                     return
                 if turn["status"] not in ("inProgress", "pending"):
                     raise RuntimeError(f"Codex 本轮未完成（状态 {turn['status']}）：{turn['error'] or ''}")
                 time.sleep(2)
             raise RuntimeError(f"等待 Codex 最终报告超过 {self.timeout} 秒；指令可能仍在原任务中执行，请勿重复投递")
-        except (OSError, sqlite3.Error, json.JSONDecodeError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        except Exception as exc:
             with self.lock:
-                self.phase = "stopped"
-                self.detail = f"{exc}（Codex 程序：{self.codex}；任务 ID：{self.thread_id}）"
+                if self.active_codex_run_id == run_id:
+                    self.active_codex_run_id = None
+                if self.run_id == run_id and self.phase == "codex_running" and self.round == number:
+                    self.phase = "stopped"
+                    self.detail = f"{exc}（Codex 程序：{self.codex}；任务 ID：{self.thread_id}）"
             print(f"第 {number} 轮停止：{exc}", flush=True)
             self.log("codex_error", {"round": number, "errorType": type(exc).__name__,
                                      "reason": error_code(exc)})
@@ -609,11 +616,12 @@ class Bridge:
         with self.lock:
             if run_id != self.run_id:
                 raise ValueError("桥接运行编号已变化；旧停止请求已忽略")
-            if self.phase == "codex_running":
-                raise ValueError("Codex 正在运行；请等待本轮结束")
+            codex_in_progress = self.active_codex_run_id is not None
             self.phase = "stopped"
-            self.detail = reason[:500]
-        self.log("stopped", {"reason": "assistant_stop"})
+            self.detail = reason[:350]
+            if codex_in_progress:
+                self.detail += "；Codex 仍会继续运行，其报告不会自动发送到 ChatGPT"
+        self.log("stopped", {"reason": reason[:500], "codexContinues": codex_in_progress})
 
 
 def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
@@ -673,14 +681,9 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                 if self.path == "/instruction":
                     duplicate_instruction = not bridge.submit(
                         data["instruction"], str(data["runId"]),
-                        str(data.get("instructionId") or ""),
-                        automatic=data.get("automatic") is True)
+                        str(data.get("instructionId") or ""))
                 elif self.path == "/start":
                     bridge.start(str(data["mode"]))
-                elif self.path == "/pause":
-                    bridge.set_auto_paused(True)
-                elif self.path == "/resume":
-                    bridge.set_auto_paused(False)
                 elif self.path == "/ack":
                     bridge.acknowledge(int(data["reportId"]), str(data["runId"]))
                 elif self.path == "/stop":
