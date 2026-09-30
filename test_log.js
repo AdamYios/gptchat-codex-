@@ -88,7 +88,9 @@ async function main() {
   await send({type: "bridgeLog", event: "card_choices_viewed", data: {
     round: 1, cardChoices: 1, strictChoiceCount: 0, manualCandidateCount: 2,
     relaxedChoiceCount: 1, latestOnly: true, method: "main_manual_loose",
-    instruction: "private text"
+    instruction: "private text", elapsedMs: 3000, tickGapMs: 8000,
+    visibilityState: "hidden", mutationObserverUsed: false,
+    diagnosticObserverStarted: true, observerMutationCount: 3
   }}, tabB);
   await send({type: "bridgeLog", event: "post_upgrade", tabId: 10}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}});
   await send({type: "bridgeLog", event: "ignored"}, {tab: {id: 9, url: "https://chatgpt.com/c/other"}});
@@ -100,6 +102,12 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.manualCandidateCount, 2);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.latestOnly, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.method, "main_manual_loose");
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.elapsedMs, 3000);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.tickGapMs, 8000);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.visibilityState, "hidden");
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.mutationObserverUsed, false);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.diagnosticObserverStarted, true);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerMutationCount, 3);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.instruction, undefined);
 
   for (let index = 0; index < 205; index += 1)

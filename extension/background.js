@@ -4,13 +4,18 @@ const DETACHED_LOG_PREFIX = "bridgePendingEvents_tab_";
 const REPORT_WAKE_ALARM = "bridge-report-ready-wake";
 const REPORT_WAKE_PERIOD_MINUTES = 0.5;
 const LOG_FIELDS = new Set([
-  "phase", "round", "reportId", "taskId", "tabId", "boundTabFound",
+  "phase", "round", "reportId", "taskId", "tabId", "boundTabFound", "instructionId", "visibilityState",
   "assistantMessages", "userMessages", "conversationTurns",
   "articles", "copyButtons", "stopButtons", "mainFound", "composerFound", "composerTag",
   "composerLength", "sendButtonFound", "sendButtonDisabled", "cardChoices", "strictChoiceCount",
   "manualCandidateCount", "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength",
   "reportLength", "filledLength", "latestCardLength", "confirmed", "reason", "method",
-  "baselineAvailable", "visibleDelta", "domDelta", "mode", "errorType", "status"
+  "baselineAvailable", "visibleDelta", "domDelta", "mode", "errorType", "status",
+  "elapsedMs", "tickGapMs", "assistantBaselineCount", "assistantCountDelta",
+  "assistantTurnDetected", "stableElapsedMs", "stableThresholdMs", "rafUsed",
+  "setTimeoutUsed", "waitForUsesSetTimeout", "visibilityUsed", "mutationObserverUsed",
+  "isGenerating", "cardPresent", "busy", "tickIntervalMs", "diagnosticObserverStarted",
+  "observerMutationCount"
 ]);
 let logQueue = Promise.resolve();
 let reportPollPromise = null;
@@ -144,7 +149,7 @@ function safeEvent(message, source, connection = null) {
     if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
     else if (typeof value === "boolean") data[key] = value;
     else if (typeof value === "string" &&
-             /^(phase|taskId|composerTag|reason|method|mode|errorType|status)$/.test(key))
+             /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId)$/.test(key))
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);
   }
   const taskId = String(connection?.threadId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);

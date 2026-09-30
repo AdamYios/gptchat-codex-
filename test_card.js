@@ -577,7 +577,12 @@ context.document = {
   const reportUserAfter = new Element("div", "新用户消息", {
     "data-content-search-unit-key": "report:after:user"
   });
+  const reportAssistantBefore = new Element("div", "之前的助手消息", {
+    "data-content-search-unit-key": "report:before:assistant"
+  });
+  let reportAssistantUnits = [reportAssistantBefore];
   let reportUserUnits = [reportUserBefore];
+  const reportInstructionRequests = [];
   const reportButton = {
     disabled: false,
     type: "button",
@@ -598,8 +603,16 @@ context.document = {
   };
   const reportStatusBar = {style: {}, dataset: {}, textContent: ""};
   let reportMessageListener;
+  let reportObserver;
+  class ReportMutationObserver {
+    constructor(callback) { this.callback = callback; this.disconnected = false; reportObserver = this; }
+    observe(target, options) { this.target = target; this.options = options; }
+    disconnect() { this.disconnected = true; }
+    emit(target) { this.callback([{target, addedNodes: []}]); }
+  }
   const reportContext = {
     Date: FastDate,
+    MutationObserver: ReportMutationObserver,
     setTimeout: callback => { fakeNow += 250; callback(); return 1; },
     InputEvent: class InputEvent {},
     location: {pathname: "/c/report"},
@@ -622,13 +635,19 @@ context.document = {
           reportPhase = "await_instruction";
           return {ok: true, data: {}};
         }
+        if (request.type === "bridgeRequest" && request.path === "/instruction") {
+          reportInstructionRequests.push(request.body);
+          return {ok: true, data: {}};
+        }
         return {ok: true, data: {}};
       }
     }},
     document: {
+      visibilityState: "visible",
       querySelector: selector => selector === "main" ? reportMain :
         selector === '#prompt-textarea[contenteditable="true"]' ? reportEditor : null,
       querySelectorAll: selector => {
+        if (selector === '[data-content-search-unit-key$=":assistant"]') return reportAssistantUnits;
         if (selector === '[data-content-search-unit-key$=":user"]') return reportUserUnits;
         if (selector.includes('data-testid="stop-button"'))
           return reportGenerating ? [{getAttribute: () => null}] : [];
@@ -670,10 +689,76 @@ context.document = {
   assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1,
     "a new user message unit key confirms delivery and allows the bridge acknowledgement");
+  assert.ok(reportLog.some(entry => entry.event === "report_acknowledged" && entry.data.reportId === 1),
+    "the assistant-wait diagnostics start only after the bridge acknowledges the report");
+  const waitStarted = reportLog.find(entry => entry.event === "assistant_wait_started");
+  assert.equal(waitStarted.data.method, "setInterval");
+  assert.equal(waitStarted.data.tickIntervalMs, 2000);
+  assert.equal(waitStarted.data.rafUsed, false);
+  assert.equal(waitStarted.data.setTimeoutUsed, false,
+    "the stability wait itself does not use setTimeout");
+  assert.equal(waitStarted.data.waitForUsesSetTimeout, true,
+    "other send confirmation waits still use setTimeout");
+  assert.equal(waitStarted.data.visibilityUsed, false);
+  assert.equal(waitStarted.data.mutationObserverUsed, false);
+  assert.equal(reportLog.find(entry => entry.event === "assistant_wait_observer_started")
+    .data.diagnosticObserverStarted, true,
+  "a separate observer records DOM appearance without driving the automatic flow");
   assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
     "the failed early confirmation remains recorded for diagnosis");
   assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1, "a stale repeated wake after acknowledgement does not resend the report");
   assert.equal(reportLog.filter(entry => entry.event === "send_click").length, 1);
+
+  reportGenerating = true;
+  const reportAssistantAfter = new Element("div", "ChatGPT 回复正在生成", {
+    "data-content-search-unit-key": "report:after:assistant"
+  });
+  reportAssistantUnits = [reportAssistantBefore, reportAssistantAfter];
+  reportContext.document.visibilityState = "hidden";
+  reportObserver.emit(reportAssistantAfter);
+  await reportContext.tickForTest();
+  assert.ok(reportLog.some(entry => entry.event === "assistant_wait_observer_fired"),
+    "the diagnostic observer logs when ChatGPT mutates an assistant turn");
+  assert.ok(reportLog.some(entry => entry.event === "assistant_turn_detected" &&
+    entry.data.isGenerating === true), "a new assistant turn is logged while the stop button is present");
+  assert.equal(reportLog.some(entry => entry.event === "assistant_reply_completed"), false,
+    "a detected turn is not logged complete while ChatGPT is still generating");
+
+  fakeNow += 62000;
+  reportGenerating = false;
+  const diagnosticCard = reportAssistantAfter.append(new Element("div"));
+  const diagnosticHeader = diagnosticCard.append(new Element("div"));
+  diagnosticHeader.append(new Element("span", "给 Codex 的指令"));
+  diagnosticHeader.append(new Element("button", "", {"aria-label": "复制"}));
+  const diagnosticBody = diagnosticCard.append(new Element("div"));
+  diagnosticBody.append(new Element("p", "诊断后继续检查卡片等待阶段。"));
+  reportObserver.emit(diagnosticCard);
+  await reportContext.tickForTest();
+  assert.equal(reportLog.find(entry => entry.event === "assistant_reply_completed").data.visibilityState, "hidden");
+  const firstCardSeen = reportLog.find(entry => entry.event === "card_dom_first_seen");
+  assert.equal(firstCardSeen.data.method, "mutation_observer",
+    "the observer records when the complete card first exists in the DOM");
+  assert.equal(firstCardSeen.data.visibilityState, "hidden");
+  assert.ok(reportLog.some(entry => entry.event === "page_stability_wait_started"),
+    "the signature change starts the existing stability wait");
+  const delayedTick = reportLog.filter(entry => entry.event === "assistant_wait_tick").at(-1);
+  assert.equal(delayedTick.data.tickGapMs, 62000,
+    "the diagnostic records a long gap between ticks while the tab is hidden");
+  assert.equal(delayedTick.data.visibilityState, "hidden");
+
+  fakeNow += 500;
+  await reportContext.tickForTest();
+  assert.equal(reportInstructionRequests.length, 0,
+    "the card is not submitted before the existing 1.8 second stability threshold");
+  fakeNow += 1500;
+  await reportContext.tickForTest();
+  assert.ok(reportLog.some(entry => entry.event === "page_stability_wait_ended"),
+    "the end of the stability wait is recorded");
+  assert.ok(reportLog.some(entry => entry.event === "card_scan" && entry.data.reportId === 1),
+    "the normal card scan is timestamped after the stability wait");
+  assert.ok(reportLog.some(entry => entry.event === "instruction_submit" && entry.data.reportId === 1),
+    "automatic instruction submission has a distinct pre-request log event");
+  assert.equal(reportInstructionRequests.length, 1);
   console.log("Card extraction and content-search-unit fallback OK");
 })().catch(error => { console.error(error); process.exitCode = 1; });

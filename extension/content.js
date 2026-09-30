@@ -11,6 +11,7 @@
   let attemptedAt = Number(sessionStorage.getItem("bridge.attemptedAt") || "0");
   let preSendAssistant = sessionStorage.getItem("bridge.preSendAssistant") || "";
   let preSendAssistantCount = Number(sessionStorage.getItem("bridge.preSendAssistantCount") || "0");
+  let preSendAssistantUnitKey = "";
   let preSendUserCount = Number(sessionStorage.getItem("bridge.preSendUserCount") || "0");
   let preSendUserText = sessionStorage.getItem("bridge.preSendUserText") || "";
   let preSendUserUnitKeys;
@@ -39,6 +40,8 @@
   let lastPhase = "";
   const recordedEvents = new Set();
   let reportWakeQueued = false;
+  let assistantWaitDiagnostic = null;
+  let assistantWaitObserver = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
   let phaseChangedAt = Date.now();
@@ -519,13 +522,87 @@
     return predicate();
   }
 
+  function disconnectAssistantWaitObserver() {
+    assistantWaitObserver?.disconnect();
+    assistantWaitObserver = null;
+  }
+
+  function mutationTouchesMessageUnit(mutation) {
+    const containsMessageUnit = node => {
+      const element = node?.nodeType === 1 ? node : node?.parentElement;
+      if (!element) return false;
+      if (element.closest?.("[data-content-search-unit-key]") ||
+          element.closest?.('[data-message-author-role="assistant"]')) return true;
+      return !!(element.querySelector?.('[data-content-search-unit-key], [data-message-author-role="assistant"]'));
+    };
+    if (containsMessageUnit(mutation.target)) return true;
+    return [...(mutation.addedNodes || [])].some(containsMessageUnit);
+  }
+
+  function startAssistantWaitObserver(diagnostic) {
+    if (typeof MutationObserver !== "function" || !document.body) {
+      record("assistant_wait_observer_unavailable", {reportId: diagnostic.reportId,
+        visibilityState: document.visibilityState || "unknown"}, `assistant_wait_observer_unavailable:${diagnostic.reportId}`);
+      return;
+    }
+    const observer = new MutationObserver(mutations => {
+      const current = assistantWaitDiagnostic;
+      if (!current?.active || current.reportId !== diagnostic.reportId) {
+        observer.disconnect();
+        if (assistantWaitObserver === observer) assistantWaitObserver = null;
+        return;
+      }
+      const observedAt = Date.now();
+      current.observerMutationCount = (current.observerMutationCount || 0) + mutations.length;
+      current.observerLastMutationAt = observedAt;
+      if (!current.observerFirstFiredAt) {
+        current.observerFirstFiredAt = observedAt;
+        record("assistant_wait_observer_fired", {reportId: current.reportId,
+          elapsedMs: observedAt - current.startedAt,
+          observerMutationCount: current.observerMutationCount,
+          visibilityState: document.visibilityState || "unknown"},
+        `assistant_wait_observer_fired:${current.reportId}`);
+      }
+      if (current.cardFirstSeen || !mutations.some(mutationTouchesMessageUnit)) return;
+      const latest = assistantMessages().at(-1) || visibleContentSearchUnits().at(-1);
+      if (!latest) return;
+      try {
+        const title = new RegExp(current.cardTitle || DEFAULT_TITLE.source, "i");
+        const found = extractCard(latest, title, current.cardSelector || "");
+        const cardChoices = found.choices?.length || (found.instruction ? 1 : 0);
+        if (!cardChoices) return;
+        current.cardFirstSeen = true;
+        record("card_dom_first_seen", {reportId: current.reportId,
+          elapsedMs: observedAt - current.startedAt,
+          assistantMessages: assistantMessages().length,
+          cardChoices,
+          instructionLength: found.instruction?.length || 0,
+          isGenerating: isGenerating(),
+          observerMutationCount: current.observerMutationCount,
+          visibilityState: document.visibilityState || "unknown",
+          method: "mutation_observer"}, `card_dom_first_seen:${current.reportId}`);
+        disconnectAssistantWaitObserver();
+      } catch {
+        record("card_dom_probe_error", {reportId: current.reportId,
+          elapsedMs: observedAt - current.startedAt,
+          method: "mutation_observer"}, `card_dom_probe_error:${current.reportId}`);
+      }
+    });
+    assistantWaitObserver = observer;
+    observer.observe(document.body, {subtree: true, childList: true, characterData: true});
+    record("assistant_wait_observer_started", {reportId: diagnostic.reportId,
+      diagnosticObserverStarted: true,
+      visibilityState: document.visibilityState || "unknown",
+      method: "mutation_observer"}, `assistant_wait_observer_started:${diagnostic.reportId}`);
+  }
+
   function drainQueuedReportWake() {
     if (busy || !reportWakeQueued) return;
     reportWakeQueued = false;
     void tick();
   }
 
-  async function acknowledgeReport(reportId, skipPreviousAssistant = false) {
+  async function acknowledgeReport(reportId, skipPreviousAssistant = false, diagnosticConfig = null) {
     record("report_confirmed", {reportId, confirmed: true}, `report_confirmed:${reportId}`);
     sentReport = reportId;
     sessionStorage.setItem("bridge.sentReport", String(reportId));
@@ -534,10 +611,42 @@
       sessionStorage.setItem("bridge.lastSubmitted", lastSubmitted);
     }
     await api("/ack", "POST", {reportId, runId});
+    const startedAt = Date.now();
+    assistantWaitDiagnostic = {
+      active: true,
+      reportId,
+      startedAt,
+      baselineSignature: preSendAssistant,
+      baselineCount: preSendAssistantCount,
+      baselineUnitKey: preSendAssistantUnitKey,
+      cardTitle: diagnosticConfig?.title || DEFAULT_TITLE.source,
+      cardSelector: diagnosticConfig?.card || "",
+      lastTickAt: 0,
+      turnDetected: false,
+      replyCompleted: false,
+      cardFirstSeen: false,
+      stabilityStartedAt: 0,
+      stabilityEndedAt: 0,
+      observerMutationCount: 0,
+      observerFirstFiredAt: 0
+    };
+    record("report_acknowledged", {reportId}, `report_acknowledged:${reportId}`);
+    record("assistant_wait_started", {reportId,
+      assistantBaselineCount: preSendAssistantCount,
+      visibilityState: document.visibilityState || "unknown",
+      method: "setInterval",
+      tickIntervalMs: 2000,
+      stableThresholdMs: 1800,
+      rafUsed: false,
+      setTimeoutUsed: false,
+      waitForUsesSetTimeout: true,
+      visibilityUsed: false,
+      mutationObserverUsed: false}, `assistant_wait_started:${reportId}`);
+    startAssistantWaitObserver(assistantWaitDiagnostic);
     status("最终报告已发往 ChatGPT，等待下一轮");
   }
 
-  async function sendReport(report, reportId) {
+  async function sendReport(report, reportId, diagnosticConfig = null) {
     const currentState = await api("/state");
     if (currentState.phase !== "report_ready" || currentState.reportId !== reportId) {
       status(currentState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
@@ -558,7 +667,9 @@
       throw new Error("找不到 ChatGPT 输入框");
     }
     const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
-    if (reportWasSent(report, reportId)) { await acknowledgeReport(reportId, attemptedReport === reportId); return; }
+    if (reportWasSent(report, reportId)) {
+      await acknowledgeReport(reportId, attemptedReport === reportId, diagnosticConfig); return;
+    }
     const existing = (editor.innerText || editor.textContent || "").trim();
     const ownDraft = normalize(existing).startsWith(normalize(message).slice(0, 90)) &&
       normalize(existing).includes(normalize(report).slice(0, 120));
@@ -593,7 +704,9 @@
     }
     preSendAssistant = currentAssistantSignature();
     sessionStorage.setItem("bridge.preSendAssistant", preSendAssistant);
-    preSendAssistantCount = assistantMessages().length;
+    const preSendAssistantMessages = assistantMessages();
+    preSendAssistantCount = preSendAssistantMessages.length;
+    preSendAssistantUnitKey = contentUnitKey(preSendAssistantMessages.at(-1));
     sessionStorage.setItem("bridge.preSendAssistantCount", String(preSendAssistantCount));
     capturePreSendUserBaseline(reportId);
     attemptedReport = reportId;
@@ -609,7 +722,7 @@
       status("发送已触发，正在继续核对网页消息；如长时间未确认，可在扩展弹窗处理");
       return;
     }
-    await acknowledgeReport(reportId, true);
+    await acknowledgeReport(reportId, true, diagnosticConfig);
   }
 
   async function recover(action) {
@@ -765,12 +878,19 @@
 
   function syncRun(state) {
     if (state.runId === runId) return;
+    if (assistantWaitDiagnostic?.active) {
+      record("assistant_wait_abandoned", {reportId: assistantWaitDiagnostic.reportId,
+        reason: "run_changed"});
+      assistantWaitDiagnostic = null;
+    }
+    disconnectAssistantWaitObserver();
     runId = state.runId;
     sentReport = 0;
     attemptedReport = 0;
     attemptedAt = 0;
     preSendAssistant = "";
     preSendAssistantCount = 0;
+    preSendAssistantUnitKey = "";
     preSendUserCount = 0;
     preSendUserText = "";
     preSendUserUnitKeys = [];
@@ -789,6 +909,17 @@
   }
 
   async function tick() {
+    const waitDiag = assistantWaitDiagnostic;
+    if (waitDiag?.active) {
+      const tickAt = Date.now();
+      record("assistant_wait_tick", {reportId: waitDiag.reportId,
+        elapsedMs: tickAt - waitDiag.startedAt,
+        tickGapMs: waitDiag.lastTickAt ? tickAt - waitDiag.lastTickAt : 0,
+        visibilityState: document.visibilityState || "unknown",
+        busy,
+        method: "setInterval"});
+      waitDiag.lastTickAt = tickAt;
+    }
     if (busy) return;
     busy = true;
     let pendingAutomaticInstructionId = "";
@@ -810,17 +941,77 @@
       if (state.phase === "codex_running") { status(`Codex 第 ${state.round} 轮运行中`); return; }
       if (state.phase === "report_ready") {
         status("正在处理 Codex 最终报告，核对 ChatGPT 发送状态");
-        await sendReport(state.report, state.reportId); return;
+        await sendReport(state.report, state.reportId, config); return;
       }
       const messages = assistantMessages();
       const unitFallback = messages.length === 0;
       const units = unitFallback ? visibleContentSearchUnits() : [];
       const latest = messages.at(-1) || units.at(-1);
+      const wait = assistantWaitDiagnostic?.active ? assistantWaitDiagnostic : null;
       if (!latest) {
+        if (wait) record("assistant_wait_blocked", {reportId: wait.reportId,
+          elapsedMs: Date.now() - wait.startedAt, reason: "no_content",
+          visibilityState: document.visibilityState || "unknown"}, `assistant_wait_blocked:${wait.reportId}:no_content`);
         record("page_wait", {reason: "no_content"}, "page_wait:no_content");
         status("等待 ChatGPT 内容区域出现"); return;
       }
-      if (isGenerating()) {
+      const generating = isGenerating();
+      if (wait) {
+        const latestUnitKey = contentUnitKey(latest);
+        const newTurn = wait.baselineUnitKey && latestUnitKey
+          ? latestUnitKey !== wait.baselineUnitKey
+          : currentAssistantSignature() !== wait.baselineSignature || messages.length > wait.baselineCount;
+        if (newTurn && !wait.turnDetected) {
+          wait.turnDetected = true;
+          record("assistant_turn_detected", {reportId: wait.reportId,
+            elapsedMs: Date.now() - wait.startedAt,
+            assistantMessages: messages.length,
+            assistantBaselineCount: wait.baselineCount,
+            assistantCountDelta: messages.length - wait.baselineCount,
+            assistantTurnDetected: true,
+            isGenerating: generating,
+            visibilityState: document.visibilityState || "unknown",
+            method: latestUnitKey ? "unit_key" : "signature"},
+          `assistant_turn_detected:${wait.reportId}`);
+        }
+        if (newTurn && !generating && !wait.replyCompleted) {
+          wait.replyCompleted = true;
+          record("assistant_reply_completed", {reportId: wait.reportId,
+            elapsedMs: Date.now() - wait.startedAt,
+            assistantMessages: messages.length,
+            assistantBaselineCount: wait.baselineCount,
+            assistantCountDelta: messages.length - wait.baselineCount,
+            assistantTurnDetected: true,
+            isGenerating: false,
+            visibilityState: document.visibilityState || "unknown",
+            method: "stop_button_absent"}, `assistant_reply_completed:${wait.reportId}`);
+        }
+        if (!wait.cardFirstSeen) {
+          try {
+            const diagnosticTitle = new RegExp(config.title || DEFAULT_TITLE.source, "i");
+            const diagnosticCard = extractCard(latest, diagnosticTitle, config.card || "");
+            const cardChoices = diagnosticCard.choices?.length || (diagnosticCard.instruction ? 1 : 0);
+            if (cardChoices) {
+              wait.cardFirstSeen = true;
+              record("card_dom_first_seen", {reportId: wait.reportId,
+                elapsedMs: Date.now() - wait.startedAt,
+                assistantMessages: messages.length,
+                cardChoices,
+                instructionLength: diagnosticCard.instruction?.length || 0,
+                isGenerating: generating,
+                visibilityState: document.visibilityState || "unknown",
+                method: "setInterval_poll"}, `card_dom_first_seen:${wait.reportId}`);
+            }
+          } catch {
+            record("card_dom_probe_error", {reportId: wait.reportId,
+              elapsedMs: Date.now() - wait.startedAt}, `card_dom_probe_error:${wait.reportId}`);
+          }
+        }
+      }
+      if (generating) {
+        if (wait) record("assistant_wait_blocked", {reportId: wait.reportId,
+          elapsedMs: Date.now() - wait.startedAt, reason: "generating",
+          visibilityState: document.visibilityState || "unknown"}, `assistant_wait_blocked:${wait.reportId}:generating`);
         record("page_wait", {reason: "generating"}, "page_wait:generating");
         status("等待 ChatGPT 回复完成"); return;
       }
@@ -832,8 +1023,59 @@
         : unitFallback
           ? `content-search-unit:${normalize(text)}`
           : `${messages.length}:${text}`;
-      if (signature !== lastSignature) { lastSignature = signature; stableSince = Date.now(); status("等待页面内容稳定"); return; }
-      if (Date.now() - stableSince < 1800) { status("等待页面内容稳定"); return; }
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        stableSince = Date.now();
+        if (wait) {
+          wait.stabilityStartedAt = stableSince;
+          wait.stabilityEndedAt = 0;
+          record("page_stability_wait_started", {reportId: wait.reportId,
+            elapsedMs: stableSince - wait.startedAt,
+            stableThresholdMs: 1800,
+            stableElapsedMs: 0,
+            signatureChanged: true,
+            visibilityState: document.visibilityState || "unknown",
+            method: "setInterval",
+            rafUsed: false,
+            setTimeoutUsed: false,
+            visibilityUsed: false,
+            mutationObserverUsed: false},
+          `page_stability_wait_started:${wait.reportId}:${stableSince}`);
+        }
+        status("等待页面内容稳定"); return;
+      }
+      const stableElapsedMs = Date.now() - stableSince;
+      if (stableElapsedMs < 1800) {
+        if (wait && !wait.stabilityStartedAt) {
+          wait.stabilityStartedAt = stableSince;
+          record("page_stability_wait_started", {reportId: wait.reportId,
+            elapsedMs: stableSince - wait.startedAt,
+            stableThresholdMs: 1800,
+            stableElapsedMs,
+            signatureChanged: false,
+            visibilityState: document.visibilityState || "unknown",
+            method: "setInterval",
+            rafUsed: false,
+            setTimeoutUsed: false,
+            visibilityUsed: false,
+            mutationObserverUsed: false},
+          `page_stability_wait_started:${wait.reportId}:${stableSince}`);
+        }
+        status("等待页面内容稳定"); return;
+      }
+      if (wait?.stabilityStartedAt && !wait.stabilityEndedAt) {
+        wait.stabilityEndedAt = Date.now();
+        record("page_stability_wait_ended", {reportId: wait.reportId,
+          elapsedMs: wait.stabilityEndedAt - wait.startedAt,
+          stableElapsedMs,
+          stableThresholdMs: 1800,
+          visibilityState: document.visibilityState || "unknown",
+          method: "setInterval",
+          rafUsed: false,
+          setTimeoutUsed: false,
+          visibilityUsed: false,
+          mutationObserverUsed: false}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
+      }
       if (signature === lastSubmitted) { status("已处理当前指令，等待 ChatGPT 新回复"); return; }
       if (!unitFallback && STOP.test(text)) {
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
@@ -861,6 +1103,10 @@
         latestCardLength: found.choices?.at(-1)?.instruction.length || found.instruction?.length || 0,
         fallbackCandidateCount,
         method: unitFallback ? "content_search_unit" : "assistant_role",
+        ...(wait ? {reportId: wait.reportId, elapsedMs: Date.now() - wait.startedAt,
+          stableElapsedMs: Date.now() - stableSince,
+          assistantTurnDetected: wait.turnDetected,
+          visibilityState: document.visibilityState || "unknown"} : {}),
         reason: found.instruction ? "matched" : "not_matched"}, `card_scan:${signature}`);
       if (unitFallback) {
         if (!found.instruction) {
@@ -889,6 +1135,15 @@
       }
       setInstructionState(id, "pending");
       pendingAutomaticInstructionId = id;
+      if (wait) {
+        record("instruction_submit", {reportId: wait.reportId,
+          instructionId: id,
+          instructionLength: found.instruction.length,
+          elapsedMs: Date.now() - wait.startedAt,
+          visibilityState: document.visibilityState || "unknown"});
+        wait.active = false;
+        disconnectAssistantWaitObserver();
+      }
       await api("/instruction", "POST", {instruction: found.instruction, instructionId: id,
         runId});
       setInstructionState(id, "seen");

@@ -41,8 +41,12 @@ LOG_FIELDS = {"phase", "round", "reportId", "taskId", "tabId", "boundTabFound", 
               "composerFound", "composerTag", "composerLength", "sendButtonFound",
               "sendButtonDisabled", "cardChoices", "strictChoiceCount", "manualCandidateCount",
               "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength", "instructionId", "reportLength",
-              "filledLength", "latestCardLength", "confirmed", "reason", "method", "baselineAvailable",
-              "visibleDelta", "domDelta", "mode", "errorType", "status"}
+              "filledLength", "latestCardLength", "confirmed", "reason", "method", "visibilityState", "baselineAvailable",
+              "visibleDelta", "domDelta", "mode", "errorType", "status", "elapsedMs", "tickGapMs",
+              "assistantBaselineCount", "assistantCountDelta", "assistantTurnDetected", "stableElapsedMs",
+              "stableThresholdMs", "rafUsed", "setTimeoutUsed", "waitForUsesSetTimeout", "visibilityUsed",
+              "mutationObserverUsed", "isGenerating", "cardPresent", "busy", "tickIntervalMs",
+              "diagnosticObserverStarted", "observerMutationCount"}
 
 
 def safe_log_data(data):
@@ -58,7 +62,7 @@ def safe_log_data(data):
         elif isinstance(value, str) and key == "instructionId":
             result[key] = value[:4096]
         elif isinstance(value, str) and key in {"phase", "taskId", "composerTag", "reason", "method",
-                                                       "mode", "errorType", "status"}:
+                                                       "mode", "errorType", "status", "visibilityState"}:
             result[key] = "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:50]
     return result
 

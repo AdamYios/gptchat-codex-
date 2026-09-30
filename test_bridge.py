@@ -101,7 +101,10 @@ class BridgeTests(unittest.TestCase):
                              "relaxedChoiceCount": 1, "latestOnly": True,
                              "method": "main_manual_loose", "phase": "report_ready",
                              "taskId": "state-task", "tabId": 17, "boundTabFound": True,
-                             "reportId": 12, "token": "secret"}}]}).encode()
+                             "reportId": 12, "elapsedMs": 5000, "tickGapMs": 62000,
+                             "visibilityState": "hidden", "mutationObserverUsed": False,
+                             "diagnosticObserverStarted": True, "observerMutationCount": 3,
+                             "token": "secret"}}]}).encode()
                 request = urllib.request.Request(base + "/events", body, method="POST",
                     headers={"X-Bridge-Token": "test-token", "Content-Type": "application/json"})
                 with urllib.request.urlopen(request) as response:
@@ -122,6 +125,12 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(records[0]["data"]["tabId"], 17)
                 self.assertTrue(records[0]["data"]["boundTabFound"])
                 self.assertEqual(records[0]["data"]["reportId"], 12)
+                self.assertEqual(records[0]["data"]["elapsedMs"], 5000)
+                self.assertEqual(records[0]["data"]["tickGapMs"], 62000)
+                self.assertEqual(records[0]["data"]["visibilityState"], "hidden")
+                self.assertFalse(records[0]["data"]["mutationObserverUsed"])
+                self.assertTrue(records[0]["data"]["diagnosticObserverStarted"])
+                self.assertEqual(records[0]["data"]["observerMutationCount"], 3)
                 self.assertEqual(records[1]["taskId"], "task")
                 self.assertNotIn("secret", log.path.read_text(encoding="utf-8"))
             finally:
