@@ -57,12 +57,14 @@
     } catch {}
   }
 
-  function sendMain(type) {
-    window.postMessage({
+  function sendMain(type, payload) {
+    const message = {
       source: CHANNEL,
       direction: "TO_MAIN",
       type
-    }, "*");
+    };
+    if (payload !== undefined) message.payload = payload;
+    window.postMessage(message, "*");
   }
 
   window.addEventListener("message", event => {
@@ -85,7 +87,7 @@
   chrome.storage.local.get(STORAGE_DEFAULTS, stored => {
     settings = settingsFromStorage(stored);
     mirrorToPageStorage();
-    sendMain("REFRESH_SETTINGS");
+    sendMain("REFRESH_SETTINGS", settings);
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -107,7 +109,7 @@
     }
 
     mirrorToPageStorage();
-    sendMain("REFRESH_SETTINGS");
+    sendMain("REFRESH_SETTINGS", settings);
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -116,7 +118,7 @@
     if (message.type === "OPTIMIZER_APPLY") {
       settings = normalizeSettings(message.settings);
       mirrorToPageStorage();
-      sendMain("REFRESH_SETTINGS");
+      sendMain("REFRESH_SETTINGS", settings);
       sendResponse({ ok: true, settings });
       return true;
     }

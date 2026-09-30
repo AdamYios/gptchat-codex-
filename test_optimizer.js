@@ -64,7 +64,8 @@ assert.deepEqual(JSON.parse(localStorageValues.get("optimizer.settings")), {
   enabled: false, keepRounds: 23, renderOptimize: false, liveWindow: false
 });
 assert.deepEqual(plain(sentToPage.at(-1)), {
-  source: channel, direction: "TO_MAIN", type: "REFRESH_SETTINGS"
+  source: channel, direction: "TO_MAIN", type: "REFRESH_SETTINGS",
+  payload: {enabled: false, keepRounds: 23, renderOptimize: false, liveWindow: false}
 });
 
 storageListeners.changed({
@@ -89,6 +90,7 @@ assert.deepEqual(plain(applyReply), {ok: true, settings: {
 }});
 assert.deepEqual(JSON.parse(localStorageValues.get("optimizer.settings")), plain(applyReply.settings));
 assert.equal(sentToPage.at(-1).type, "REFRESH_SETTINGS");
+assert.deepEqual(plain(sentToPage.at(-1).payload), plain(applyReply.settings));
 
 windowListeners.message({source: window, data: {
   source: channel, direction: "FROM_MAIN", type: "STATUS", payload: {rounds: 7}
@@ -108,4 +110,120 @@ runtimeListener({type: "OPTIMIZER_LIVE_NOW"}, {}, reply => Object.assign(liveRep
 assert.deepEqual(plain(liveReply), {ok: true});
 assert.equal(sentToPage.at(-1).type, "APPLY_LIVE_NOW");
 
-console.log("Optimizer storage keys and message namespaces OK");
+async function testMainFetch() {
+const mainWindowListeners = {};
+const networkRequests = [];
+let responseBody = {page_info: {has_previous_page: true, start_cursor: "older-cursor"}, messages: [1, 2, 3]};
+const mainWindow = {
+  fetch: async (input, init) => {
+    networkRequests.push({input, init});
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
+      headers: {"content-type": "application/json"}
+    });
+  },
+  addEventListener: (name, callback) => { mainWindowListeners[name] = callback; },
+  postMessage: message => sentToPage.push(message)
+};
+const fakeDocument = {
+  documentElement: {},
+  head: {appendChild() {}},
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  getElementById: () => null,
+  createElement: () => ({remove() {}}),
+  addEventListener() {}
+};
+class FakeMutationObserver { observe() {} }
+const mainContext = {
+  window: mainWindow,
+  document: fakeDocument,
+  location: {
+    href: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+    origin: "https://chatgpt.com"
+  },
+  localStorage: {getItem: () => JSON.stringify({enabled: true, keepRounds: 4})},
+  performance: {now: () => 1, getEntriesByType: () => []},
+  MutationObserver: FakeMutationObserver,
+  Element: class Element {},
+  HTMLElement: class HTMLElement {},
+  URL,
+  URLSearchParams,
+  Request,
+  Response,
+  Headers,
+  Date,
+  Math,
+  Number,
+  String,
+  Object,
+  RegExp,
+  JSON,
+  setTimeout: () => 1,
+  clearTimeout() {},
+  setInterval: () => 1,
+  requestAnimationFrame: callback => callback(),
+  console
+};
+vm.runInNewContext(mainSource, mainContext, {filename: "optimizer-main.js"});
+
+const conversationId = "12345678-1234-1234-1234-123456789abc";
+const pendingInitial = mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversations/${conversationId}?num_turns=3`
+);
+assert.equal(networkRequests.length, 0, "initial request waits for extension settings");
+mainWindowListeners.message({source: mainWindow, data: {
+  source: channel,
+  direction: "TO_MAIN",
+  type: "REFRESH_SETTINGS",
+  payload: {enabled: true, keepRounds: 23, renderOptimize: true, liveWindow: true}
+}});
+const initialResponse = await pendingInitial;
+assert.equal(new URL(networkRequests[0].input).searchParams.get("num_turns"), "23",
+  "configured N replaces a smaller caller-provided num_turns");
+assert.deepEqual(await initialResponse.json(), {
+  page_info: {has_previous_page: false, start_cursor: null},
+  messages: [1, 2, 3]
+});
+
+await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversations/${conversationId}?num_turns=99`
+);
+assert.equal(new URL(networkRequests[1].input).searchParams.get("num_turns"), "23",
+  "configured N also replaces a larger caller-provided num_turns");
+
+const requestCountBeforeHistory = networkRequests.length;
+const blockedHistory = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversations/${conversationId}/messages?before=older-cursor`
+);
+assert.equal(networkRequests.length, requestCountBeforeHistory,
+  "older-history pagination is not sent to the server");
+assert.deepEqual(await blockedHistory.json(), {
+  current_node: null,
+  messages: [],
+  moderation_results: [],
+  page_info: {has_previous_page: false, start_cursor: null}
+});
+const blockedPostHistory = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversations/${conversationId}/messages?before=older-cursor`,
+  {method: "POST"}
+);
+assert.equal(networkRequests.length, requestCountBeforeHistory,
+  "before pagination is blocked for every method");
+assert.equal(blockedPostHistory.status, 200);
+
+responseBody = {messages: [4]};
+const noPageInfo = await mainWindow.fetch(
+  `https://chatgpt.com/backend-api/conversations/${conversationId}`
+);
+assert.deepEqual(await noPageInfo.json(), {messages: [4]},
+  "responses without page_info keep their original shape");
+
+}
+
+testMainFetch().then(() => {
+  console.log("Optimizer settings sync, bounded initial requests, and history blocking OK");
+}).catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});

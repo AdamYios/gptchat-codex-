@@ -14,6 +14,11 @@
   const NativeIntersectionObserver = window.IntersectionObserver;
 
   let settings = readSettings();
+  let settingsReady = false;
+  let resolveSettingsReady;
+  const settingsReadyPromise = new Promise(resolve => {
+    resolveSettingsReady = resolve;
+  });
   let highestTurnIndexSeen = null;
   let lastUrl = location.href;
   let liveApplyTimer = null;
@@ -74,6 +79,12 @@
     } catch {
       return { ...DEFAULTS };
     }
+  }
+
+  function markSettingsReady() {
+    if (settingsReady) return;
+    settingsReady = true;
+    resolveSettingsReady();
   }
 
 
@@ -256,10 +267,14 @@
     if (!match) return null;
 
     const url = new URL(match.url.href);
-    const existing = Number(url.searchParams.get("num_turns"));
     const desired = clampRounds(settings.keepRounds);
-
-    if (!Number.isFinite(existing) || existing <= 0 || existing > desired) {
+    const existing = Number(url.searchParams.get("num_turns"));
+    if (
+      match.kind === "initial" ||
+      !Number.isFinite(existing) ||
+      existing <= 0 ||
+      existing > desired
+    ) {
       url.searchParams.set("num_turns", String(desired));
     }
 
@@ -286,22 +301,21 @@
     const info = requestInfo(input, init);
     const started = performance.now();
 
-    if (settings.enabled && info.method === "GET") {
+    const conversation = matchConversationUrl(info.url);
+    if (conversation && !settingsReady) await settingsReadyPromise;
+
+    if (settings.enabled && conversation) {
       const rewritten = rewriteConversationUrl(info.url);
 
       if (rewritten) {
-        stats.conversationRequests += 1;
-
-        if (rewritten.kind === "messages") {
-          stats.paginationRequests += 1;
-        }
-
         // A /messages?before=... request is specifically asking for older history.
-        // When history blocking is enabled, stop it at the network boundary.
+        // Stop it at the network boundary, regardless of which HTTP method was used.
         if (
           rewritten.kind === "messages" &&
           rewritten.hasBefore
         ) {
+          stats.conversationRequests += 1;
+          stats.paginationRequests += 1;
           stats.blockedPaginationRequests += 1;
 
           stats.lastBlockedPagination = {
@@ -319,46 +333,51 @@
           return buildEmptyHistoryResponse(rewritten.originalUrl);
         }
 
-        if (rewritten.changed) {
-          stats.rewrittenRequests += 1;
-        }
+        if (info.method === "GET") {
+          stats.conversationRequests += 1;
+          if (rewritten.kind === "messages") stats.paginationRequests += 1;
 
-        const nextInput = rewritten.changed
-          ? rebuildFetchInput(input, rewritten.rewrittenUrl)
-          : input;
-
-        try {
-          let response = await originalFetch(nextInput, init);
-
-          if (rewritten.kind === "initial") {
-            response = await lockInitialHistoryBoundary(response);
+          if (rewritten.changed) {
+            stats.rewrittenRequests += 1;
           }
 
-          stats.lastConversationRequest = {
-            kind: rewritten.kind,
-            changed: rewritten.changed,
-            requested: pathForLog(rewritten.originalUrl),
-            sent: pathForLog(rewritten.rewrittenUrl),
-            status: response.status,
-            contentType: response.headers.get("content-type"),
-            contentLength: response.headers.get("content-length"),
-            durationMs: Math.round(performance.now() - started)
-          };
+          const nextInput = rewritten.changed
+            ? rebuildFetchInput(input, rewritten.rewrittenUrl)
+            : input;
 
-          pushRequest({
-            channel: "conversation",
-            ...stats.lastConversationRequest
-          });
+          try {
+            let response = await originalFetch(nextInput, init);
 
-          emit("STATUS", snapshot());
-          return response;
-        } catch (error) {
-          pushRequest({
-            channel: "conversation-error",
-            request: pathForLog(rewritten.rewrittenUrl),
-            error: String(error?.message || error)
-          });
-          throw error;
+            if (rewritten.kind === "initial") {
+              response = await lockInitialHistoryBoundary(response);
+            }
+
+            stats.lastConversationRequest = {
+              kind: rewritten.kind,
+              changed: rewritten.changed,
+              requested: pathForLog(rewritten.originalUrl),
+              sent: pathForLog(rewritten.rewrittenUrl),
+              status: response.status,
+              contentType: response.headers.get("content-type"),
+              contentLength: response.headers.get("content-length"),
+              durationMs: Math.round(performance.now() - started)
+            };
+
+            pushRequest({
+              channel: "conversation",
+              ...stats.lastConversationRequest
+            });
+
+            emit("STATUS", snapshot());
+            return response;
+          } catch (error) {
+            pushRequest({
+              channel: "conversation-error",
+              request: pathForLog(rewritten.rewrittenUrl),
+              error: String(error?.message || error)
+            });
+            throw error;
+          }
         }
       }
     }
@@ -864,7 +883,10 @@
     }
 
     if (message.type === "REFRESH_SETTINGS") {
-      settings = readSettings();
+      settings = message.payload && typeof message.payload === "object"
+        ? normalizeSettings(message.payload)
+        : readSettings();
+      markSettingsReady();
       refreshRenderStyle();
 
       if (!settings.enabled || !settings.liveWindow) {
