@@ -35,7 +35,8 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-LOG_FIELDS = {"phase", "round", "reportId", "port", "portAutoSelected", "assistantMessages", "userMessages",
+LOG_FIELDS = {"phase", "round", "reportId", "taskId", "tabId", "boundTabFound", "port",
+              "portAutoSelected", "assistantMessages", "userMessages",
               "conversationTurns", "articles", "copyButtons", "stopButtons", "mainFound",
               "composerFound", "composerTag", "composerLength", "sendButtonFound",
               "sendButtonDisabled", "cardChoices", "strictChoiceCount", "manualCandidateCount",
@@ -56,7 +57,7 @@ def safe_log_data(data):
             result[key] = value
         elif isinstance(value, str) and key == "instructionId":
             result[key] = value[:4096]
-        elif isinstance(value, str) and key in {"phase", "composerTag", "reason", "method",
+        elif isinstance(value, str) and key in {"phase", "taskId", "composerTag", "reason", "method",
                                                        "mode", "errorType", "status"}:
             result[key] = "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:50]
     return result

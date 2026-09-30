@@ -4,7 +4,8 @@ const DETACHED_LOG_PREFIX = "bridgePendingEvents_tab_";
 const REPORT_WAKE_ALARM = "bridge-report-ready-wake";
 const REPORT_WAKE_PERIOD_MINUTES = 0.5;
 const LOG_FIELDS = new Set([
-  "phase", "round", "reportId", "assistantMessages", "userMessages", "conversationTurns",
+  "phase", "round", "reportId", "taskId", "tabId", "boundTabFound",
+  "assistantMessages", "userMessages", "conversationTurns",
   "articles", "copyButtons", "stopButtons", "mainFound", "composerFound", "composerTag",
   "composerLength", "sendButtonFound", "sendButtonDisabled", "cardChoices", "strictChoiceCount",
   "manualCandidateCount", "relaxedChoiceCount", "fallbackCandidateCount", "latestOnly", "instructionLength",
@@ -59,14 +60,48 @@ function pollPendingReports() {
       if (!Number.isInteger(tabId) || !connection.port || !connection.token) return;
       recordBackgroundEvent(connection, "alarm_fired");
       try {
-        const response = await fetch(`http://127.0.0.1:${connection.port}/state`, {
-          headers: {"X-Bridge-Token": connection.token}, signal: AbortSignal.timeout(4000)
-        });
-        if (!response.ok) return;
-        const state = await response.json();
+        let response;
+        try {
+          response = await fetch(`http://127.0.0.1:${connection.port}/state`, {
+            headers: {"X-Bridge-Token": connection.token}, signal: AbortSignal.timeout(4000)
+          });
+        } catch (error) {
+          recordBackgroundEvent(connection, "alarm_state_checked", {
+            tabId, status: "request_error", errorType: error?.name || "Error"
+          });
+          return;
+        }
+        if (!response.ok) {
+          recordBackgroundEvent(connection, "alarm_state_checked", {tabId, status: `http_${response.status}`});
+          return;
+        }
+        let state;
+        try {
+          state = await response.json();
+        } catch (error) {
+          recordBackgroundEvent(connection, "alarm_state_checked", {
+            tabId, status: "invalid_json", errorType: error?.name || "Error"
+          });
+          return;
+        }
         const reportId = Number(state.reportId);
-        if (state.phase !== "report_ready" || !Number.isSafeInteger(reportId) || reportId <= 0) return;
-        recordBackgroundEvent(connection, "report_ready_detected", reportId);
+        const stateTaskId = typeof state.taskId === "string" ? state.taskId :
+          typeof state.threadId === "string" ? state.threadId : "";
+        const stateDetails = {
+          tabId,
+          ...(typeof state.phase === "string" ? {phase: state.phase} : {}),
+          ...(stateTaskId ? {taskId: stateTaskId} : {}),
+          ...(Number.isSafeInteger(reportId) ? {reportId} : {})
+        };
+        recordBackgroundEvent(connection, "alarm_state_checked", stateDetails);
+        checkAlarmTab(connection, tabId, stateDetails);
+
+        if (state.phase !== "report_ready" || !Number.isSafeInteger(reportId) || reportId <= 0) {
+          recordBackgroundEvent(connection, "alarm_no_report", stateDetails);
+          return;
+        }
+        recordBackgroundEvent(connection, "alarm_report_match", stateDetails);
+        recordBackgroundEvent(connection, "report_ready_detected", {reportId});
 
         // A tab can be rebound while a poll is in flight. Only wake it if the
         // same task still owns this binding; sending a message never activates it.
@@ -74,7 +109,7 @@ function pollPendingReports() {
         if (!current || current.id !== connection.id || current.port !== connection.port ||
             current.token !== connection.token) return;
         const wake = chrome.tabs.sendMessage(tabId, {type: "bridgeReportReady", reportId});
-        recordBackgroundEvent(connection, "wake_message_sent", reportId);
+        recordBackgroundEvent(connection, "wake_message_sent", {reportId});
         await wake;
       } catch { /* The next alarm retries if the bridge or tab is temporarily unavailable. */ }
     }));
@@ -109,7 +144,7 @@ function safeEvent(message, source, connection = null) {
     if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
     else if (typeof value === "boolean") data[key] = value;
     else if (typeof value === "string" &&
-             /^(phase|composerTag|reason|method|mode|errorType|status)$/.test(key))
+             /^(phase|taskId|composerTag|reason|method|mode|errorType|status)$/.test(key))
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);
   }
   const taskId = String(connection?.threadId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);
@@ -159,8 +194,7 @@ function scheduleLog(task) {
   return logQueue;
 }
 
-function recordBackgroundEvent(connection, event, reportId = null) {
-  const data = Number.isSafeInteger(reportId) && reportId > 0 ? {reportId} : {};
+function recordBackgroundEvent(connection, event, data = {}) {
   const entry = safeEvent({event, data}, "background", connection);
   const tabId = Number(connection.tabId);
   const task = scheduleLog(async () => {
@@ -172,6 +206,23 @@ function recordBackgroundEvent(connection, event, reportId = null) {
     await flushPending(tabId);
   });
   void task.catch(() => {});
+}
+
+function checkAlarmTab(connection, tabId, stateDetails) {
+  let tabRequest;
+  try { tabRequest = chrome.tabs.get(tabId); }
+  catch {
+    recordBackgroundEvent(connection, "alarm_no_tab", {...stateDetails, boundTabFound: false});
+    return;
+  }
+  Promise.resolve(tabRequest).then(tab => {
+    if (tab) recordBackgroundEvent(connection, "alarm_tab_found",
+      {...stateDetails, boundTabFound: true});
+    else recordBackgroundEvent(connection, "alarm_no_tab",
+      {...stateDetails, boundTabFound: false});
+  }, () => {
+    recordBackgroundEvent(connection, "alarm_no_tab", {...stateDetails, boundTabFound: false});
+  }).catch(() => {});
 }
 
 async function unbindConnection(tabId, fallbackTaskId = "", source = "popup") {

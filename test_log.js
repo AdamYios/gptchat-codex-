@@ -14,6 +14,7 @@ async function main() {
   const apiRouted = [];
   const reportWakeMessages = [];
   const alarmRecords = new Map();
+  const missingTabIds = new Set();
   let online = false;
   let listener;
   let tabRemovedListener;
@@ -21,6 +22,10 @@ async function main() {
   const chrome = {
     runtime: {onMessage: {addListener: callback => { listener = callback; }}},
     tabs: {onRemoved: {addListener: callback => { tabRemovedListener = callback; }},
+      get: async tabId => {
+        if (missingTabIds.has(tabId)) throw new Error("tab not found");
+        return {id: tabId};
+      },
       sendMessage: async (tabId, message) => { reportWakeMessages.push({tabId, message}); }},
     alarms: {
       get: async name => alarmRecords.get(name) || null,
@@ -128,7 +133,9 @@ async function main() {
   assert.deepEqual(apiRouted, [8767, 8766]);
   assert.equal(alarmRecords.get("bridge-report-ready-wake")?.periodInMinutes, 0.5,
     "the MV3 worker installs a minimum-period report wake alarm");
+  missingTabIds.add(8);
   await alarmListener({name: "bridge-report-ready-wake"});
+  await new Promise(resolve => setTimeout(resolve, 0));
   await send({type: "bridgeLog", event: "wake_log_flush", data: {}}, reboundTabA);
   assert.deepEqual(reportWakeMessages.map(({tabId, message}) => ({tabId,
     message: {type: message.type, reportId: message.reportId}})), [{tabId: 7,
@@ -147,8 +154,30 @@ async function main() {
   assert.equal(wakeEvents[0].data.reportId, undefined);
   assert.equal(wakeEvents[1].data.reportId, 4);
   assert.equal(wakeEvents[2].data.reportId, 4);
+  const stateCheckedA = written.get(8767).find(entry => entry.event === "alarm_state_checked");
+  assert.equal(stateCheckedA.data.phase, "report_ready");
+  assert.equal(stateCheckedA.data.taskId, "taskA");
+  assert.equal(stateCheckedA.data.tabId, 7);
+  assert.equal(stateCheckedA.data.reportId, 4);
+  const reportMatchA = written.get(8767).find(entry => entry.event === "alarm_report_match");
+  assert.equal(reportMatchA.data.reportId, 4);
+  const tabFoundA = written.get(8767).find(entry => entry.event === "alarm_tab_found");
+  assert.equal(tabFoundA.data.tabId, 7);
+  assert.equal(tabFoundA.data.boundTabFound, true);
   assert.ok(written.get(8766).some(entry => entry.event === "alarm_fired" &&
     entry.taskId === "taskB"), "alarm events are logged separately per bound task");
+  const taskBAlarmEvents = written.get(8766).filter(entry =>
+    ["alarm_state_checked", "alarm_no_tab", "alarm_no_report"].includes(entry.event)
+  );
+  const stateCheckedB = taskBAlarmEvents.find(entry => entry.event === "alarm_state_checked");
+  assert.equal(stateCheckedB.data.phase, "setup");
+  assert.equal(stateCheckedB.data.taskId, "taskB");
+  assert.equal(stateCheckedB.data.tabId, 8);
+  assert.equal(stateCheckedB.data.reportId, 0);
+  assert.ok(taskBAlarmEvents.some(entry => entry.event === "alarm_no_tab" &&
+    entry.data.tabId === 8 && entry.data.boundTabFound === false));
+  assert.ok(taskBAlarmEvents.some(entry => entry.event === "alarm_no_report" &&
+    entry.data.phase === "setup"));
   assert.deepEqual(apiRouted.slice(2), [8767, 8766, 8770]);
 
   online = false;
@@ -160,9 +189,9 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_tab_8[0].taskId, "taskB");
 
   assert.equal(written.get(8765).length, 0);
-  assert.equal(written.get(8767).length, 212);
-  assert.equal(written.get(8766).length, 4);
-  assert.equal(written.get(8770).length, 4);
+  assert.equal(written.get(8767).length, 215);
+  assert.equal(written.get(8766).length, 7);
+  assert.equal(written.get(8770).length, 7);
   assert.deepEqual(written.get(8767).slice(0, 2).map(entry => entry.event), ["send_click", "offline_step"]);
   assert.equal(written.get(8767)[0].taskId, "taskA");
   assert.equal(written.get(8767).at(-1).taskId, "taskA");
