@@ -41,7 +41,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  tickInterval = setInterval\(tick, 2000\);\s*tick\(\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -87,6 +87,22 @@ const context = {location: {pathname: "/c/test"}, sessionStorage: {
     }}
   }, console};
 vm.runInNewContext(source, context, {filename: file});
+
+const statusBar = {style: {}, dataset: {}, textContent: ""};
+context.document = {getElementById: id => id === "codex-bridge-status" ? statusBar : null};
+context.statusForTest("已自动识别并发送最新的未处理指令卡片");
+assert.equal(context.statusSnapshotForTest().actionStatus, "已自动识别并发送最新的未处理指令卡片",
+  "automatic bridge status transitions should appear in the recent-activity row");
+assert.match(statusBar.textContent, /最近操作.*已自动识别并发送/);
+context.actionFeedbackForTest("手动查看卡片");
+const manualActionChangedAt = context.statusSnapshotForTest().actionChangedAt;
+context.statusForTest("已自动识别并发送最新的未处理指令卡片");
+assert.equal(context.statusSnapshotForTest().actionStatus, "手动查看卡片",
+  "repeated polling of an unchanged status should not erase a newer manual action");
+assert.equal(context.statusSnapshotForTest().actionChangedAt, manualActionChangedAt);
+context.statusForTest("报告已发往 ChatGPT，等待下一轮");
+assert.equal(context.statusSnapshotForTest().actionStatus, "报告已发往 ChatGPT，等待下一轮",
+  "the next automatic status transition should become the recent activity");
 
 const message = new Element("div", "", {"data-content-search-unit-key": "thread:latest:assistant"});
 message.append(new Element("p", "所以我建议先检查现有 schema。"));

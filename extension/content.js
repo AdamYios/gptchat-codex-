@@ -118,6 +118,12 @@
       phaseStatus = text;
       phaseStatusError = error;
       phaseChangedAt = Date.now();
+      // Keep the recent-activity line useful for automatic bridge progress,
+      // not only popup button actions. Repeated polling of the same status
+      // does not replace a newer manual action or refresh its timestamp.
+      actionStatus = String(text || "").slice(0, 160);
+      actionStatusError = error;
+      actionChangedAt = phaseChangedAt;
     }
     lastCheckAt = Date.now();
     renderStatus();
