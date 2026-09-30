@@ -15,7 +15,16 @@ const LOG_FIELDS = new Set([
   "assistantTurnDetected", "stableElapsedMs", "stableThresholdMs", "rafUsed",
   "setTimeoutUsed", "waitForUsesSetTimeout", "visibilityUsed", "mutationObserverUsed",
   "isGenerating", "cardPresent", "busy", "tickIntervalMs", "diagnosticObserverStarted",
-  "observerMutationCount"
+  "observerMutationCount", "observerCallbackCount", "observerChildListCount",
+  "observerCharacterDataCount", "observerAttributeCount", "observerCallbackDelta",
+  "observerMutationDelta", "optimizerLiveWindowMutationCount", "optimizerLiveWindowMutationDelta",
+  "optimizerBoundaryMutationCount", "optimizerBoundaryMutationDelta", "optimizerHiddenMarkerCount",
+  "optimizerBoundaryMarkerCount", "optimizerStatusAvailable", "optimizerLiveScans",
+  "optimizerLiveScanDelta", "optimizerLiveUnits", "optimizerLiveHiddenUnits",
+  "optimizerLiveLastReason",
+  "signatureChangeCount", "signatureLength", "unitKeyLength",
+  "latestTextLength", "assistantMessageCount", "previousStableElapsedMs", "cardFirstSeen",
+  "replyCompleted"
 ]);
 let logQueue = Promise.resolve();
 let reportPollPromise = null;
@@ -149,7 +158,7 @@ function safeEvent(message, source, connection = null) {
     if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
     else if (typeof value === "boolean") data[key] = value;
     else if (typeof value === "string" &&
-             /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId)$/.test(key))
+             /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId|optimizerLiveLastReason)$/.test(key))
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);
   }
   const taskId = String(connection?.threadId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);

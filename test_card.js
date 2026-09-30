@@ -603,16 +603,24 @@ context.document = {
   };
   const reportStatusBar = {style: {}, dataset: {}, textContent: ""};
   let reportMessageListener;
+  let reportWindowMessageListener;
+  const reportWindow = {addEventListener(type, callback) {
+    if (type === "message") reportWindowMessageListener = callback;
+  }};
   let reportObserver;
   class ReportMutationObserver {
     constructor(callback) { this.callback = callback; this.disconnected = false; reportObserver = this; }
     observe(target, options) { this.target = target; this.options = options; }
     disconnect() { this.disconnected = true; }
-    emit(target) { this.callback([{target, addedNodes: []}]); }
+    emit(target) { this.callback([{type: "childList", target, addedNodes: []}]); }
+    emitAttribute(target, attributeName) {
+      this.callback([{type: "attributes", target, attributeName, addedNodes: []}]);
+    }
   }
   const reportContext = {
     Date: FastDate,
     MutationObserver: ReportMutationObserver,
+    window: reportWindow,
     setTimeout: callback => { fakeNow += 250; callback(); return 1; },
     InputEvent: class InputEvent {},
     location: {pathname: "/c/report"},
@@ -665,6 +673,9 @@ context.document = {
     const keepChannelOpen = reportMessageListener({type: "bridgeReportReady", reportId: 1}, null, resolve);
     assert.equal(keepChannelOpen, true, "report-ready notification waits for the page-side wake tick");
   });
+  const emitOptimizerStatus = payload => reportWindowMessageListener({source: reportWindow, data: {
+    source: "CHATGPT_LONG_CHAT_OPTIMIZER", direction: "FROM_MAIN", type: "STATUS", payload
+  }});
   assert.equal((await wakeForReport()).ok, true);
   assert.ok(reportLog.some(entry => entry.event === "content_wake_received" &&
     entry.data.reportId === 1), "content logs the received wake with its report ID");
@@ -704,6 +715,8 @@ context.document = {
   assert.equal(reportLog.find(entry => entry.event === "assistant_wait_observer_started")
     .data.diagnosticObserverStarted, true,
   "a separate observer records DOM appearance without driving the automatic flow");
+  assert.ok(reportObserver.options.attributeFilter.includes("data-cgo-live-hidden"),
+    "the observer watches the optimizer live-window marker for diagnostic attribution");
   assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
     "the failed early confirmation remains recorded for diagnosis");
   assert.equal((await wakeForReport()).ok, true);
@@ -722,6 +735,9 @@ context.document = {
     "the diagnostic observer logs when ChatGPT mutates an assistant turn");
   assert.ok(reportLog.some(entry => entry.event === "assistant_turn_detected" &&
     entry.data.isGenerating === true), "a new assistant turn is logged while the stop button is present");
+  assert.ok(reportLog.some(entry => entry.event === "page_stability_checkpoint" &&
+    entry.data.reason === "assistant_generating"),
+  "the stability diagnostics identify assistant generation as an early return gate");
   assert.equal(reportLog.some(entry => entry.event === "assistant_reply_completed"), false,
     "a detected turn is not logged complete while ChatGPT is still generating");
 
@@ -734,12 +750,15 @@ context.document = {
   const diagnosticBody = diagnosticCard.append(new Element("div"));
   diagnosticBody.append(new Element("p", "诊断后继续检查卡片等待阶段。"));
   reportObserver.emit(diagnosticCard);
+  emitOptimizerStatus({liveScans: 12, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "new-content"});
   await reportContext.tickForTest();
   assert.equal(reportLog.find(entry => entry.event === "assistant_reply_completed").data.visibilityState, "hidden");
   const firstCardSeen = reportLog.find(entry => entry.event === "card_dom_first_seen");
   assert.equal(firstCardSeen.data.method, "mutation_observer",
     "the observer records when the complete card first exists in the DOM");
   assert.equal(firstCardSeen.data.visibilityState, "hidden");
+  assert.equal(reportObserver.disconnected, false,
+    "the diagnostic observer continues counting DOM changes after it finds the card");
   assert.ok(reportLog.some(entry => entry.event === "page_stability_wait_started"),
     "the signature change starts the existing stability wait");
   const delayedTick = reportLog.filter(entry => entry.event === "assistant_wait_tick").at(-1);
@@ -747,11 +766,44 @@ context.document = {
     "the diagnostic records a long gap between ticks while the tab is hidden");
   assert.equal(delayedTick.data.visibilityState, "hidden");
 
+  diagnosticCard.attributes["data-cgo-live-hidden"] = "true";
+  reportContext.document.querySelectorAll = selector => {
+    if (selector === '[data-content-search-unit-key$=":assistant"]') return reportAssistantUnits;
+    if (selector === '[data-content-search-unit-key$=":user"]') return reportUserUnits;
+    if (selector === '[data-cgo-live-hidden="true"]') return [diagnosticCard];
+    if (selector === '[data-cgo-history-boundary="true"]') return [];
+    if (selector.includes('data-testid="stop-button"'))
+      return reportGenerating ? [{getAttribute: () => null}] : [];
+    return [];
+  };
+  reportObserver.emitAttribute(diagnosticCard, "data-cgo-live-hidden");
   fakeNow += 500;
   await reportContext.tickForTest();
   assert.equal(reportInstructionRequests.length, 0,
     "the card is not submitted before the existing 1.8 second stability threshold");
-  fakeNow += 1500;
+  const stabilityCheckpoint = reportLog.filter(entry => entry.event === "page_stability_checkpoint" &&
+    entry.data.reason === "stable_threshold").at(-1);
+  assert.equal(stabilityCheckpoint.data.optimizerLiveWindowMutationDelta, 1,
+    "stability checkpoints count optimizer live-window marker mutations");
+  assert.equal(stabilityCheckpoint.data.optimizerHiddenMarkerCount, 1);
+  assert.equal(stabilityCheckpoint.data.optimizerLiveScans, 12);
+  assert.equal(stabilityCheckpoint.data.optimizerLiveUnits, 8);
+  assert.equal(stabilityCheckpoint.data.optimizerLiveHiddenUnits, 3);
+  assert.equal(stabilityCheckpoint.data.optimizerLiveLastReason, "new-content");
+  assert.equal(stabilityCheckpoint.data.signatureChangeCount, 1,
+    "an optimizer marker mutation is observable but does not reset the content signature timer");
+  assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1);
+  emitOptimizerStatus({liveScans: 13, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "mutation"});
+  reportObserver.emitAttribute(diagnosticCard, "style");
+  fakeNow += 500;
+  await reportContext.tickForTest();
+  const optimizerScanCheckpoint = reportLog.filter(entry => entry.event === "page_stability_checkpoint" &&
+    entry.data.reason === "stable_threshold").at(-1);
+  assert.equal(optimizerScanCheckpoint.data.optimizerLiveScanDelta, 1,
+    "the checkpoint correlates optimizer live-window scans with the page stability gate");
+  assert.equal(optimizerScanCheckpoint.data.optimizerLiveWindowMutationDelta, 1);
+  assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1);
+  fakeNow += 1000;
   await reportContext.tickForTest();
   assert.ok(reportLog.some(entry => entry.event === "page_stability_wait_ended"),
     "the end of the stability wait is recorded");

@@ -42,6 +42,7 @@
   let reportWakeQueued = false;
   let assistantWaitDiagnostic = null;
   let assistantWaitObserver = null;
+  let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
   let phaseChangedAt = Date.now();
@@ -51,6 +52,23 @@
   let actionChangedAt = 0;
   const scriptInstance = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let tickInterval = null;
+
+  try {
+    if (typeof window !== "undefined" && window.addEventListener) {
+      window.addEventListener("message", event => {
+        const message = event.data;
+        if (event.source !== window || message?.source !== "CHATGPT_LONG_CHAT_OPTIMIZER" ||
+            message.direction !== "FROM_MAIN" || !["READY", "STATUS"].includes(message.type)) return;
+        const payload = message.payload || {};
+        optimizerDiagnosticStatus = {
+          liveScans: Number.isFinite(Number(payload.liveScans)) ? Number(payload.liveScans) : null,
+          liveUnits: Number.isFinite(Number(payload.liveUnits)) ? Number(payload.liveUnits) : null,
+          liveHiddenUnits: Number.isFinite(Number(payload.liveHiddenUnits)) ? Number(payload.liveHiddenUnits) : null,
+          liveLastReason: typeof payload.liveLastReason === "string" ? payload.liveLastReason : ""
+        };
+      });
+    }
+  } catch { /* Optimizer diagnostics are optional and must not affect bridge startup. */ }
 
   function operationSnapshot() {
     const editor = composer();
@@ -539,6 +557,61 @@
     return [...(mutation.addedNodes || [])].some(containsMessageUnit);
   }
 
+  function diagnosticSelectorCount(selector) {
+    try { return document.querySelectorAll(selector).length; }
+    catch { return 0; }
+  }
+
+  function assistantWaitDiagnosticFields(wait) {
+    const liveScans = optimizerDiagnosticStatus?.liveScans;
+    const fields = {
+      observerCallbackCount: wait.observerCallbackCount || 0,
+      observerMutationCount: wait.observerMutationCount || 0,
+      observerChildListCount: wait.observerChildListCount || 0,
+      observerCharacterDataCount: wait.observerCharacterDataCount || 0,
+      observerAttributeCount: wait.observerAttributeCount || 0,
+      optimizerLiveWindowMutationCount: wait.optimizerLiveWindowMutationCount || 0,
+      optimizerBoundaryMutationCount: wait.optimizerBoundaryMutationCount || 0,
+      optimizerHiddenMarkerCount: diagnosticSelectorCount('[data-cgo-live-hidden="true"]'),
+      optimizerBoundaryMarkerCount: diagnosticSelectorCount('[data-cgo-history-boundary="true"]'),
+      optimizerStatusAvailable: !!optimizerDiagnosticStatus,
+      optimizerLiveScans: liveScans ?? 0,
+      optimizerLiveUnits: optimizerDiagnosticStatus?.liveUnits ?? 0,
+      optimizerLiveHiddenUnits: optimizerDiagnosticStatus?.liveHiddenUnits ?? 0,
+      optimizerLiveLastReason: optimizerDiagnosticStatus?.liveLastReason || ""
+    };
+    const previous = wait.lastDiagnosticSnapshot || {};
+    fields.observerCallbackDelta = fields.observerCallbackCount - (previous.observerCallbackCount || 0);
+    fields.observerMutationDelta = fields.observerMutationCount - (previous.observerMutationCount || 0);
+    fields.optimizerLiveWindowMutationDelta = fields.optimizerLiveWindowMutationCount -
+      (previous.optimizerLiveWindowMutationCount || 0);
+    fields.optimizerBoundaryMutationDelta = fields.optimizerBoundaryMutationCount -
+      (previous.optimizerBoundaryMutationCount || 0);
+    fields.optimizerLiveScanDelta = liveScans === null || liveScans === undefined ||
+      wait.lastOptimizerLiveScans === null || wait.lastOptimizerLiveScans === undefined
+      ? 0 : liveScans - wait.lastOptimizerLiveScans;
+    if (liveScans !== null && liveScans !== undefined) wait.lastOptimizerLiveScans = liveScans;
+    wait.lastDiagnosticSnapshot = fields;
+    return fields;
+  }
+
+  function recordAssistantWaitCheckpoint(wait, reason, details = {}) {
+    if (!wait?.active) return;
+    const now = Date.now();
+    record("page_stability_checkpoint", {reportId: wait.reportId,
+      elapsedMs: now - wait.startedAt,
+      stableElapsedMs: stableSince ? now - stableSince : 0,
+      stableThresholdMs: 1800,
+      signatureChangeCount: wait.signatureChangeCount || 0,
+      cardFirstSeen: !!wait.cardFirstSeen,
+      assistantTurnDetected: !!wait.turnDetected,
+      replyCompleted: !!wait.replyCompleted,
+      visibilityState: document.visibilityState || "unknown",
+      reason,
+      ...assistantWaitDiagnosticFields(wait),
+      ...details});
+  }
+
   function startAssistantWaitObserver(diagnostic) {
     if (typeof MutationObserver !== "function" || !document.body) {
       record("assistant_wait_observer_unavailable", {reportId: diagnostic.reportId,
@@ -553,8 +626,28 @@
         return;
       }
       const observedAt = Date.now();
+      current.observerCallbackCount = (current.observerCallbackCount || 0) + 1;
       current.observerMutationCount = (current.observerMutationCount || 0) + mutations.length;
       current.observerLastMutationAt = observedAt;
+      const liveMarkerTargets = new Set(mutations
+        .filter(mutation => mutation.type === "attributes" &&
+          mutation.attributeName === "data-cgo-live-hidden")
+        .map(mutation => mutation.target));
+      for (const mutation of mutations) {
+        if (mutation.type === "childList") current.observerChildListCount = (current.observerChildListCount || 0) + 1;
+        else if (mutation.type === "characterData") current.observerCharacterDataCount = (current.observerCharacterDataCount || 0) + 1;
+        else if (mutation.type === "attributes") {
+          current.observerAttributeCount = (current.observerAttributeCount || 0) + 1;
+          if (mutation.attributeName === "data-cgo-live-hidden" ||
+              (mutation.attributeName === "style" &&
+               (mutation.target?.getAttribute?.("data-cgo-live-hidden") === "true" ||
+                liveMarkerTargets.has(mutation.target)))) {
+            current.optimizerLiveWindowMutationCount = (current.optimizerLiveWindowMutationCount || 0) + 1;
+          }
+          if (mutation.attributeName === "data-cgo-history-boundary")
+            current.optimizerBoundaryMutationCount = (current.optimizerBoundaryMutationCount || 0) + 1;
+        }
+      }
       if (!current.observerFirstFiredAt) {
         current.observerFirstFiredAt = observedAt;
         record("assistant_wait_observer_fired", {reportId: current.reportId,
@@ -563,7 +656,8 @@
           visibilityState: document.visibilityState || "unknown"},
         `assistant_wait_observer_fired:${current.reportId}`);
       }
-      if (current.cardFirstSeen || !mutations.some(mutationTouchesMessageUnit)) return;
+      if (current.cardFirstSeen || !mutations.some(mutation => mutation.type !== "attributes" &&
+          mutationTouchesMessageUnit(mutation))) return;
       const latest = assistantMessages().at(-1) || visibleContentSearchUnits().at(-1);
       if (!latest) return;
       try {
@@ -581,7 +675,6 @@
           observerMutationCount: current.observerMutationCount,
           visibilityState: document.visibilityState || "unknown",
           method: "mutation_observer"}, `card_dom_first_seen:${current.reportId}`);
-        disconnectAssistantWaitObserver();
       } catch {
         record("card_dom_probe_error", {reportId: current.reportId,
           elapsedMs: observedAt - current.startedAt,
@@ -589,7 +682,9 @@
       }
     });
     assistantWaitObserver = observer;
-    observer.observe(document.body, {subtree: true, childList: true, characterData: true});
+    observer.observe(document.body, {subtree: true, childList: true, characterData: true,
+      attributes: true,
+      attributeFilter: ["data-cgo-live-hidden", "data-cgo-history-boundary", "style"]});
     record("assistant_wait_observer_started", {reportId: diagnostic.reportId,
       diagnosticObserverStarted: true,
       visibilityState: document.visibilityState || "unknown",
@@ -628,7 +723,17 @@
       stabilityStartedAt: 0,
       stabilityEndedAt: 0,
       observerMutationCount: 0,
-      observerFirstFiredAt: 0
+      observerFirstFiredAt: 0,
+      observerCallbackCount: 0,
+      observerChildListCount: 0,
+      observerCharacterDataCount: 0,
+      observerAttributeCount: 0,
+      optimizerLiveWindowMutationCount: 0,
+      optimizerBoundaryMutationCount: 0,
+      signatureChangeCount: 0,
+      lastSignatureChangedAt: 0,
+      lastOptimizerLiveScans: optimizerDiagnosticStatus?.liveScans ?? null,
+      lastDiagnosticSnapshot: null
     };
     record("report_acknowledged", {reportId}, `report_acknowledged:${reportId}`);
     record("assistant_wait_started", {reportId,
@@ -915,17 +1020,24 @@
       record("assistant_wait_tick", {reportId: waitDiag.reportId,
         elapsedMs: tickAt - waitDiag.startedAt,
         tickGapMs: waitDiag.lastTickAt ? tickAt - waitDiag.lastTickAt : 0,
+        cardFirstSeen: !!waitDiag.cardFirstSeen,
+        assistantTurnDetected: !!waitDiag.turnDetected,
+        replyCompleted: !!waitDiag.replyCompleted,
         visibilityState: document.visibilityState || "unknown",
         busy,
         method: "setInterval"});
       waitDiag.lastTickAt = tickAt;
     }
-    if (busy) return;
+    if (busy) {
+      recordAssistantWaitCheckpoint(waitDiag, "tick_busy");
+      return;
+    }
     busy = true;
     let pendingAutomaticInstructionId = "";
     try {
       const config = await bridgeSettings();
       if (!config.bound) {
+        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_unbound");
         const bar = document.getElementById("codex-bridge-status");
         if (bar?.dataset.bridgeInstance === scriptInstance) bar.remove();
         return;
@@ -936,10 +1048,20 @@
         lastPhase = state.phase;
         record("phase", {phase: state.phase, round: state.round, reportId: state.reportId});
       }
-      if (state.phase === "stopped") { status(state.detail || "已停止", true); return; }
-      if (state.phase === "setup") { status("已连接；请在扩展弹窗选择 A 或 B 起点"); return; }
-      if (state.phase === "codex_running") { status(`Codex 第 ${state.round} 轮运行中`); return; }
+      if (state.phase === "stopped") {
+        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
+        status(state.detail || "已停止", true); return;
+      }
+      if (state.phase === "setup") {
+        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
+        status("已连接；请在扩展弹窗选择 A 或 B 起点"); return;
+      }
+      if (state.phase === "codex_running") {
+        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
+        status(`Codex 第 ${state.round} 轮运行中`); return;
+      }
       if (state.phase === "report_ready") {
+        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
         status("正在处理 Codex 最终报告，核对 ChatGPT 发送状态");
         await sendReport(state.report, state.reportId, config); return;
       }
@@ -952,11 +1074,20 @@
         if (wait) record("assistant_wait_blocked", {reportId: wait.reportId,
           elapsedMs: Date.now() - wait.startedAt, reason: "no_content",
           visibilityState: document.visibilityState || "unknown"}, `assistant_wait_blocked:${wait.reportId}:no_content`);
+        recordAssistantWaitCheckpoint(wait, "no_content", {assistantMessageCount: messages.length,
+          latestTextLength: 0, isGenerating: false});
         record("page_wait", {reason: "no_content"}, "page_wait:no_content");
         status("等待 ChatGPT 内容区域出现"); return;
       }
       const generating = isGenerating();
       if (wait) {
+        if (!wait.cardFirstSeen && !wait.initialAssistantStateLogged) {
+          wait.initialAssistantStateLogged = true;
+          recordAssistantWaitCheckpoint(wait, "assistant_state", {phase: state.phase,
+            assistantMessageCount: messages.length,
+            latestTextLength: (latest.innerText || latest.textContent || "").trim().length,
+            isGenerating: generating});
+        }
         const latestUnitKey = contentUnitKey(latest);
         const newTurn = wait.baselineUnitKey && latestUnitKey
           ? latestUnitKey !== wait.baselineUnitKey
@@ -1012,11 +1143,17 @@
         if (wait) record("assistant_wait_blocked", {reportId: wait.reportId,
           elapsedMs: Date.now() - wait.startedAt, reason: "generating",
           visibilityState: document.visibilityState || "unknown"}, `assistant_wait_blocked:${wait.reportId}:generating`);
+        recordAssistantWaitCheckpoint(wait, "assistant_generating", {phase: state.phase,
+          assistantMessageCount: messages.length, isGenerating: true});
         record("page_wait", {reason: "generating"}, "page_wait:generating");
         status("等待 ChatGPT 回复完成"); return;
       }
       const text = (latest.innerText || "").trim();
-      if (!text) { status("等待 ChatGPT 回复内容"); return; }
+      if (!text) {
+        recordAssistantWaitCheckpoint(wait, "empty_assistant_text", {phase: state.phase,
+          assistantMessageCount: messages.length, latestTextLength: 0, isGenerating: false});
+        status("等待 ChatGPT 回复内容"); return;
+      }
       const unitKey = contentUnitKey(latest);
       const signature = unitKey
         ? `${location.pathname || "/"}:${unitKey}:${normalize(text)}`
@@ -1024,16 +1161,32 @@
           ? `content-search-unit:${normalize(text)}`
           : `${messages.length}:${text}`;
       if (signature !== lastSignature) {
+        const previousStableElapsedMs = stableSince ? Date.now() - stableSince : 0;
         lastSignature = signature;
         stableSince = Date.now();
         if (wait) {
+          wait.signatureChangeCount = (wait.signatureChangeCount || 0) + 1;
+          wait.lastSignatureChangedAt = stableSince;
           wait.stabilityStartedAt = stableSince;
           wait.stabilityEndedAt = 0;
+          record("page_stability_reset", {reportId: wait.reportId,
+            reason: "signature_changed",
+            elapsedMs: stableSince - wait.startedAt,
+            previousStableElapsedMs,
+            signatureChangeCount: wait.signatureChangeCount,
+            signatureLength: signature.length,
+            unitKeyLength: unitKey.length,
+            latestTextLength: text.length,
+            assistantMessageCount: messages.length,
+            isGenerating: generating,
+            visibilityState: document.visibilityState || "unknown",
+            ...assistantWaitDiagnosticFields(wait)});
           record("page_stability_wait_started", {reportId: wait.reportId,
             elapsedMs: stableSince - wait.startedAt,
             stableThresholdMs: 1800,
             stableElapsedMs: 0,
             signatureChanged: true,
+            signatureChangeCount: wait.signatureChangeCount,
             visibilityState: document.visibilityState || "unknown",
             method: "setInterval",
             rafUsed: false,
@@ -1046,6 +1199,9 @@
       }
       const stableElapsedMs = Date.now() - stableSince;
       if (stableElapsedMs < 1800) {
+        recordAssistantWaitCheckpoint(wait, "stable_threshold", {phase: state.phase,
+          stableElapsedMs, assistantMessageCount: messages.length,
+          latestTextLength: text.length, isGenerating: false});
         if (wait && !wait.stabilityStartedAt) {
           wait.stabilityStartedAt = stableSince;
           record("page_stability_wait_started", {reportId: wait.reportId,
@@ -1069,6 +1225,9 @@
           elapsedMs: wait.stabilityEndedAt - wait.startedAt,
           stableElapsedMs,
           stableThresholdMs: 1800,
+          signatureChangeCount: wait.signatureChangeCount || 0,
+          reason: "threshold_reached_no_signature_change",
+          ...assistantWaitDiagnosticFields(wait),
           visibilityState: document.visibilityState || "unknown",
           method: "setInterval",
           rafUsed: false,
@@ -1076,7 +1235,11 @@
           visibilityUsed: false,
           mutationObserverUsed: false}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
       }
-      if (signature === lastSubmitted) { status("已处理当前指令，等待 ChatGPT 新回复"); return; }
+      if (signature === lastSubmitted) {
+        recordAssistantWaitCheckpoint(wait, "signature_already_submitted", {phase: state.phase,
+          stableElapsedMs, latestTextLength: text.length, isGenerating: false});
+        status("已处理当前指令，等待 ChatGPT 新回复"); return;
+      }
       if (!unitFallback && STOP.test(text)) {
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
         status("ChatGPT 表示任务完成或需要人工处理，已停止"); return;

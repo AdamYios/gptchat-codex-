@@ -90,7 +90,18 @@ async function main() {
     relaxedChoiceCount: 1, latestOnly: true, method: "main_manual_loose",
     instruction: "private text", elapsedMs: 3000, tickGapMs: 8000,
     visibilityState: "hidden", mutationObserverUsed: false,
-    diagnosticObserverStarted: true, observerMutationCount: 3
+    diagnosticObserverStarted: true, observerMutationCount: 3,
+    reason: "stable_threshold", signatureChangeCount: 4,
+    observerCallbackCount: 7, observerChildListCount: 11,
+    observerCharacterDataCount: 5, observerAttributeCount: 9,
+    observerCallbackDelta: 2, observerMutationDelta: 6,
+    optimizerLiveWindowMutationCount: 3, optimizerLiveWindowMutationDelta: 1,
+    optimizerBoundaryMutationCount: 2, optimizerBoundaryMutationDelta: 0,
+    optimizerHiddenMarkerCount: 4, optimizerBoundaryMarkerCount: 1,
+    optimizerStatusAvailable: true, optimizerLiveScans: 14, optimizerLiveScanDelta: 2,
+    optimizerLiveUnits: 10, optimizerLiveHiddenUnits: 4, optimizerLiveLastReason: "new-content",
+    latestTextLength: 123, assistantMessageCount: 6,
+    previousStableElapsedMs: 1900, cardFirstSeen: true, replyCompleted: true
   }}, tabB);
   await send({type: "bridgeLog", event: "post_upgrade", tabId: 10}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}});
   await send({type: "bridgeLog", event: "ignored"}, {tab: {id: 9, url: "https://chatgpt.com/c/other"}});
@@ -108,6 +119,31 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.mutationObserverUsed, false);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.diagnosticObserverStarted, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.observerMutationCount, 3);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.reason, "stable_threshold");
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.signatureChangeCount, 4);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerCallbackCount, 7);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerChildListCount, 11);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerCharacterDataCount, 5);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerAttributeCount, 9);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerCallbackDelta, 2);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.observerMutationDelta, 6);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveWindowMutationCount, 3);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveWindowMutationDelta, 1);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMutationCount, 2);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMutationDelta, 0);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerHiddenMarkerCount, 4);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMarkerCount, 1);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerStatusAvailable, true);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveScans, 14);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveScanDelta, 2);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveUnits, 10);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveHiddenUnits, 4);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveLastReason, "new-content");
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.latestTextLength, 123);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.assistantMessageCount, 6);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.previousStableElapsedMs, 1900);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.cardFirstSeen, true);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.replyCompleted, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.instruction, undefined);
 
   for (let index = 0; index < 205; index += 1)
