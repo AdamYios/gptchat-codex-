@@ -41,7 +41,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  tickInterval = setInterval\(tick, 2000\);\s*tick\(\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -195,11 +195,45 @@ context.document = {
 context.saveReportBaselineForTest(repeatedReport, 1);
 assert.equal(context.reportWasSentForTest(repeatedReport, 1), false);
 mainForReport.innerText += `\n新发送的消息：${repeatedReport}`;
-assert.equal(context.reportWasSentForTest(repeatedReport, 1), true);
+assert.ok(context.reportTextEvidenceForTest(repeatedReport, 1).visibleDelta > 0,
+  "visible-text changes remain available as diagnostics");
+assert.equal(context.reportWasSentForTest(repeatedReport, 1), false,
+  "DOM text deltas alone no longer decide that a report was sent");
 mainForReport.innerText = oldMainText;
 context.saveReportBaselineForTest(repeatedReport, 1);
 mainForReport.textContent += `\n折叠消息的 DOM 正文：${repeatedReport}`;
-assert.equal(context.reportWasSentForTest(repeatedReport, 1), true);
+assert.ok(context.reportTextEvidenceForTest(repeatedReport, 1).domDelta > 0,
+  "DOM text changes remain available as diagnostics");
+assert.equal(context.reportWasSentForTest(repeatedReport, 1), false);
+
+const priorUserUnit = new Element("div", "发送前已有的用户消息", {
+  "data-content-search-unit-key": "thread:before:user"
+});
+const nextUserUnit = new Element("div", "新的用户消息，但不含可见报告正文", {
+  "data-content-search-unit-key": "thread:after:user"
+});
+let currentUserUnits = [priorUserUnit];
+const emptyComposer = {innerText: "", textContent: ""};
+mainForReport.innerText = oldMainText;
+mainForReport.textContent = oldMainText;
+context.document = {
+  querySelector: selector => selector === "main" ? mainForReport :
+    selector.includes("contenteditable") ? emptyComposer : null,
+  querySelectorAll: selector => selector === '[data-content-search-unit-key$=":user"]'
+    ? currentUserUnits : []
+};
+context.saveReportBaselineForTest(repeatedReport, 1);
+context.capturePreSendUserBaselineForTest(1);
+assert.equal(context.userMessagesForTest().length, 1);
+currentUserUnits = [nextUserUnit];
+assert.equal(context.userMessagesForTest().length, 1,
+  "the optimizer may hide the old node so the total mounted message count stays unchanged");
+const noTextDelta = context.reportTextEvidenceForTest(repeatedReport, 1);
+assert.equal(noTextDelta.baselineAvailable, true);
+assert.equal(noTextDelta.visibleDelta, 0);
+assert.equal(noTextDelta.domDelta, 0);
+assert.equal(context.reportWasSentForTest(repeatedReport, 1), true,
+  "a new user turn key confirms delivery even when counts and text deltas do not change");
 context.document = {
   querySelector: selector => selector === "main" ? message : null,
   querySelectorAll: selector => {
@@ -510,5 +544,92 @@ context.document = {
   assert.match(bar.textContent, /连接检查/);
   context.stopInvalidatedForTest();
   assert.match(bar.textContent, /请刷新当前 ChatGPT 标签页/);
+
+  let fakeNow = 100000;
+  class FastDate extends Date { static now() { return fakeNow; } }
+  const reportLog = [];
+  const reportSession = {"bridge.runId": "report-run"};
+  let reportPhase = "report_ready";
+  let reportEditorText = "";
+  let reportSendButtonAvailable = false;
+  let reportAckCount = 0;
+  const reportMain = {innerText: "对话已有内容", textContent: "对话已有内容"};
+  const reportUserBefore = new Element("div", "之前的用户消息", {
+    "data-content-search-unit-key": "report:before:user"
+  });
+  const reportUserAfter = new Element("div", "新用户消息", {
+    "data-content-search-unit-key": "report:after:user"
+  });
+  let reportUserUnits = [reportUserBefore];
+  const reportButton = {
+    disabled: false,
+    type: "button",
+    matches: () => true,
+    getAttribute: () => null,
+    click() {
+      reportEditorText = "";
+      reportUserUnits = [reportUserAfter];
+    }
+  };
+  const reportForm = {querySelectorAll: () => reportSendButtonAvailable ? [reportButton] : []};
+  const reportEditor = {
+    get innerText() { return reportEditorText; },
+    get textContent() { return reportEditorText; },
+    focus() {},
+    dispatchEvent() {},
+    closest: () => reportForm
+  };
+  const reportStatusBar = {style: {}, dataset: {}, textContent: ""};
+  const reportContext = {
+    Date: FastDate,
+    setTimeout: callback => { fakeNow += 250; callback(); return 1; },
+    InputEvent: class InputEvent {},
+    location: {pathname: "/c/report"},
+    sessionStorage: {
+      getItem: key => reportSession[key] || null,
+      setItem: (key, value) => { reportSession[key] = value; },
+      removeItem: key => { delete reportSession[key]; }
+    },
+    getComputedStyle: () => ({display: "block", visibility: "visible", contentVisibility: "visible"}),
+    chrome: {runtime: {
+      onMessage: {addListener() {}},
+      sendMessage: async request => {
+        if (request.type === "bridgeLog") { reportLog.push(request); return {ok: true}; }
+        if (request.type === "bridgeGetConfig") return {ok: true, bound: true, title: "", card: ""};
+        if (request.type === "bridgeRequest" && request.path === "/state")
+          return {ok: true, data: {runId: "report-run", phase: reportPhase, round: 0,
+            report: repeatedReport, reportId: 1}};
+        if (request.type === "bridgeRequest" && request.path === "/ack") {
+          reportAckCount += 1;
+          reportPhase = "await_instruction";
+          return {ok: true, data: {}};
+        }
+        return {ok: true, data: {}};
+      }
+    }},
+    document: {
+      querySelector: selector => selector === "main" ? reportMain :
+        selector === '#prompt-textarea[contenteditable="true"]' ? reportEditor : null,
+      querySelectorAll: selector => selector === '[data-content-search-unit-key$=":user"]'
+        ? reportUserUnits : [],
+      getElementById: id => id === "codex-bridge-status" ? reportStatusBar : null,
+      createElement: () => reportStatusBar,
+      body: {appendChild() {}},
+      execCommand: (_command, _ui, text) => { reportEditorText = text; return true; }
+    },
+    console
+  };
+  vm.runInNewContext(source, reportContext, {filename: `${file}:report-send`});
+  await reportContext.tickForTest();
+  assert.match(reportEditorText, /Codex 最终报告：/,
+    "the report remains in the composer while the send button is temporarily absent");
+  assert.equal(reportLog.some(entry => entry.event === "send_button_unavailable"), true);
+  assert.equal(reportLog.some(entry => entry.event === "tick_error"), false,
+    "a temporarily missing send button is retried without becoming a tick error");
+  reportSendButtonAvailable = true;
+  await reportContext.tickForTest();
+  assert.equal(reportAckCount, 1,
+    "the next tick retries the filled report and acknowledges it after the new user unit appears");
+  assert.equal(reportLog.some(entry => entry.event === "report_unconfirmed"), false);
   console.log("Card extraction and content-search-unit fallback OK");
 })().catch(error => { console.error(error); process.exitCode = 1; });

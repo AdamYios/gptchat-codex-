@@ -13,6 +13,15 @@
   let preSendAssistantCount = Number(sessionStorage.getItem("bridge.preSendAssistantCount") || "0");
   let preSendUserCount = Number(sessionStorage.getItem("bridge.preSendUserCount") || "0");
   let preSendUserText = sessionStorage.getItem("bridge.preSendUserText") || "";
+  let preSendUserUnitKeys;
+  try {
+    const savedKeys = JSON.parse(sessionStorage.getItem("bridge.preSendUserUnitKeys") || "[]");
+    preSendUserUnitKeys = Array.isArray(savedKeys)
+      ? savedKeys.filter(key => typeof key === "string" && key) : [];
+  } catch { preSendUserUnitKeys = []; }
+  let preSendUserUnitKeysReportId = Number(sessionStorage.getItem("bridge.preSendUserUnitKeysReportId") || "0");
+  let preSendGenerating = sessionStorage.getItem("bridge.preSendGenerating") === "true";
+  let preSendGeneratingReportId = Number(sessionStorage.getItem("bridge.preSendGeneratingReportId") || "0");
   let runId = sessionStorage.getItem("bridge.runId") || "";
   let baselinedReport = Number(sessionStorage.getItem("bridge.baselinedReport") || "0");
   let confirmationBaselineId = Number(sessionStorage.getItem("bridge.confirmationBaselineId") || "0");
@@ -321,6 +330,28 @@
     return [...document.querySelectorAll('[data-message-author-role="user"]')];
   }
 
+  function userMessageUnitKeys() {
+    return [...document.querySelectorAll('[data-content-search-unit-key$=":user"]')]
+      .map(message => message.getAttribute("data-content-search-unit-key") || "")
+      .filter(Boolean);
+  }
+
+  function capturePreSendUserBaseline(reportId) {
+    const messages = userMessages();
+    preSendUserCount = messages.length;
+    preSendUserText = normalize(messages.at(-1)?.innerText || messages.at(-1)?.textContent || "");
+    preSendUserUnitKeys = userMessageUnitKeys();
+    preSendUserUnitKeysReportId = reportId;
+    preSendGenerating = isGenerating();
+    preSendGeneratingReportId = reportId;
+    sessionStorage.setItem("bridge.preSendUserCount", String(preSendUserCount));
+    sessionStorage.setItem("bridge.preSendUserText", preSendUserText);
+    sessionStorage.setItem("bridge.preSendUserUnitKeys", JSON.stringify(preSendUserUnitKeys));
+    sessionStorage.setItem("bridge.preSendUserUnitKeysReportId", String(reportId));
+    sessionStorage.setItem("bridge.preSendGenerating", String(preSendGenerating));
+    sessionStorage.setItem("bridge.preSendGeneratingReportId", String(reportId));
+  }
+
   function visibleContentSearchUnits() {
     return [...document.querySelectorAll("[data-content-search-unit-key]")]
       .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
@@ -337,13 +368,24 @@
 
   function reportWasSent(report, reportId) {
     if (attemptedReport !== reportId) return false;
-    if (latestUserContains(report)) return true;
-    if (!normalize(composer()?.innerText || composer()?.textContent || "")) {
-      const evidence = reportTextEvidence(report, reportId);
-      if (evidence.visibleDelta > 0 || evidence.domDelta > 0) return true;
-    }
-    // Without evidence of a new user turn or newly rendered report, require manual recovery.
-    return false;
+    const signals = reportConfirmationSignals(report, reportId);
+    return signals.newUserUnitKey || signals.latestUserContainsReport ||
+      (signals.composerEmpty && signals.generationStarted);
+  }
+
+  function reportConfirmationSignals(report, reportId) {
+    const previousKeys = new Set(preSendUserUnitKeys);
+    const newUserUnitKey = preSendUserUnitKeysReportId === reportId &&
+      userMessageUnitKeys().some(key => !previousKeys.has(key));
+    const editor = composer();
+    const generating = isGenerating();
+    return {
+      newUserUnitKey,
+      latestUserContainsReport: latestUserContains(report),
+      composerEmpty: !normalize(editor?.innerText || editor?.textContent || ""),
+      generating,
+      generationStarted: preSendGeneratingReportId === reportId && !preSendGenerating && generating
+    };
   }
 
   function normalize(text) {
@@ -525,10 +567,11 @@
     const buttonReady = await waitFor(() => {
       const button = sendButton(editor);
       return !!button && !button.disabled && button.getAttribute("aria-disabled") !== "true";
-    }, 5000);
+    }, 2000);
     if (!buttonReady) {
       record("send_button_unavailable", {reportId}, `send_button_unavailable:${reportId}`);
-      throw new Error("报告已在输入框中，但发送按钮未启用；请检查页面，桥接不会重复填入");
+      status("报告已填入输入框；发送按钮暂不可用，桥接将在下一轮重试");
+      return;
     }
     const latestState = await api("/state");
     if (latestState.phase !== "report_ready" || latestState.reportId !== reportId) {
@@ -539,10 +582,7 @@
     sessionStorage.setItem("bridge.preSendAssistant", preSendAssistant);
     preSendAssistantCount = assistantMessages().length;
     sessionStorage.setItem("bridge.preSendAssistantCount", String(preSendAssistantCount));
-    preSendUserCount = userMessages().length;
-    preSendUserText = normalize(userMessages().at(-1)?.innerText || "");
-    sessionStorage.setItem("bridge.preSendUserCount", String(preSendUserCount));
-    sessionStorage.setItem("bridge.preSendUserText", preSendUserText);
+    capturePreSendUserBaseline(reportId);
     attemptedReport = reportId;
     sessionStorage.setItem("bridge.attemptedReport", String(reportId));
     attemptedAt = Date.now();
@@ -551,7 +591,8 @@
     sendButton(editor).click();
     if (!await waitFor(() => reportWasSent(report, reportId), 10000)) {
       record("report_unconfirmed", {reportId, confirmed: false,
-        ...reportTextEvidence(report, reportId)}, `report_unconfirmed:${reportId}`);
+        ...reportTextEvidence(report, reportId),
+        ...reportConfirmationSignals(report, reportId)}, `report_unconfirmed:${reportId}`);
       status("发送已触发，正在继续核对网页消息；如长时间未确认，可在扩展弹窗处理");
       return;
     }
@@ -706,6 +747,10 @@
     preSendAssistantCount = 0;
     preSendUserCount = 0;
     preSendUserText = "";
+    preSendUserUnitKeys = [];
+    preSendUserUnitKeysReportId = 0;
+    preSendGenerating = false;
+    preSendGeneratingReportId = 0;
     baselinedReport = 0;
     confirmationBaselineId = 0;
     confirmationBaselineCounts = null;
@@ -713,7 +758,7 @@
     recordedEvents.clear();
     stableSince = Date.now();
     sessionStorage.setItem("bridge.runId", runId);
-    for (const key of ["sentReport", "attemptedReport", "attemptedAt", "preSendAssistant", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "baselinedReport", "confirmationBaselineId", "confirmationBaselineCounts"])
+    for (const key of ["sentReport", "attemptedReport", "attemptedAt", "preSendAssistant", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "preSendUserUnitKeys", "preSendUserUnitKeysReportId", "preSendGenerating", "preSendGeneratingReportId", "baselinedReport", "confirmationBaselineId", "confirmationBaselineCounts"])
       sessionStorage.removeItem(`bridge.${key}`);
   }
 
