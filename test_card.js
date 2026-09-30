@@ -580,6 +580,7 @@ context.document = {
     closest: () => reportForm
   };
   const reportStatusBar = {style: {}, dataset: {}, textContent: ""};
+  let reportMessageListener;
   const reportContext = {
     Date: FastDate,
     setTimeout: callback => { fakeNow += 250; callback(); return 1; },
@@ -592,7 +593,7 @@ context.document = {
     },
     getComputedStyle: () => ({display: "block", visibility: "visible", contentVisibility: "visible"}),
     chrome: {runtime: {
-      onMessage: {addListener() {}},
+      onMessage: {addListener(callback) { reportMessageListener = callback; }},
       sendMessage: async request => {
         if (request.type === "bridgeLog") { reportLog.push(request); return {ok: true}; }
         if (request.type === "bridgeGetConfig") return {ok: true, bound: true, title: "", card: ""};
@@ -620,16 +621,23 @@ context.document = {
     console
   };
   vm.runInNewContext(source, reportContext, {filename: `${file}:report-send`});
-  await reportContext.tickForTest();
+  const wakeForReport = () => new Promise(resolve => {
+    const keepChannelOpen = reportMessageListener({type: "bridgeReportReady", reportId: 1}, null, resolve);
+    assert.equal(keepChannelOpen, true, "report-ready notification waits for the page-side wake tick");
+  });
+  assert.equal((await wakeForReport()).ok, true);
   assert.match(reportEditorText, /Codex 最终报告：/,
-    "the report remains in the composer while the send button is temporarily absent");
+    "an event wake sends the report without waiting for the content-script interval");
   assert.equal(reportLog.some(entry => entry.event === "send_button_unavailable"), true);
   assert.equal(reportLog.some(entry => entry.event === "tick_error"), false,
     "a temporarily missing send button is retried without becoming a tick error");
   reportSendButtonAvailable = true;
-  await reportContext.tickForTest();
+  assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1,
-    "the next tick retries the filled report and acknowledges it after the new user unit appears");
+    "a later event wake retries the filled report and acknowledges it after the new user unit appears");
   assert.equal(reportLog.some(entry => entry.event === "report_unconfirmed"), false);
+  assert.equal((await wakeForReport()).ok, true);
+  assert.equal(reportAckCount, 1, "a stale repeated wake after acknowledgement does not resend the report");
+  assert.equal(reportLog.filter(entry => entry.event === "send_click").length, 1);
   console.log("Card extraction and content-search-unit fallback OK");
 })().catch(error => { console.error(error); process.exitCode = 1; });

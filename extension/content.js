@@ -38,6 +38,7 @@
   } catch { instructionStates = new Map(); }
   let lastPhase = "";
   const recordedEvents = new Set();
+  let reportWakeQueued = false;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
   let phaseChangedAt = Date.now();
@@ -513,6 +514,12 @@
     return predicate();
   }
 
+  function drainQueuedReportWake() {
+    if (busy || !reportWakeQueued) return;
+    reportWakeQueued = false;
+    void tick();
+  }
+
   async function acknowledgeReport(reportId, skipPreviousAssistant = false) {
     record("report_confirmed", {reportId, confirmed: true}, `report_confirmed:${reportId}`);
     sentReport = reportId;
@@ -630,7 +637,7 @@
         return sentReport === state.reportId ? "已重新发送并确认网页收到报告。" : "已重新点击发送；扩展会继续核对网页消息。";
       }
       throw new Error("未知恢复操作");
-    } finally { busy = false; }
+    } finally { busy = false; drainQueuedReportWake(); }
   }
 
   async function cardChoices(selectedIndex = null, selectedKey = null) {
@@ -715,11 +722,23 @@
       sessionStorage.setItem("bridge.lastSubmitted", signature);
       status(`已将第 ${selectedIndex + 1} 张指令卡片送往 Codex`);
       return `已发送第 ${selectedIndex + 1} 张指令卡片。`;
-    } finally { busy = false; }
+    } finally { busy = false; drainQueuedReportWake(); }
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, respond) => {
     if (message.type === "bridgePing") { respond({ok: true}); return false; }
+    if (message.type === "bridgeReportReady") {
+      const reportId = Number(message.reportId);
+      if (!Number.isSafeInteger(reportId) || reportId <= 0) {
+        respond({ok: false, error: "无效的报告编号"}); return false;
+      }
+      if (busy) {
+        reportWakeQueued = true;
+        respond({ok: true, queued: true}); return false;
+      }
+      tick().then(() => respond({ok: true}), error => respond({ok: false, error: String(error)}));
+      return true;
+    }
     if (message.type === "bridgeUiAction") {
       actionFeedback(message.text, !!message.error);
       if (message.phase === "unbound") status("未绑定；自动桥接已停止");
@@ -880,7 +899,10 @@
       }
       record("tick_error", {reason: "exception"}, `tick_error:${String(error)}`);
       status(String(error), true);
-    } finally { busy = false; }
+    } finally {
+      busy = false;
+      drainQueuedReportWake();
+    }
   }
   tickInterval = setInterval(tick, 2000);
   tick();

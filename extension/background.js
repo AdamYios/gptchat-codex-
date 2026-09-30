@@ -1,6 +1,8 @@
 const LEGACY_LOG_KEY = "bridgePendingEvents";
 const LOG_LIMIT = 1000;
 const DETACHED_LOG_PREFIX = "bridgePendingEvents_tab_";
+const REPORT_WAKE_ALARM = "bridge-report-ready-wake";
+const REPORT_WAKE_PERIOD_MINUTES = 0.5;
 const LOG_FIELDS = new Set([
   "phase", "round", "reportId", "assistantMessages", "userMessages", "conversationTurns",
   "articles", "copyButtons", "stopButtons", "mainFound", "composerFound", "composerTag",
@@ -10,6 +12,7 @@ const LOG_FIELDS = new Set([
   "baselineAvailable", "visibleDelta", "domDelta", "mode", "errorType", "status"
 ]);
 let logQueue = Promise.resolve();
+let reportPollPromise = null;
 
 function connectionMap(config) {
   const map = config.connections && typeof config.connections === "object" ? config.connections : {};
@@ -27,6 +30,64 @@ async function getConnection(tabId) {
   ]);
   const connection = connectionMap(config)[String(tabId)];
   return connection ? {...connection, tabId: Number(connection.tabId ?? tabId)} : null;
+}
+
+async function ensureReportWakeAlarm() {
+  if (!chrome.alarms?.get || !chrome.alarms?.create || !chrome.alarms?.clear) return;
+  try {
+    const [alarm, config] = await Promise.all([
+      chrome.alarms.get(REPORT_WAKE_ALARM),
+      chrome.storage.local.get(["connections", "tabId", "port", "token", "title", "card"])
+    ]);
+    const hasBoundTask = Object.values(connectionMap(config))
+      .some(connection => connection?.port && connection?.token);
+    if (hasBoundTask && !alarm) await chrome.alarms.create(REPORT_WAKE_ALARM,
+      {periodInMinutes: REPORT_WAKE_PERIOD_MINUTES});
+    else if (!hasBoundTask && alarm) await chrome.alarms.clear(REPORT_WAKE_ALARM);
+  } catch { /* The regular content-script bridge remains available if alarms fail. */ }
+}
+
+function pollPendingReports() {
+  if (reportPollPromise) return reportPollPromise;
+  reportPollPromise = (async () => {
+    const config = await chrome.storage.local.get([
+      "connections", "tabId", "port", "token", "title", "card"
+    ]);
+    const connections = Object.values(connectionMap(config));
+    await Promise.all(connections.map(async connection => {
+      const tabId = Number(connection.tabId);
+      if (!Number.isInteger(tabId) || !connection.port || !connection.token) return;
+      try {
+        const response = await fetch(`http://127.0.0.1:${connection.port}/state`, {
+          headers: {"X-Bridge-Token": connection.token}, signal: AbortSignal.timeout(4000)
+        });
+        if (!response.ok) return;
+        const state = await response.json();
+        const reportId = Number(state.reportId);
+        if (state.phase !== "report_ready" || !Number.isSafeInteger(reportId) || reportId <= 0) return;
+
+        // A tab can be rebound while a poll is in flight. Only wake it if the
+        // same task still owns this binding; sending a message never activates it.
+        const current = await getConnection(tabId);
+        if (!current || current.id !== connection.id || current.port !== connection.port ||
+            current.token !== connection.token) return;
+        await chrome.tabs.sendMessage(tabId, {type: "bridgeReportReady", reportId});
+      } catch { /* The next alarm retries if the bridge or tab is temporarily unavailable. */ }
+    }));
+  })().catch(() => {}).finally(() => { reportPollPromise = null; });
+  return reportPollPromise;
+}
+
+if (chrome.alarms?.onAlarm) {
+  chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === REPORT_WAKE_ALARM) return pollPendingReports();
+  });
+  const ensureAlarm = () => { void ensureReportWakeAlarm(); };
+  chrome.runtime.onStartup?.addListener(ensureAlarm);
+  chrome.runtime.onInstalled?.addListener(ensureAlarm);
+  // Alarms may be cleared between browser sessions. Recreate the important
+  // alarm whenever the MV3 service worker starts, without resetting an existing one.
+  ensureAlarm();
 }
 
 function connectionLogKey(connection) {
@@ -55,6 +116,7 @@ function safeEvent(message, source, connection = null) {
 async function saveConnectionMap(config, connections) {
   await chrome.storage.local.set({connections});
   await chrome.storage.local.remove(["tabId", "port", "token", "title", "card"]);
+  await ensureReportWakeAlarm();
 }
 
 function boundTab(sender, connection) {

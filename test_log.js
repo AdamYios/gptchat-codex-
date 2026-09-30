@@ -12,12 +12,22 @@ async function main() {
   const written = new Map([[8765, []], [8766, []], [8767, []], [8768, []], [8770, []]]);
   const batchSizes = [];
   const apiRouted = [];
+  const reportWakeMessages = [];
+  const alarmRecords = new Map();
   let online = false;
   let listener;
   let tabRemovedListener;
+  let alarmListener;
   const chrome = {
     runtime: {onMessage: {addListener: callback => { listener = callback; }}},
-    tabs: {onRemoved: {addListener: callback => { tabRemovedListener = callback; }}},
+    tabs: {onRemoved: {addListener: callback => { tabRemovedListener = callback; }},
+      sendMessage: async (tabId, message) => { reportWakeMessages.push({tabId, message}); }},
+    alarms: {
+      get: async name => alarmRecords.get(name) || null,
+      create: async (name, info) => { alarmRecords.set(name, info); },
+      clear: async name => alarmRecords.delete(name),
+      onAlarm: {addListener: callback => { alarmListener = callback; }}
+    },
     storage: {local: {
       get: async keys => {
         const result = {};
@@ -37,8 +47,10 @@ async function main() {
       port === 8768 ? "secretZ" : "old-secret");
     if (parsedUrl.pathname !== "/events") {
       apiRouted.push(port);
-      return {ok: true, json: async () => ({threadId: port === 8767 ? "taskA" : port === 8768 ? "taskZ" :
-        port === 8766 ? "taskB" : "taskA"})};
+      return {ok: true, json: async () => ({
+        threadId: port === 8767 ? "taskA" : port === 8768 ? "taskZ" : port === 8766 ? "taskB" : "taskA",
+        phase: port === 8767 ? "report_ready" : "setup", reportId: port === 8767 ? 4 : 0
+      })};
     }
     const events = JSON.parse(options.body).events;
     batchSizes.push(events.length);
@@ -46,6 +58,8 @@ async function main() {
     return {ok: true};
   };
   const source = fs.readFileSync(path.join(__dirname, "extension", "background.js"), "utf8");
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "extension", "manifest.json"), "utf8"));
+  assert.ok(manifest.permissions.includes("alarms"), "background report wake requires the alarms permission");
   vm.runInNewContext(source, {chrome, fetch, URL, AbortSignal, Promise, Set, Object, String, Number});
   const send = (message, sender = {}) => new Promise(resolve => {
     assert.equal(listener(message, sender, resolve), true);
@@ -112,6 +126,14 @@ async function main() {
   assert.equal(stateA.data.threadId, "taskA");
   assert.equal(stateB.data.threadId, "taskB");
   assert.deepEqual(apiRouted, [8767, 8766]);
+  assert.equal(alarmRecords.get("bridge-report-ready-wake")?.periodInMinutes, 0.5,
+    "the MV3 worker installs a minimum-period report wake alarm");
+  await alarmListener({name: "bridge-report-ready-wake"});
+  assert.deepEqual(reportWakeMessages.map(({tabId, message}) => ({tabId,
+    message: {type: message.type, reportId: message.reportId}})), [{tabId: 7,
+    message: {type: "bridgeReportReady", reportId: 4}}],
+  "the alarm polls bound tasks and wakes only the tab whose Codex report is ready");
+  assert.deepEqual(apiRouted.slice(2), [8767, 8766, 8770]);
 
   online = false;
   await tabRemovedListener(8);
