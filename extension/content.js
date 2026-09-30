@@ -551,7 +551,7 @@
       record("composer_missing", {reportId}, `composer_missing:${reportId}`);
       throw new Error("找不到 ChatGPT 输入框");
     }
-    const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
+    const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
     if (reportWasSent(report, reportId)) { await acknowledgeReport(reportId, attemptedReport === reportId); return; }
     const existing = (editor.innerText || editor.textContent || "").trim();
     const ownDraft = normalize(existing).startsWith(normalize(message).slice(0, 90)) &&
