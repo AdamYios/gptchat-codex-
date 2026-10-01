@@ -46,8 +46,8 @@ class Element {
 
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
-  /  tickInterval = setInterval\(tick, 2000\);\s*tick\(\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  /  void startAutomaticLoop\("script_started"\);/,
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -61,6 +61,9 @@ const logged = [];
 let bound = true;
 let stateRequests = 0;
 let contentMessageListener;
+let timerStarts = 0;
+let timerClears = 0;
+const activeTimers = new Set();
 const context = {location: {pathname: "/c/test"}, sessionStorage: {
   getItem: key => saved[key] || null,
   setItem: (key, value) => { saved[key] = value; },
@@ -91,7 +94,9 @@ const context = {location: {pathname: "/c/test"}, sessionStorage: {
       }
       return {ok: true, data: {}};
     }}
-  }, console};
+  }, console,
+  setInterval: () => { const id = ++timerStarts; activeTimers.add(id); return id; },
+  clearInterval: id => { timerClears += 1; activeTimers.delete(id); }};
 vm.runInNewContext(source, context, {filename: file});
 
 const statusBar = {style: {}, dataset: {}, textContent: ""};
@@ -539,6 +544,31 @@ context.document = {
     "a stopped flow does not post newly visible instructions");
   assert.equal(JSON.parse(saved["bridge.instructionStates"] || "[]").some(([id]) => id === stoppedId), false,
     "a card observed after flow end is not marked seen or pending");
+
+  const originalDocument = context.document;
+  context.document = {getElementById: id => id === "codex-bridge-status" ? statusBar : null,
+    querySelector: () => null, querySelectorAll: () => []};
+  const stateRequestsBeforeStopLoop = stateRequests;
+  await context.startAutomaticLoopForTest("test_stopped");
+  assert.equal(stateRequests, stateRequestsBeforeStopLoop + 1);
+  assert.equal(activeTimers.size, 0,
+    "observing stopped clears the automatic content polling interval");
+  assert.equal(timerClears, 1);
+
+  bridgePhase = "await_instruction";
+  const restarted = await new Promise(resolve => {
+    assert.equal(contentMessageListener({type: "bridgeFlowStarted"}, null, resolve), true);
+  });
+  assert.equal(restarted.ok, true);
+  assert.equal(timerStarts, 2);
+  assert.equal(activeTimers.size, 1,
+    "starting a new flow recreates automatic polling without rebinding");
+  assert.equal(stateRequests, stateRequestsBeforeStopLoop + 2,
+    "the restarted loop immediately checks the new bridge flow");
+  bridgePhase = "stopped";
+  await context.tickForTest();
+  assert.equal(activeTimers.size, 0);
+  context.document = originalDocument;
 
   bridgePhase = "await_instruction";
   await context.tickForTest();

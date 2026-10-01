@@ -1017,6 +1017,11 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, respond) => {
     if (message.type === "bridgePing") { respond({ok: true}); return false; }
+    if (message.type === "bridgeFlowStarted") {
+      startAutomaticLoop("flow_started").then(() => respond({ok: true}),
+        error => respond({ok: false, error: String(error)}));
+      return true;
+    }
     if (message.type === "bridgeReportReady") {
       const reportId = Number(message.reportId);
       if (!Number.isSafeInteger(reportId) || reportId <= 0) {
@@ -1116,8 +1121,9 @@
         record("phase", {phase: state.phase, round: state.round, reportId: state.reportId});
       }
       if (state.phase === "stopped") {
-        recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
-        status(state.detail || "已停止", true); return;
+        status(state.detail || "已停止", true);
+        stopAutomaticLoop();
+        return;
       }
       if (state.phase === "setup") {
         recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
@@ -1418,6 +1424,20 @@
       drainQueuedReportWake();
     }
   }
-  tickInterval = setInterval(tick, 2000);
-  tick();
+  function stopAutomaticLoop() {
+    if (tickInterval !== null) clearInterval(tickInterval);
+    tickInterval = null;
+    assistantWaitTickQueued = false;
+    reportWakeQueued = false;
+    assistantWaitDiagnostic = null;
+    disconnectAssistantWaitObserver();
+  }
+
+  function startAutomaticLoop(trigger = "setInterval") {
+    if (tickInterval !== null) return tick(trigger).then(() => false);
+    tickInterval = setInterval(tick, 2000);
+    return tick(trigger).then(() => true);
+  }
+
+  void startAutomaticLoop("script_started");
 })();

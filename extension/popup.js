@@ -180,6 +180,16 @@ async function notifyPage(text, error = false, tabId = null, phase = "") {
   catch { /* The popup still shows the result if the page receiver is unavailable. */ }
 }
 
+async function notifyFlowLifecycle(tabId, started) {
+  try {
+    await chrome.runtime.sendMessage({type: started ? "bridgeTaskStarted" : "bridgeTaskStopped", tabId});
+  } catch { /* The bridge state remains authoritative if the service worker is restarting. */ }
+  if (started) {
+    try { await chrome.tabs.sendMessage(tabId, {type: "bridgeFlowStarted"}); }
+    catch { /* The content script will resume when it is next injected. */ }
+  }
+}
+
 async function act(callback, operation = "action", requestedTabId = null) {
   const label = OPERATION_NAMES[operation] || "操作";
   let tabId = requestedTabId;
@@ -338,6 +348,7 @@ $("endFlow").onclick = () => act(async tabId => {
   if (!connection) throw new Error("当前标签页尚未绑定桥接任务");
   const state = await bridgeApi("/state", "GET", undefined, connection);
   const stopped = await bridgeApi("/stop", "POST", {reason: "用户结束当前流程", runId: state.runId}, connection);
+  await notifyFlowLifecycle(tabId, false);
   return stopped.codexInProgress
     ? "当前流程已结束；Codex 仍会继续运行，后续报告不会自动发送到 ChatGPT。"
     : "当前流程已结束；桥接连接和标签页绑定保持不变。";
@@ -444,6 +455,7 @@ $("startSelected").onclick = () => {
     if (!connection) throw new Error("当前标签页尚未绑定桥接任务");
     await ensureContent(tabId);
     await bridgeApi("/start", "POST", {mode}, connection);
+    await notifyFlowLifecycle(tabId, true);
   }, operation);
 };
 

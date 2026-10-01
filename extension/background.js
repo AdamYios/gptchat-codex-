@@ -1,6 +1,7 @@
 const LEGACY_LOG_KEY = "bridgePendingEvents";
 const LOG_LIMIT = 1000;
 const DETACHED_LOG_PREFIX = "bridgePendingEvents_tab_";
+const STOPPED_CONNECTIONS_KEY = "bridgeStoppedConnectionIds";
 const REPORT_WAKE_ALARM = "bridge-report-ready-wake";
 const REPORT_WAKE_PERIOD_MINUTES = 0.5;
 const LOG_FIELDS = new Set([
@@ -28,6 +29,25 @@ const LOG_FIELDS = new Set([
 ]);
 let logQueue = Promise.resolve();
 let reportPollPromise = null;
+let stoppedConnectionQueue = Promise.resolve();
+
+function connectionIdentity(connection) {
+  return String(connection?.id || `${connection?.tabId}_${connection?.port || ""}`);
+}
+
+function updateConnectionStopped(connection, stopped) {
+  const id = connectionIdentity(connection);
+  const task = stoppedConnectionQueue.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get(STOPPED_CONNECTIONS_KEY);
+    const ids = new Set(Array.isArray(stored[STOPPED_CONNECTIONS_KEY])
+      ? stored[STOPPED_CONNECTIONS_KEY].filter(value => typeof value === "string") : []);
+    if (stopped) ids.add(id);
+    else ids.delete(id);
+    await chrome.storage.local.set({[STOPPED_CONNECTIONS_KEY]: [...ids]});
+  });
+  stoppedConnectionQueue = task;
+  return task;
+}
 
 function connectionMap(config) {
   const map = config.connections && typeof config.connections === "object" ? config.connections : {};
@@ -52,10 +72,13 @@ async function ensureReportWakeAlarm() {
   try {
     const [alarm, config] = await Promise.all([
       chrome.alarms.get(REPORT_WAKE_ALARM),
-      chrome.storage.local.get(["connections", "tabId", "port", "token", "title", "card"])
+      chrome.storage.local.get(["connections", "tabId", "port", "token", "title", "card",
+        STOPPED_CONNECTIONS_KEY])
     ]);
+    const stopped = new Set(Array.isArray(config[STOPPED_CONNECTIONS_KEY])
+      ? config[STOPPED_CONNECTIONS_KEY] : []);
     const hasBoundTask = Object.values(connectionMap(config))
-      .some(connection => connection?.port && connection?.token);
+      .some(connection => connection?.port && connection?.token && !stopped.has(connectionIdentity(connection)));
     if (hasBoundTask && !alarm) await chrome.alarms.create(REPORT_WAKE_ALARM,
       {periodInMinutes: REPORT_WAKE_PERIOD_MINUTES});
     else if (!hasBoundTask && alarm) await chrome.alarms.clear(REPORT_WAKE_ALARM);
@@ -66,13 +89,15 @@ function pollPendingReports() {
   if (reportPollPromise) return reportPollPromise;
   reportPollPromise = (async () => {
     const config = await chrome.storage.local.get([
-      "connections", "tabId", "port", "token", "title", "card"
+      "connections", "tabId", "port", "token", "title", "card", STOPPED_CONNECTIONS_KEY
     ]);
     const connections = Object.values(connectionMap(config));
+    const stopped = new Set(Array.isArray(config[STOPPED_CONNECTIONS_KEY])
+      ? config[STOPPED_CONNECTIONS_KEY] : []);
     await Promise.all(connections.map(async connection => {
       const tabId = Number(connection.tabId);
       if (!Number.isInteger(tabId) || !connection.port || !connection.token) return;
-      recordBackgroundEvent(connection, "alarm_fired");
+      if (stopped.has(connectionIdentity(connection))) return;
       try {
         let response;
         try {
@@ -107,6 +132,13 @@ function pollPendingReports() {
           ...(stateTaskId ? {taskId: stateTaskId} : {}),
           ...(Number.isSafeInteger(reportId) ? {reportId} : {})
         };
+        if (state.phase === "stopped") {
+          await updateConnectionStopped(connection, true);
+          return;
+        }
+        if (stopped.has(connectionIdentity(connection)))
+          await updateConnectionStopped(connection, false);
+        recordBackgroundEvent(connection, "alarm_fired");
         recordBackgroundEvent(connection, "alarm_state_checked", stateDetails);
         checkAlarmTab(connection, tabId, stateDetails);
 
@@ -127,6 +159,7 @@ function pollPendingReports() {
         await wake;
       } catch { /* The next alarm retries if the bridge or tab is temporarily unavailable. */ }
     }));
+    await ensureReportWakeAlarm();
   })().catch(() => {}).finally(() => { reportPollPromise = null; });
   return reportPollPromise;
 }
@@ -246,6 +279,7 @@ async function unbindConnection(tabId, fallbackTaskId = "", source = "popup") {
   ]);
   const connection = connectionMap(config)[String(tabId)];
   if (!connection) return false;
+  await updateConnectionStopped(connection, false);
   const taskId = String(connection.threadId || fallbackTaskId || "")
     .replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);
   const taskConnection = {...connection, threadId: taskId};
@@ -283,6 +317,17 @@ chrome.tabs?.onRemoved?.addListener(tabId => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message.type === "bridgeTaskStopped" || message.type === "bridgeTaskStarted") {
+    (async () => {
+      const tabId = Number(message.tabId);
+      const connection = await getConnection(tabId);
+      if (!connection) throw new Error("当前标签页没有绑定桥接任务");
+      await updateConnectionStopped(connection, message.type === "bridgeTaskStopped");
+      await ensureReportWakeAlarm();
+      return {ok: true};
+    })().then(respond, error => respond({ok: false, error: String(error)}));
+    return true;
+  }
   if (message.type === "bridgeIsBound" || message.type === "bridgeGetConfig") {
     getConnection(sender.tab?.id).then(connection => {
       const bound = boundTab(sender, connection);
@@ -355,6 +400,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       else await chrome.storage.local.remove(detachedKey);
       if (Array.isArray(stored[LEGACY_LOG_KEY])) await chrome.storage.local.remove(LEGACY_LOG_KEY);
       if (replacedLegacy && previousLegacyKey) await chrome.storage.local.remove(previousLegacyKey);
+      await updateConnectionStopped(connection, false);
       connections[String(tabId)] = connection;
       await saveConnectionMap(config, connections);
     }).then(() => respond({ok: true}), error => respond({ok: false, error: String(error)}));

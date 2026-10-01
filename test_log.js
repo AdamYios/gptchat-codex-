@@ -12,6 +12,8 @@ async function main() {
   const written = new Map([[8765, []], [8766, []], [8767, []], [8768, []], [8770, []]]);
   const batchSizes = [];
   const apiRouted = [];
+  const phaseByPort = new Map([[8765, "setup"], [8766, "setup"], [8767, "report_ready"],
+    [8768, "setup"], [8770, "setup"]]);
   const reportWakeMessages = [];
   const alarmRecords = new Map();
   const missingTabIds = new Set();
@@ -52,9 +54,10 @@ async function main() {
       port === 8768 ? "secretZ" : "old-secret");
     if (parsedUrl.pathname !== "/events") {
       apiRouted.push(port);
+      const phase = phaseByPort.get(port) || "setup";
       return {ok: true, json: async () => ({
         threadId: port === 8767 ? "taskA" : port === 8768 ? "taskZ" : port === 8766 ? "taskB" : "taskA",
-        phase: port === 8767 ? "report_ready" : "setup", reportId: port === 8767 ? 4 : 0
+        phase, reportId: phase === "report_ready" ? 4 : 0
       })};
     }
     const events = JSON.parse(options.body).events;
@@ -229,6 +232,47 @@ async function main() {
     entry.data.phase === "setup"));
   assert.deepEqual(apiRouted.slice(2), [8767, 8766, 8770]);
 
+  await send({type: "bridgeLog", event: "before_stop_check"}, tabB);
+  const taskBWrittenBeforeStop = written.get(8766).length;
+  const taskBStateChecksBeforeStop = apiRouted.filter(port => port === 8766).length;
+  phaseByPort.set(8767, "stopped");
+  await send({type: "bridgeTaskStopped", tabId: 7});
+  phaseByPort.set(8770, "stopped");
+  await send({type: "bridgeTaskStopped", tabId: 10});
+  phaseByPort.set(8766, "stopped");
+  await alarmListener({name: "bridge-report-ready-wake"});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(apiRouted.filter(port => port === 8766).length, taskBStateChecksBeforeStop + 1,
+    "the alarm checks state once to discover a stopped task");
+  assert.ok(saved.bridgeStoppedConnectionIds.includes("taskB"),
+    "a stopped connection is remembered across service-worker restarts");
+  assert.equal(written.get(8766).length, taskBWrittenBeforeStop,
+    "the first stopped-state detection writes no periodic alarm events");
+
+  await alarmListener({name: "bridge-report-ready-wake"});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(apiRouted.filter(port => port === 8766).length, taskBStateChecksBeforeStop + 1,
+    "later alarms do not poll a remembered stopped task");
+  assert.equal(written.get(8766).length, taskBWrittenBeforeStop,
+    "later alarms do not append stopped-task log entries");
+  assert.equal(saved.connections["8"].id, "taskB", "stopping preserves the tab binding");
+  assert.equal(alarmRecords.has("bridge-report-ready-wake"), false,
+    "the report wake alarm is cleared when every bound flow is stopped");
+
+  phaseByPort.set(8766, "setup");
+  await send({type: "bridgeTaskStarted", tabId: 8});
+  assert.equal(alarmRecords.has("bridge-report-ready-wake"), true,
+    "starting a new flow recreates the report wake alarm");
+  assert.equal(saved.bridgeStoppedConnectionIds.includes("taskB"), false,
+    "starting a new flow clears the stopped marker");
+  const resumedPollsBefore = apiRouted.filter(port => port === 8766).length;
+  await alarmListener({name: "bridge-report-ready-wake"});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await send({type: "bridgeLog", event: "resumed_poll_flush"}, tabB);
+  assert.equal(apiRouted.filter(port => port === 8766).length, resumedPollsBefore + 1,
+    "the alarm resumes checking after the popup starts a new flow");
+  assert.equal(saved.connections["8"].id, "taskB", "restarting still keeps the same binding");
+
   online = false;
   await tabRemovedListener(8);
   assert.equal(saved.connections["8"], undefined);
@@ -239,7 +283,8 @@ async function main() {
 
   assert.equal(written.get(8765).length, 0);
   assert.equal(written.get(8767).length, 215);
-  assert.equal(written.get(8766).length, 7);
+  assert.equal(written.get(8766).length, taskBWrittenBeforeStop + 5,
+    "only one resumed poll and its explicit flush are added after the stopped interval");
   assert.equal(written.get(8770).length, 7);
   assert.deepEqual(written.get(8767).slice(0, 2).map(entry => entry.event), ["send_click", "offline_step"]);
   assert.equal(written.get(8767)[0].taskId, "taskA");

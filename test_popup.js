@@ -47,6 +47,7 @@ async function main() {
   const starts = [];
   const pageNotifications = [];
   const optimizerMessages = [];
+  const lifecycleMessages = [];
   const reloadedTabs = [];
   let activeId = 7;
   const intervals = [];
@@ -54,6 +55,8 @@ async function main() {
   const phaseByPort = new Map([[8765, "report_ready"], [8766, "setup"]]);
   const chrome = {
     runtime: {sendMessage: async message => {
+      if (["bridgeTaskStarted", "bridgeTaskStopped"].includes(message.type))
+        lifecycleMessages.push({type: message.type, tabId: message.tabId});
       if (message.type === "bridgeBind") {
         const connections = {...(state.connections || {})};
         if (state.tabId && state.port && state.token && !connections[String(state.tabId)])
@@ -81,6 +84,7 @@ async function main() {
       update: async (id, options) => { if (options.active) activeId = id; },
       reload: async id => { reloadedTabs.push(id); },
       sendMessage: async (id, message) => {
+        if (message.type === "bridgeFlowStarted") lifecycleMessages.push({type: message.type, tabId: id});
         if (message.type.startsWith("OPTIMIZER_")) {
           optimizerMessages.push({tabId: id, type: message.type, settings: message.settings});
           if (message.type === "OPTIMIZER_STATUS") return {ok: true,
@@ -214,6 +218,9 @@ async function main() {
   assert.equal(elements.get("currentTaskSection").hidden, false,
     "await_instruction shows the current task card");
   assert.equal(elements.get("reportRecoveryActions").hidden, true);
+  assert.deepEqual(lifecycleMessages.slice(0, 2), [
+    {type: "bridgeTaskStarted", tabId: 8}, {type: "bridgeFlowStarted", tabId: 8}
+  ], "starting a flow clears background suppression and resumes the content loop");
   elements.get("startMode").value = "B";
   await elements.get("startSelected").onclick();
   assert.deepEqual(starts, [{port: 8766, mode: "A"}, {port: 8766, mode: "B"}]);
@@ -231,6 +238,9 @@ async function main() {
   assert.equal(intervals[0].delay, 1500);
   await elements.get("endFlow").onclick();
   assert.deepEqual(stopRequests, [{port: 8766, body: {reason: "用户结束当前流程", runId: "run"}}]);
+  assert.equal(lifecycleMessages.at(-1).type, "bridgeTaskStopped",
+    "ending a flow tells the background to suppress alarm checks immediately");
+  assert.equal(lifecycleMessages.at(-1).tabId, 8);
   assert.equal(state.connections["8"].port, 8766, "ending the flow keeps the tag bound");
   assert.equal(elements.get("startSelected").disabled, true,
     "a new flow cannot start while the previous Codex task is still running");
@@ -246,6 +256,9 @@ async function main() {
   elements.get("startMode").value = "A";
   await elements.get("startSelected").onclick();
   assert.deepEqual(starts, [{port: 8766, mode: "A"}, {port: 8766, mode: "B"}, {port: 8766, mode: "A"}]);
+  assert.deepEqual(lifecycleMessages.slice(-2), [
+    {type: "bridgeTaskStarted", tabId: 8}, {type: "bridgeFlowStarted", tabId: 8}
+  ], "a later flow resumes automatic transfer on the same bound tab");
   assert.ok(routed.some(item => item.port === 8766 && item.path === "/stop" && item.method === "POST"));
   assert.equal(routed.some(item => item.path === "/pause" || item.path === "/resume"), false);
   assert.match(routed.filter(item => item.path === "/state").map(item => item.port).join(","), /8765.*8766|8766.*8765/);
