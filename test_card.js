@@ -47,7 +47,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  void startAutomaticLoop\("script_started"\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.prepareAssistantWaitObserverForTest = () => { assistantWaitDiagnostic = {active: true, reportId: 991, startedAt: Date.now(), cardFirstSeen: true, lastContentChangeAt: Date.now() - 2000, observerMutationCount: 0, observerCallbackCount: 0, observerChildListCount: 0, observerCharacterDataCount: 0, observerAttributeCount: 0}; startAssistantWaitObserver(assistantWaitDiagnostic); }; globalThis.setBusyForTest = value => { busy = value; }; globalThis.drainQueuedAssistantWaitTickForTest = drainQueuedAssistantWaitTick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.recordForTest = record; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.prepareAssistantWaitObserverForTest = () => { assistantWaitDiagnostic = {active: true, reportId: 991, startedAt: Date.now(), cardFirstSeen: true, lastContentChangeAt: Date.now() - 2000, observerMutationCount: 0, observerCallbackCount: 0, observerChildListCount: 0, observerCharacterDataCount: 0, observerAttributeCount: 0}; startAssistantWaitObserver(assistantWaitDiagnostic); }; globalThis.setBusyForTest = value => { busy = value; }; globalThis.drainQueuedAssistantWaitTickForTest = drainQueuedAssistantWaitTick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -1055,5 +1055,63 @@ context.document = {
   assert.equal(reportLog.filter(entry => entry.event === "instruction_submit").length, 1,
     "visibility restoration does not submit the same instruction twice");
   assert.equal(reportInstructionRequests.length, 1);
+
+  let logNow = 100000;
+  context.Date = class LogDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [logNow])); }
+    static now() { return logNow; }
+  };
+  const beforeRateLimitedLogs = logged.length;
+  const waitTick = {reportId: 77, cardFirstSeen: false, assistantTurnDetected: false,
+    replyCompleted: false, visibilityState: "hidden", busy: false, method: "setInterval",
+    elapsedMs: 2000, tickGapMs: 2000};
+  await context.recordForTest("assistant_wait_tick", waitTick);
+  assert.equal(logged.length, beforeRateLimitedLogs + 1,
+    "the first assistant wait tick state is recorded immediately");
+  assert.equal(logged.at(-1).occurredAt, new Date(logNow).toISOString(),
+    "content events carry their original occurrence timestamp");
+  logNow += 2000;
+  await context.recordForTest("assistant_wait_tick", {...waitTick, method: "mutation_observer",
+    elapsedMs: 4000, tickGapMs: 2000});
+  assert.equal(logged.length, beforeRateLimitedLogs + 1,
+    "unchanged assistant wait tick states are suppressed even when timing fields change");
+  logNow += 1000;
+  await context.recordForTest("assistant_wait_tick", {...waitTick, assistantTurnDetected: true,
+    elapsedMs: 5000, tickGapMs: 3000});
+  assert.equal(logged.length, beforeRateLimitedLogs + 2,
+    "an assistant wait state transition is recorded without waiting for the interval");
+  logNow += 30000;
+  await context.recordForTest("assistant_wait_tick", {...waitTick, assistantTurnDetected: true,
+    elapsedMs: 35000, tickGapMs: 30000});
+  assert.equal(logged.length, beforeRateLimitedLogs + 3,
+    "an unchanged assistant wait state is recorded again after 30 seconds");
+
+  const pendingState = {reportId: 77, cardFirstSeen: true, visibilityState: "hidden",
+    stableElapsedMs: 1800};
+  await context.recordForTest("assistant_wait_pending_submit", pendingState);
+  const afterFirstPendingState = logged.length;
+  logNow += 10000;
+  await context.recordForTest("assistant_wait_pending_submit", {...pendingState, stableElapsedMs: 11800});
+  assert.equal(logged.length, afterFirstPendingState,
+    "stable elapsed time alone does not bypass pending-submit log throttling");
+  logNow += 1;
+  await context.recordForTest("assistant_wait_pending_submit", {...pendingState, visibilityState: "visible"});
+  assert.equal(logged.length, afterFirstPendingState + 1,
+    "a pending-submit state change is recorded immediately");
+  logNow += 30000;
+  await context.recordForTest("assistant_wait_pending_submit", {...pendingState,
+    visibilityState: "visible", stableElapsedMs: 41800});
+  assert.equal(logged.length, afterFirstPendingState + 2,
+    "an unchanged pending-submit state is recorded again after 30 seconds");
+
+  const beforeUnrestrictedEvents = logged.length;
+  await context.recordForTest("tick_error", {reason: "same_error"});
+  await context.recordForTest("tick_error", {reason: "same_error"});
+  await context.recordForTest("phase", {phase: "setup"});
+  await context.recordForTest("phase", {phase: "setup"});
+  await context.recordForTest("instruction_submit", {reportId: 77});
+  await context.recordForTest("instruction_submit", {reportId: 77});
+  assert.equal(logged.length, beforeUnrestrictedEvents + 6,
+    "errors and state transitions are never rate-limited by the repetitive wait-event filter");
   console.log("Card extraction and content-search-unit fallback OK");
 })().catch(error => { console.error(error); process.exitCode = 1; });

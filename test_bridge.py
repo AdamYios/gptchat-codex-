@@ -95,7 +95,9 @@ class BridgeTests(unittest.TestCase):
             worker.start()
             base = f"http://127.0.0.1:{server.server_port}"
             try:
-                body = json.dumps({"events": [{"time": "2026-09-26T09:00:00Z",
+                body = json.dumps({"events": [{
+                    "time": "2026-10-01T09:00:05Z", "occurredAt": "2026-09-26T09:00:00Z",
+                    "delayedWrite": True, "delayMs": 5000,
                     "source": "content", "event": "card_choices_viewed", "taskId": "previous-task",
                     "data": {"cardChoices": 1, "strictChoiceCount": 0, "manualCandidateCount": 2,
                              "relaxedChoiceCount": 1, "latestOnly": True,
@@ -115,6 +117,8 @@ class BridgeTests(unittest.TestCase):
                     records = json.load(response)["records"]
                 self.assertEqual([entry["source"] for entry in records], ["content", "bridge"])
                 self.assertEqual(records[0]["occurredAt"], "2026-09-26T09:00:00+00:00")
+                self.assertTrue(records[0]["delayedWrite"])
+                self.assertEqual(records[0]["delayMs"], 5000)
                 self.assertEqual(records[0]["session"], records[1]["session"])
                 self.assertEqual(records[0]["taskId"], "previous-task")
                 self.assertEqual(records[0]["data"]["manualCandidateCount"], 2)

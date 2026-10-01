@@ -1,5 +1,6 @@
 const LEGACY_LOG_KEY = "bridgePendingEvents";
 const LOG_LIMIT = 1000;
+const LOG_DELAY_MARK_AFTER_MS = 1000;
 const DETACHED_LOG_PREFIX = "bridgePendingEvents_tab_";
 const STOPPED_CONNECTIONS_KEY = "bridgeStoppedConnectionIds";
 const REPORT_WAKE_ALARM = "bridge-report-ready-wake";
@@ -195,7 +196,10 @@ function safeEvent(message, source, connection = null) {
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);
   }
   const taskId = String(connection?.threadId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);
-  return {time: new Date().toISOString(), source, event: String(message.event || "unknown")
+  const time = new Date().toISOString();
+  const occurredAt = typeof message.occurredAt === "string" && Number.isFinite(Date.parse(message.occurredAt))
+    ? message.occurredAt : time;
+  return {time, occurredAt, source, event: String(message.event || "unknown")
     .replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50), ...(taskId ? {taskId} : {}), data};
 }
 
@@ -222,6 +226,18 @@ async function flushPending(tabId) {
     pending = [...stored[LEGACY_LOG_KEY], ...pending];
     await chrome.storage.local.set({[key]: pending, [LEGACY_LOG_KEY]: []});
   }
+  let markedPending = false;
+  const flushStartedAt = Date.now();
+  pending = pending.map(entry => {
+    const occurredAt = Date.parse(entry.occurredAt || entry.time || "");
+    if (!Number.isFinite(occurredAt) || entry.delayedWrite === true ||
+        flushStartedAt - occurredAt < LOG_DELAY_MARK_AFTER_MS)
+      return entry;
+    const delayMs = Math.max(0, Math.floor(flushStartedAt - occurredAt));
+    markedPending = true;
+    return {...entry, delayedWrite: true, delayMs};
+  });
+  if (markedPending) await chrome.storage.local.set({[key]: pending});
   try {
     while (pending.length) {
       const batch = pending.slice(0, 100);

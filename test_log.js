@@ -88,7 +88,8 @@ async function main() {
     reportId: 2, token: "secret", instruction: "private text", phase: "report_ready"
   }}, tabA);
   await send({type: "bridgeLog", event: "bind_error", data: {reason: "receiver_missing", token: "secret"}, tabId: 8});
-  await send({type: "bridgeLog", event: "card_choices_viewed", data: {
+  await send({type: "bridgeLog", event: "card_choices_viewed",
+    occurredAt: "2000-01-01T00:00:00.000Z", data: {
     round: 1, cardChoices: 1, strictChoiceCount: 0, manualCandidateCount: 2,
     relaxedChoiceCount: 1, latestOnly: true, method: "main_manual_loose",
     instruction: "private text", elapsedMs: 3000, tickGapMs: 8000,
@@ -114,6 +115,11 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskA.length, 1);
   assert.equal(saved.bridgePendingEvents_taskB.length, 2);
   assert.equal(saved.bridgePendingEvents_taskA[0].taskId, "taskA");
+  assert.equal(saved.bridgePendingEvents_taskA[0].occurredAt,
+    saved.bridgePendingEvents_taskA[0].time,
+    "events without an explicit timestamp use their original receive time");
+  assert.equal(saved.bridgePendingEvents_taskA[0].delayedWrite, undefined,
+    "a freshly queued event is not mislabeled as delayed");
   assert.equal(saved.bridgePendingEvents_taskA[0].data.token, undefined);
   assert.equal(saved.bridgePendingEvents_taskA[0].data.instruction, undefined);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.manualCandidateCount, 2);
@@ -156,6 +162,11 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.stabilityStartedAt, 1770000000000);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.assistantContentMutationCount, 2);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.instruction, undefined);
+  assert.equal(saved.bridgePendingEvents_taskB[1].occurredAt, "2000-01-01T00:00:00.000Z",
+    "a queued event retains the content-side occurrence timestamp");
+  assert.equal(saved.bridgePendingEvents_taskB[1].delayedWrite, true,
+    "events that have waited in the extension log queue are visibly marked as delayed");
+  assert.ok(saved.bridgePendingEvents_taskB[1].delayMs > 1000);
 
   for (let index = 0; index < 205; index += 1)
     await send({type: "bridgeLog", event: "offline_step", data: {round: index}}, tabA);
@@ -186,6 +197,12 @@ async function main() {
   assert.equal(stateA.data.threadId, "taskA");
   assert.equal(stateB.data.threadId, "taskB");
   assert.deepEqual(apiRouted, [8767, 8766]);
+  const deliveredQueuedEvent = written.get(8766).find(entry => entry.event === "card_choices_viewed");
+  assert.equal(deliveredQueuedEvent.occurredAt, "2000-01-01T00:00:00.000Z",
+    "the bridge receives the preserved occurrence time after queued delivery");
+  assert.equal(deliveredQueuedEvent.delayedWrite, true,
+    "the delayed-write marker survives extension queue delivery");
+  assert.ok(deliveredQueuedEvent.delayMs > 1000);
   assert.equal(alarmRecords.get("bridge-report-ready-wake")?.periodInMinutes, 0.5,
     "the MV3 worker installs a minimum-period report wake alarm");
   missingTabIds.add(8);

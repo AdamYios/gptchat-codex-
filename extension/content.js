@@ -58,6 +58,9 @@
   let actionChangedAt = 0;
   const scriptInstance = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let tickInterval = null;
+  const LOG_REPEAT_INTERVAL_MS = 30000;
+  const RATE_LIMITED_LOG_EVENTS = new Set(["assistant_wait_tick", "assistant_wait_pending_submit"]);
+  const rateLimitedLogStates = new Map();
 
   try {
     if (typeof window !== "undefined" && window.addEventListener) {
@@ -95,16 +98,38 @@
     };
   }
 
+  function logStateSignature(event, data) {
+    const fields = event === "assistant_wait_tick"
+      ? ["reportId", "cardFirstSeen", "assistantTurnDetected", "replyCompleted", "visibilityState",
+        "busy", "phase", "isGenerating", "assistantCount", "latestAssistantUnitKey",
+        "assistantUnitKeyChanged", "assistantSignatureChanged", "assistantCountChanged",
+        "assistantSelectionSource"]
+      : ["reportId", "cardFirstSeen", "visibilityState", "phase"];
+    return JSON.stringify(fields.map(field => [field, data?.[field] ?? null]));
+  }
+
+  function shouldRecordRateLimitedEvent(event, data) {
+    if (!RATE_LIMITED_LOG_EVENTS.has(event)) return true;
+    const now = Date.now();
+    const signature = logStateSignature(event, data);
+    const previous = rateLimitedLogStates.get(event);
+    if (previous && previous.signature === signature &&
+        now - previous.loggedAt < LOG_REPEAT_INTERVAL_MS) return false;
+    rateLimitedLogStates.set(event, {signature, loggedAt: now});
+    return true;
+  }
+
   function record(event, data = {}, onceKey = "") {
     if (onceKey) {
       if (recordedEvents.has(onceKey)) return Promise.resolve();
       recordedEvents.add(onceKey);
     }
+    if (!shouldRecordRateLimitedEvent(event, data)) return Promise.resolve();
     let snapshot;
     try { snapshot = operationSnapshot(); }
     catch { snapshot = {reason: "snapshot_failed"}; }
     try {
-      return chrome.runtime.sendMessage({type: "bridgeLog", event,
+      return chrome.runtime.sendMessage({type: "bridgeLog", occurredAt: new Date().toISOString(), event,
         data: {...snapshot, ...data}}).catch(() => {});
     } catch { return Promise.resolve(); /* Logging must never interrupt the bridge. */ }
   }

@@ -100,7 +100,8 @@ class EventLog:
         return "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:100]
 
     def write(self, source: str, event: str, data=None, occurred_at: str | None = None,
-              task_id: str | None = None):
+              task_id: str | None = None, delayed_write: bool = False,
+              delay_ms: int | float | None = None):
         entry = {"time": datetime.now(timezone.utc).isoformat(),
                  "session": self.session_id,
                  "source": source if source in {"bridge", "content", "popup"} else "unknown",
@@ -116,6 +117,13 @@ class EventLog:
                     entry["occurredAt"] = parsed.astimezone(timezone.utc).isoformat()
             except (TypeError, ValueError):
                 pass
+        if delayed_write:
+            entry["delayedWrite"] = True
+            if isinstance(delay_ms, (int, float)) and not isinstance(delay_ms, bool):
+                entry["delayMs"] = max(0, int(delay_ms))
+            elif "occurredAt" in entry:
+                occurred = datetime.fromisoformat(entry["occurredAt"])
+                entry["delayMs"] = max(0, int((datetime.now(timezone.utc) - occurred).total_seconds() * 1000))
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,7 +687,9 @@ def make_handler(bridge: Bridge, token: str, event_log: EventLog | None = None):
                     for entry in events:
                         event_log.write(entry.get("source", "unknown"),
                                         str(entry.get("event", "unknown")), entry.get("data"),
-                                        entry.get("time"), entry.get("taskId"))
+                                        entry.get("occurredAt") or entry.get("time"),
+                                        entry.get("taskId"), entry.get("delayedWrite") is True,
+                                        entry.get("delayMs"))
                     self.send_json(200, {"accepted": len(events)})
                     return
                 duplicate_instruction = False
