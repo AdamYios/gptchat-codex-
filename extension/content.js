@@ -1420,20 +1420,23 @@
             stableThresholdMs: 1800,
             cardFirstSeen: true,
             visibilityState: "hidden"});
-          status("指令卡片已稳定；标签页恢复后继续扫描并发送");
-        } else {
-          status("后台正在检查 ChatGPT 回复；恢复标签页后继续自动传递");
+          status("指令卡片已稳定，正在后台扫描并提交");
         }
-        return;
+        if (!wait?.pendingSubmit) {
+          status("后台等待有效指令卡片");
+          return;
+        }
       }
       if (wait?.pendingSubmit) {
         const pendingForMs = wait.pendingSubmitAt ? now - wait.pendingSubmitAt : 0;
+        if (document.visibilityState !== "hidden") {
+          record("assistant_wait_pending_submit_resumed", {reportId: wait.reportId,
+            elapsedMs: now - wait.startedAt,
+            pendingForMs,
+            visibilityState: "visible"});
+        }
         wait.pendingSubmit = false;
         wait.pendingSubmitAt = 0;
-        record("assistant_wait_pending_submit_resumed", {reportId: wait.reportId,
-          elapsedMs: now - wait.startedAt,
-          pendingForMs,
-          visibilityState: "visible"});
       }
       if (!unitFallback && STOP.test(text)) {
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
