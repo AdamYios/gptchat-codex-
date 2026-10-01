@@ -101,7 +101,9 @@ async function main() {
     optimizerStatusAvailable: true, optimizerLiveScans: 14, optimizerLiveScanDelta: 2,
     optimizerLiveUnits: 10, optimizerLiveHiddenUnits: 4, optimizerLiveLastReason: "new-content",
     latestTextLength: 123, assistantMessageCount: 6,
-    previousStableElapsedMs: 1900, cardFirstSeen: true, replyCompleted: true
+    previousStableElapsedMs: 1900, cardFirstSeen: true, replyCompleted: true,
+    lastContentChangeAt: 1770000000000, stabilityStartedAt: 1770000000000,
+    assistantContentMutationCount: 2
   }}, tabB);
   await send({type: "bridgeLog", event: "post_upgrade", tabId: 10}, {tab: {id: 10, url: "https://chatgpt.com/c/old"}});
   await send({type: "bridgeLog", event: "ignored"}, {tab: {id: 9, url: "https://chatgpt.com/c/other"}});
@@ -144,6 +146,9 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.previousStableElapsedMs, 1900);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.cardFirstSeen, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.replyCompleted, true);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.lastContentChangeAt, 1770000000000);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.stabilityStartedAt, 1770000000000);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.assistantContentMutationCount, 2);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.instruction, undefined);
 
   for (let index = 0; index < 205; index += 1)

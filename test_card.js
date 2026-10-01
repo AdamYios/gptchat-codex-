@@ -19,9 +19,15 @@ class Element {
   getClientRects() { for (let node = this; node; node = node.parentElement) if (node.hidden) return []; return [{}]; }
   contains(other) { for (let node = other; node; node = node.parentElement) if (node === this) return true; return false; }
   closest(selector) {
-    if (selector !== "[data-content-search-unit-key]") return null;
-    for (let node = this; node; node = node.parentElement)
-      if (node.getAttribute("data-content-search-unit-key")) return node;
+    const wantsAnyUnit = selector === "[data-content-search-unit-key]";
+    const wantsAssistantUnit = selector.includes('data-content-search-unit-key$=":assistant"');
+    const wantsAssistantRole = selector.includes('data-message-author-role="assistant"');
+    if (!wantsAnyUnit && !wantsAssistantUnit && !wantsAssistantRole) return null;
+    for (let node = this; node; node = node.parentElement) {
+      const unitKey = node.getAttribute("data-content-search-unit-key") || "";
+      if ((wantsAnyUnit && unitKey) || (wantsAssistantUnit && unitKey.endsWith(":assistant")) ||
+          (wantsAssistantRole && node.getAttribute("data-message-author-role") === "assistant")) return node;
+    }
     return null;
   }
   querySelectorAll(selector) {
@@ -721,8 +727,8 @@ context.document = {
   assert.equal(waitStarted.data.method, "setInterval_and_mutation_observer");
   assert.equal(waitStarted.data.tickIntervalMs, 2000);
   assert.equal(waitStarted.data.rafUsed, false);
-  assert.equal(waitStarted.data.setTimeoutUsed, true,
-    "a one-shot timeout rechecks stability without waiting for the content interval");
+  assert.equal(waitStarted.data.setTimeoutUsed, false,
+    "stability progress does not depend on a one-shot timeout");
   assert.equal(waitStarted.data.waitForUsesSetTimeout, true,
     "other send confirmation waits still use setTimeout");
   assert.equal(waitStarted.data.visibilityUsed, false);
@@ -730,7 +736,7 @@ context.document = {
     "the mutation observer wakes processing when a valid card appears");
   assert.equal(reportLog.find(entry => entry.event === "assistant_wait_observer_started")
     .data.diagnosticObserverStarted, true,
-  "a separate observer records DOM appearance without driving the automatic flow");
+  "the observer remains active to timestamp content changes and wake card processing");
   assert.ok(reportObserver.options.attributeFilter.includes("data-cgo-live-hidden"),
     "the observer watches the optimizer live-window marker for diagnostic attribution");
   assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
@@ -784,6 +790,13 @@ context.document = {
 
   assert.equal(delayedTick.data.method, "mutation_observer_card_found",
     "the card observer starts the flow directly without waiting for the interval tick");
+  const stabilityStarted = reportLog.find(entry => entry.event === "page_stability_wait_started");
+  assert.equal(stabilityStarted.data.setTimeoutUsed, false);
+  assert.equal(stabilityStarted.data.lastContentChangeAt, stabilityStarted.data.stabilityStartedAt,
+    "the stability wait stores the assistant content change timestamp");
+  assert.equal(stabilityStarted.data.stableElapsedMs, 0);
+  assert.equal(reportTimers.size, 0,
+    "no delayed stability timer is scheduled in the hidden page");
   diagnosticCard.attributes["data-cgo-live-hidden"] = "true";
   reportContext.document.querySelectorAll = selector => {
     if (selector === '[data-content-search-unit-key$=":assistant"]') return reportAssistantUnits;
@@ -794,16 +807,21 @@ context.document = {
       return reportGenerating ? [{getAttribute: () => null}] : [];
     return [];
   };
-  reportObserver.emitAttribute(diagnosticCard, "data-cgo-live-hidden");
   emitOptimizerStatus({liveScans: 13, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "mutation"});
-  const stabilityTimer = [...reportTimers.entries()].find(([, timer]) =>
-    timer.dueAt >= fakeNow + 1700);
-  assert.ok(stabilityTimer, "card discovery schedules a one-shot stability wake");
-  fakeNow = stabilityTimer[1].dueAt;
-  reportTimers.delete(stabilityTimer[0]);
-  stabilityTimer[1].callback();
+  assert.equal(reportTimers.size, 0,
+    "the hidden-page stability wait has no timer callback to depend on");
+  fakeNow += 27 * 60 * 1000;
+  reportObserver.emitAttribute(diagnosticCard, "style");
   await flushContentWork();
   const stabilityEnded = reportLog.find(entry => entry.event === "page_stability_wait_ended");
+  assert.equal(stabilityEnded.data.method, "mutation_observer_stability_threshold",
+    "an observer callback resumes the wait after a delayed background timer");
+  assert.ok(stabilityEnded.data.stableElapsedMs >= 27 * 60 * 1000,
+    "the delayed observer checks elapsed time from the last content mutation");
+  assert.ok(stabilityEnded.data.lastContentChangeAt > 0);
+  assert.ok(stabilityEnded.data.stabilityStartedAt > 0);
+  assert.equal(stabilityEnded.data.assistantContentMutationCount, 2,
+    "the observer timestamps both the new assistant turn and its instruction card");
   assert.equal(stabilityEnded.data.optimizerLiveScanDelta, 1,
     "the stability wake correlates optimizer scans without a later interval tick");
   assert.equal(stabilityEnded.data.optimizerLiveWindowMutationDelta, 1);
@@ -814,7 +832,8 @@ context.document = {
   assert.equal(stabilityEnded.data.optimizerLiveLastReason, "mutation");
   assert.equal(stabilityEnded.data.signatureChangeCount, 1,
     "an optimizer marker mutation does not reset the content signature timer");
-  assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1);
+  assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1,
+    "optimizer marker mutations do not reset the assistant-content stability clock");
   assert.ok(reportLog.some(entry => entry.event === "assistant_wait_wake_requested" &&
     entry.data.method === "mutation_observer_card_found"),
   "card discovery requests an immediate processing pass");

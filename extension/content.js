@@ -43,7 +43,6 @@
   let assistantWaitDiagnostic = null;
   let assistantWaitObserver = null;
   let assistantWaitTickQueued = false;
-  let stabilityWakeTimer = null;
   let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
@@ -162,7 +161,6 @@
   function stopInvalidatedScript() {
     if (tickInterval !== null) clearInterval(tickInterval);
     tickInterval = null;
-    clearStabilityWake();
     const bar = document.getElementById("codex-bridge-status");
     if (bar?.dataset.bridgeInstance === scriptInstance) {
       bar.style.background = "#fff0c2";
@@ -548,13 +546,6 @@
     assistantWaitObserver = null;
   }
 
-  function clearStabilityWake() {
-    if (stabilityWakeTimer !== null) {
-      try { clearTimeout(stabilityWakeTimer); } catch {}
-    }
-    stabilityWakeTimer = null;
-  }
-
   function requestAssistantWaitTick(method) {
     const wait = assistantWaitDiagnostic;
     if (!wait?.active) return;
@@ -572,19 +563,6 @@
     requestAssistantWaitTick("mutation_observer_queued");
   }
 
-  function scheduleStabilityWake(wait, signature) {
-    if (!wait?.active) return;
-    clearStabilityWake();
-    const reportId = wait.reportId;
-    const delay = Math.max(0, 1800 - (Date.now() - stableSince));
-    stabilityWakeTimer = setTimeout(() => {
-      stabilityWakeTimer = null;
-      const current = assistantWaitDiagnostic;
-      if (!current?.active || current.reportId !== reportId || lastSignature !== signature) return;
-      requestAssistantWaitTick("stability_timeout");
-    }, delay);
-  }
-
   function mutationTouchesMessageUnit(mutation) {
     const containsMessageUnit = node => {
       const element = node?.nodeType === 1 ? node : node?.parentElement;
@@ -597,6 +575,19 @@
     return [...(mutation.addedNodes || [])].some(containsMessageUnit);
   }
 
+  function mutationTouchesAssistantMessage(mutation) {
+    const containsAssistant = node => {
+      const element = node?.nodeType === 1 ? node : node?.parentElement;
+      if (!element) return false;
+      if (element.closest?.('[data-content-search-unit-key$=":assistant"]') ||
+          element.closest?.('[data-message-author-role="assistant"]')) return true;
+      return !!element.querySelector?.(
+        '[data-content-search-unit-key$=":assistant"], [data-message-author-role="assistant"]');
+    };
+    if (containsAssistant(mutation.target)) return true;
+    return [...(mutation.addedNodes || [])].some(containsAssistant);
+  }
+
   function diagnosticSelectorCount(selector) {
     try { return document.querySelectorAll(selector).length; }
     catch { return 0; }
@@ -605,6 +596,9 @@
   function assistantWaitDiagnosticFields(wait) {
     const liveScans = optimizerDiagnosticStatus?.liveScans;
     const fields = {
+      lastContentChangeAt: wait.lastContentChangeAt || 0,
+      stabilityStartedAt: wait.stabilityStartedAt || 0,
+      assistantContentMutationCount: wait.assistantContentMutationCount || 0,
       observerCallbackCount: wait.observerCallbackCount || 0,
       observerMutationCount: wait.observerMutationCount || 0,
       observerChildListCount: wait.observerChildListCount || 0,
@@ -640,7 +634,8 @@
     const now = Date.now();
     record("page_stability_checkpoint", {reportId: wait.reportId,
       elapsedMs: now - wait.startedAt,
-      stableElapsedMs: stableSince ? now - stableSince : 0,
+      stableElapsedMs: wait?.lastContentChangeAt
+        ? now - wait.lastContentChangeAt : stableSince ? now - stableSince : 0,
       stableThresholdMs: 1800,
       signatureChangeCount: wait.signatureChangeCount || 0,
       cardFirstSeen: !!wait.cardFirstSeen,
@@ -669,6 +664,25 @@
       current.observerCallbackCount = (current.observerCallbackCount || 0) + 1;
       current.observerMutationCount = (current.observerMutationCount || 0) + mutations.length;
       current.observerLastMutationAt = observedAt;
+      const assistantContentMutations = mutations.filter(mutation =>
+        mutation.type !== "attributes" && mutationTouchesAssistantMessage(mutation));
+      if (assistantContentMutations.length) {
+        current.assistantContentMutationCount = (current.assistantContentMutationCount || 0) +
+          assistantContentMutations.length;
+        const previousStabilityStartedAt = current.stabilityStartedAt || 0;
+        current.lastContentChangeAt = observedAt;
+        if (previousStabilityStartedAt) {
+          current.stabilityStartedAt = observedAt;
+          current.stabilityEndedAt = 0;
+          record("page_stability_reset", {reportId: current.reportId,
+            reason: "assistant_dom_content_changed",
+            previousStableElapsedMs: observedAt - previousStabilityStartedAt,
+            lastContentChangeAt: observedAt,
+            stabilityStartedAt: observedAt,
+            assistantContentMutationCount: current.assistantContentMutationCount,
+            visibilityState: document.visibilityState || "unknown"});
+        }
+      }
       const liveMarkerTargets = new Set(mutations
         .filter(mutation => mutation.type === "attributes" &&
           mutation.attributeName === "data-cgo-live-hidden")
@@ -697,9 +711,11 @@
         `assistant_wait_observer_fired:${current.reportId}`);
       }
       if (current.cardFirstSeen) {
-        if (mutations.some(mutation => mutation.type !== "attributes" &&
-            mutationTouchesMessageUnit(mutation)) && !isGenerating())
+        if (!isGenerating() && assistantContentMutations.length)
           requestAssistantWaitTick("mutation_observer_card_content");
+        else if (!isGenerating() && current.lastContentChangeAt &&
+            observedAt - current.lastContentChangeAt >= 1800)
+          requestAssistantWaitTick("mutation_observer_stability_threshold");
         return;
       }
       if (!mutations.some(mutation => mutation.type !== "attributes" &&
@@ -767,8 +783,11 @@
       turnDetected: false,
       replyCompleted: false,
       cardFirstSeen: false,
+      lastContentChangeAt: startedAt,
       stabilityStartedAt: 0,
       stabilityEndedAt: 0,
+      assistantContentMutationCount: 0,
+      lastSignatureMutationCount: 0,
       observerMutationCount: 0,
       observerFirstFiredAt: 0,
       observerCallbackCount: 0,
@@ -790,7 +809,7 @@
       tickIntervalMs: 2000,
       stableThresholdMs: 1800,
       rafUsed: false,
-      setTimeoutUsed: true,
+      setTimeoutUsed: false,
       waitForUsesSetTimeout: true,
       visibilityUsed: false,
       mutationObserverUsed: true}, `assistant_wait_started:${reportId}`);
@@ -1035,7 +1054,6 @@
         reason: "run_changed"});
       assistantWaitDiagnostic = null;
     }
-    clearStabilityWake();
     assistantWaitTickQueued = false;
     disconnectAssistantWaitObserver();
     runId = state.runId;
@@ -1087,7 +1105,6 @@
       const config = await bridgeSettings();
       if (!config.bound) {
         recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_unbound");
-        clearStabilityWake();
         const bar = document.getElementById("codex-bridge-status");
         if (bar?.dataset.bridgeInstance === scriptInstance) bar.remove();
         return;
@@ -1210,18 +1227,27 @@
         : unitFallback
           ? `content-search-unit:${normalize(text)}`
           : `${messages.length}:${text}`;
-      if (signature !== lastSignature) {
-        const previousStableElapsedMs = stableSince ? Date.now() - stableSince : 0;
+      const now = Date.now();
+      const observedMutationCount = wait?.assistantContentMutationCount || 0;
+      const hasUnprocessedObservedChange = !!wait &&
+        observedMutationCount > (wait.lastSignatureMutationCount || 0);
+      const signatureChanged = signature !== lastSignature;
+      if (signatureChanged) {
+        const previousStableElapsedMs = wait?.lastContentChangeAt
+          ? now - wait.lastContentChangeAt : stableSince ? now - stableSince : 0;
         lastSignature = signature;
-        stableSince = Date.now();
         if (wait) {
           wait.signatureChangeCount = (wait.signatureChangeCount || 0) + 1;
-          wait.lastSignatureChangedAt = stableSince;
-          wait.stabilityStartedAt = stableSince;
+          wait.lastSignatureChangedAt = hasUnprocessedObservedChange
+            ? wait.lastContentChangeAt : now;
+          if (!hasUnprocessedObservedChange) wait.lastContentChangeAt = now;
+          wait.lastSignatureMutationCount = observedMutationCount;
+          wait.stabilityStartedAt = wait.lastContentChangeAt || now;
           wait.stabilityEndedAt = 0;
+          stableSince = wait.lastContentChangeAt || now;
           record("page_stability_reset", {reportId: wait.reportId,
             reason: "signature_changed",
-            elapsedMs: stableSince - wait.startedAt,
+            elapsedMs: now - wait.startedAt,
             previousStableElapsedMs,
             signatureChangeCount: wait.signatureChangeCount,
             signatureLength: signature.length,
@@ -1232,61 +1258,70 @@
             visibilityState: document.visibilityState || "unknown",
             ...assistantWaitDiagnosticFields(wait)});
           record("page_stability_wait_started", {reportId: wait.reportId,
-            elapsedMs: stableSince - wait.startedAt,
+            elapsedMs: now - wait.startedAt,
+            lastContentChangeAt: wait.lastContentChangeAt,
+            stabilityStartedAt: wait.stabilityStartedAt,
             stableThresholdMs: 1800,
-            stableElapsedMs: 0,
+            stableElapsedMs: Math.max(0, now - wait.lastContentChangeAt),
             signatureChanged: true,
             signatureChangeCount: wait.signatureChangeCount,
             visibilityState: document.visibilityState || "unknown",
-            method: "setInterval_and_timeout_wake",
+            method: "setInterval_or_observer",
             rafUsed: false,
-            setTimeoutUsed: true,
+            setTimeoutUsed: false,
             visibilityUsed: false,
             mutationObserverUsed: true},
-          `page_stability_wait_started:${wait.reportId}:${stableSince}`);
-          scheduleStabilityWake(wait, signature);
+          `page_stability_wait_started:${wait.reportId}:${wait.stabilityStartedAt}`);
+        } else {
+          stableSince = now;
         }
-        status("等待页面内容稳定"); return;
+      } else if (wait && hasUnprocessedObservedChange) {
+        wait.lastSignatureMutationCount = observedMutationCount;
+        wait.stabilityStartedAt = wait.lastContentChangeAt || now;
+        wait.stabilityEndedAt = 0;
       }
-      const stableElapsedMs = Date.now() - stableSince;
+      const lastContentChangeAt = wait?.lastContentChangeAt || stableSince;
+      const stableElapsedMs = Math.max(0, now - lastContentChangeAt);
+      if (wait && !wait.stabilityStartedAt) {
+        wait.stabilityStartedAt = lastContentChangeAt || now;
+        record("page_stability_wait_started", {reportId: wait.reportId,
+          elapsedMs: now - wait.startedAt,
+          lastContentChangeAt: wait.lastContentChangeAt || now,
+          stabilityStartedAt: wait.stabilityStartedAt,
+          stableThresholdMs: 1800,
+          stableElapsedMs,
+          signatureChanged: false,
+          visibilityState: document.visibilityState || "unknown",
+          method: "setInterval_or_observer",
+          rafUsed: false,
+          setTimeoutUsed: false,
+          visibilityUsed: false,
+          mutationObserverUsed: true},
+        `page_stability_wait_started:${wait.reportId}:${wait.stabilityStartedAt}`);
+      }
       if (stableElapsedMs < 1800) {
-        if (wait) scheduleStabilityWake(wait, signature);
         recordAssistantWaitCheckpoint(wait, "stable_threshold", {phase: state.phase,
           stableElapsedMs, assistantMessageCount: messages.length,
           latestTextLength: text.length, isGenerating: false});
-        if (wait && !wait.stabilityStartedAt) {
-          wait.stabilityStartedAt = stableSince;
-          record("page_stability_wait_started", {reportId: wait.reportId,
-            elapsedMs: stableSince - wait.startedAt,
-            stableThresholdMs: 1800,
-            stableElapsedMs,
-            signatureChanged: false,
-            visibilityState: document.visibilityState || "unknown",
-            method: "setInterval_and_timeout_wake",
-            rafUsed: false,
-            setTimeoutUsed: true,
-            visibilityUsed: false,
-            mutationObserverUsed: true},
-          `page_stability_wait_started:${wait.reportId}:${stableSince}`);
-        }
         status("等待页面内容稳定"); return;
       }
       if (wait?.stabilityStartedAt && !wait.stabilityEndedAt) {
-        wait.stabilityEndedAt = Date.now();
+        wait.stabilityEndedAt = now;
         record("page_stability_wait_ended", {reportId: wait.reportId,
           elapsedMs: wait.stabilityEndedAt - wait.startedAt,
+          lastContentChangeAt: wait.lastContentChangeAt,
+          stabilityStartedAt: wait.stabilityStartedAt,
           stableElapsedMs,
           stableThresholdMs: 1800,
           signatureChangeCount: wait.signatureChangeCount || 0,
           reason: "threshold_reached_no_signature_change",
           ...assistantWaitDiagnosticFields(wait),
           visibilityState: document.visibilityState || "unknown",
-          method: "setInterval_and_timeout_wake",
+          method: trigger,
           rafUsed: false,
-          setTimeoutUsed: true,
+          setTimeoutUsed: false,
           visibilityUsed: false,
           mutationObserverUsed: true}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
-        clearStabilityWake();
       }
       if (signature === lastSubmitted) {
         recordAssistantWaitCheckpoint(wait, "signature_already_submitted", {phase: state.phase,
@@ -1358,7 +1393,6 @@
           elapsedMs: Date.now() - wait.startedAt,
           visibilityState: document.visibilityState || "unknown"});
         wait.active = false;
-        clearStabilityWake();
         disconnectAssistantWaitObserver();
       }
       await api("/instruction", "POST", {instruction: found.instruction, instructionId: id,

@@ -24,7 +24,7 @@ const LOG_FIELDS = new Set([
   "optimizerLiveLastReason",
   "signatureChangeCount", "signatureLength", "unitKeyLength",
   "latestTextLength", "assistantMessageCount", "previousStableElapsedMs", "cardFirstSeen",
-  "replyCompleted"
+  "replyCompleted", "lastContentChangeAt", "stabilityStartedAt", "assistantContentMutationCount"
 ]);
 let logQueue = Promise.resolve();
 let reportPollPromise = null;
