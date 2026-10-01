@@ -47,7 +47,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  void startAutomaticLoop\("script_started"\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.prepareAssistantWaitObserverForTest = () => { assistantWaitDiagnostic = {active: true, reportId: 991, startedAt: Date.now(), cardFirstSeen: true, lastContentChangeAt: Date.now() - 2000, observerMutationCount: 0, observerCallbackCount: 0, observerChildListCount: 0, observerCharacterDataCount: 0, observerAttributeCount: 0}; startAssistantWaitObserver(assistantWaitDiagnostic); }; globalThis.setBusyForTest = value => { busy = value; }; globalThis.drainQueuedAssistantWaitTickForTest = drainQueuedAssistantWaitTick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -454,6 +454,27 @@ context.document = {
   assert.equal(instructionRequests.at(-1).instructionId, stableId);
   assert.equal(JSON.parse(saved["bridge.instructionStates"]).find(entry => entry[0] === stableId)[1], "seen");
 
+  const textContentFallbackBody = "innerText 为空时仍读取可用的 textContent 并发送这张卡片。";
+  const textContentFallbackTurn = makeStrictMessage("thread:text-content-fallback:assistant", textContentFallbackBody);
+  Object.defineProperty(textContentFallbackTurn, "innerText", {configurable: true, get: () => ""});
+  Object.defineProperty(textContentFallbackTurn, "textContent", {configurable: true,
+    value: `给 Codex 的指令\n${textContentFallbackBody}`});
+  showAssistant(textContentFallbackTurn);
+  const beforeTextContentFallback = instructionRequests.length;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforeTextContentFallback + 1,
+    "an assistant message with empty innerText but non-empty textContent continues through automatic send");
+  assert.equal(instructionRequests.at(-1).instruction, textContentFallbackBody);
+
+  const genuinelyEmptyTurn = new Element("div", "", {"data-content-search-unit-key": "thread:empty:assistant"});
+  showAssistant(genuinelyEmptyTurn);
+  const beforeEmptyAssistant = instructionRequests.length;
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforeEmptyAssistant,
+    "a genuinely empty assistant turn remains in the wait path");
+
   const afterFirstStableSend = instructionRequests.length;
   runId = "new-bridge-run";
   await context.tickForTest();
@@ -596,6 +617,73 @@ context.document = {
   assert.match(bar.textContent, /连接检查/);
   context.stopInvalidatedForTest();
   assert.match(bar.textContent, /请刷新当前 ChatGPT 标签页/);
+
+  const savedDocumentForObserver = context.document;
+  const observerRoot = {querySelectorAll: () => []};
+  const assistantMutationTarget = {
+    nodeType: 1,
+    innerText: "助手消息",
+    textContent: "助手消息",
+    getClientRects: () => [{}],
+    getAttribute: () => null,
+    closest: selector => selector.includes('data-content-search-unit-key$=":assistant"')
+      ? assistantMutationTarget : null,
+    querySelector: () => null,
+    contains: node => node === assistantMutationTarget
+  };
+  let assistantObserverCallback;
+  let assistantObserverConfiguration;
+  context.MutationObserver = class {
+    constructor(callback) { assistantObserverCallback = callback; }
+    observe(target, options) { assistantObserverConfiguration = {target, options}; }
+    disconnect() {}
+  };
+  context.document = {
+    body: observerRoot,
+    visibilityState: "hidden",
+    querySelector: selector => selector === "main" ? observerRoot : null,
+    querySelectorAll: selector => selector === '[data-content-search-unit-key$=":assistant"]'
+      ? [assistantMutationTarget] : [],
+    getElementById: () => bar
+  };
+  context.prepareAssistantWaitObserverForTest();
+  assert.equal(assistantObserverConfiguration.target, observerRoot,
+    "the wait observer is scoped to the conversation main root");
+  assert.deepEqual(Array.from(assistantObserverConfiguration.options.attributeFilter),
+    ["data-testid", "aria-label", "aria-hidden"],
+    "style and optimizer marker attributes are excluded from observation");
+  const wakeEventsBeforeOptimizerAttributes = logged.filter(entry =>
+    entry.event.startsWith("assistant_wait_wake_")).length;
+  assistantObserverCallback([
+    {type: "attributes", attributeName: "style", target: assistantMutationTarget},
+    {type: "attributes", attributeName: "data-cgo-live-hidden", target: assistantMutationTarget},
+    {type: "attributes", attributeName: "data-cgo-history-boundary", target: assistantMutationTarget}
+  ]);
+  assert.equal(logged.filter(entry => entry.event.startsWith("assistant_wait_wake_")).length,
+    wakeEventsBeforeOptimizerAttributes,
+    "optimizer style and live-window marker mutations do not wake automatic transfer");
+
+  context.setBusyForTest(true);
+  const mutation = {type: "characterData", target: assistantMutationTarget, addedNodes: []};
+  for (let index = 0; index < 200; index += 1) assistantObserverCallback([mutation]);
+  assert.equal(logged.filter(entry => entry.event === "assistant_wait_wake_coalesced" &&
+    entry.data.reportId === 991).length, 1,
+  "a hidden-tab assistant mutation burst is represented by one coalesced diagnostic event");
+  assert.equal(logged.filter(entry => entry.event === "assistant_wait_wake_requested" &&
+    entry.data.reportId === 991).length, 0,
+  "busy observer callbacks do not each write a wake-request log");
+  context.setBusyForTest(false);
+  context.drainQueuedAssistantWaitTickForTest();
+  const compactWakeEvents = logged.filter(entry => entry.event.startsWith("assistant_wait_wake_") &&
+    entry.data.reportId === 991);
+  assert.equal(compactWakeEvents.length, 2,
+    "200 hidden-tab mutations produce one coalesced and one resumed wake record");
+  assert.equal(compactWakeEvents.find(entry => entry.event === "assistant_wait_wake_requested")
+    .data.coalescedWakeCount, 200,
+  "the resumed wake retains the number of coalesced mutations for diagnosis");
+  for (let index = 0; index < 16; index += 1) await Promise.resolve();
+  context.stopAutomaticLoopForTest();
+  context.document = savedDocumentForObserver;
 
   let fakeNow = 100000;
   class FastDate extends Date { static now() { return fakeNow; } }
@@ -767,8 +855,9 @@ context.document = {
   assert.equal(reportLog.find(entry => entry.event === "assistant_wait_observer_started")
     .data.diagnosticObserverStarted, true,
   "the observer remains active to timestamp content changes and wake card processing");
-  assert.ok(reportObserver.options.attributeFilter.includes("data-cgo-live-hidden"),
-    "the observer watches the optimizer live-window marker for diagnostic attribution");
+  assert.deepEqual(Array.from(reportObserver.options.attributeFilter),
+    ["data-testid", "aria-label", "aria-hidden"],
+    "the observer watches only assistant-affecting generation attributes, not optimizer markers or style");
   assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
     "the failed early confirmation remains recorded for diagnosis");
   assert.equal((await wakeForReport()).ok, true);
@@ -841,20 +930,30 @@ context.document = {
   assert.equal(reportTimers.size, 0,
     "the hidden-page stability wait has no timer callback to depend on");
   fakeNow += 27 * 60 * 1000;
+  const wakesBeforeOptimizerMutation = reportLog.filter(entry =>
+    entry.event.startsWith("assistant_wait_wake_")).length;
   reportObserver.emitAttribute(diagnosticCard, "style");
   await flushContentWork();
+  assert.equal(reportLog.filter(entry => entry.event.startsWith("assistant_wait_wake_")).length,
+    wakesBeforeOptimizerMutation,
+    "optimizer style changes do not wake the assistant wait observer");
+  assert.equal(reportLog.some(entry => entry.event === "page_stability_wait_ended"), false,
+    "an optimizer-only mutation cannot drive card scanning");
+  fakeNow += 1800;
+  await reportContext.tickForTest();
+  await flushContentWork();
   const stabilityEnded = reportLog.find(entry => entry.event === "page_stability_wait_ended");
-  assert.equal(stabilityEnded.data.method, "mutation_observer_stability_threshold",
-    "an observer callback resumes the wait after a delayed background timer");
+  assert.equal(stabilityEnded.data.method, "setInterval",
+    "the next normal tick evaluates elapsed stability after optimizer mutations are ignored");
   assert.ok(stabilityEnded.data.stableElapsedMs >= 27 * 60 * 1000,
-    "the delayed observer checks elapsed time from the last content mutation");
+    "the delayed tick checks elapsed time from the last assistant-content mutation");
   assert.ok(stabilityEnded.data.lastContentChangeAt > 0);
   assert.ok(stabilityEnded.data.stabilityStartedAt > 0);
   assert.equal(stabilityEnded.data.assistantContentMutationCount, 2,
     "the observer timestamps both the new assistant turn and its instruction card");
   assert.equal(stabilityEnded.data.optimizerLiveScanDelta, 1,
-    "the stability wake correlates optimizer scans without a later interval tick");
-  assert.equal(stabilityEnded.data.optimizerLiveWindowMutationDelta, 1);
+    "optimizer scan status remains diagnostic without becoming a wake source");
+  assert.equal(stabilityEnded.data.optimizerLiveWindowMutationDelta, 0);
   assert.equal(stabilityEnded.data.optimizerHiddenMarkerCount, 1);
   assert.equal(stabilityEnded.data.optimizerLiveScans, 13);
   assert.equal(stabilityEnded.data.optimizerLiveUnits, 8);

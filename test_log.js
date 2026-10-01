@@ -104,6 +104,7 @@ async function main() {
     optimizerStatusAvailable: true, optimizerLiveScans: 14, optimizerLiveScanDelta: 2,
     optimizerLiveUnits: 10, optimizerLiveHiddenUnits: 4, optimizerLiveLastReason: "new-content",
     latestTextLength: 123, assistantMessageCount: 6,
+    coalescedWakeCount: 11,
     previousStableElapsedMs: 1900, cardFirstSeen: true, replyCompleted: true,
     lastContentChangeAt: 1770000000000, stabilityStartedAt: 1770000000000,
     assistantContentMutationCount: 2
@@ -146,6 +147,8 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveLastReason, "new-content");
   assert.equal(saved.bridgePendingEvents_taskB[1].data.latestTextLength, 123);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.assistantMessageCount, 6);
+  assert.equal(saved.bridgePendingEvents_taskB[1].data.coalescedWakeCount, 11,
+    "wake coalescing counts survive the extension logging allowlist");
   assert.equal(saved.bridgePendingEvents_taskB[1].data.previousStableElapsedMs, 1900);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.cardFirstSeen, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.replyCompleted, true);

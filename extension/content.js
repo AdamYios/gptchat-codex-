@@ -43,6 +43,10 @@
   let assistantWaitDiagnostic = null;
   let assistantWaitObserver = null;
   let assistantWaitTickQueued = false;
+  let assistantWaitQueuedWakeCount = 0;
+  let assistantWaitQueuedWakeLogged = false;
+  let assistantWaitLastWakeAt = 0;
+  const ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS = 250;
   let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
@@ -171,21 +175,26 @@
 
   function assistantMessages() {
     const current = [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')]
-      .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
+      .filter(el => isVisible(el) && messageText(el));
     if (current.length) return current;
     const direct = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
-      .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
+      .filter(el => isVisible(el) && messageText(el));
     if (direct.length) return direct;
     // A generic conversation turn or article may be a user message. Only use
     // a fallback when the DOM explicitly identifies the assistant author.
     return [...document.querySelectorAll(
       '[data-author-role="assistant"], [data-role="assistant"], [data-testid*="assistant-message"]'
-    )].filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
+    )].filter(el => isVisible(el) && messageText(el));
+  }
+
+  function messageText(element) {
+    const rendered = typeof element?.innerText === "string" ? element.innerText : "";
+    const source = rendered.trim() ? rendered : element?.textContent || "";
+    return String(source).trim();
   }
 
   function isGenerating() {
-    const selectors = '[data-testid="stop-button"], button[aria-label*="Stop generating"], button[aria-label*="停止生成"]';
-    return [...document.querySelectorAll(selectors)].some(button => {
+    return [...document.querySelectorAll(GENERATION_CONTROL_SELECTOR)].some(button => {
       if (!isVisible(button) || button.getAttribute("aria-hidden") === "true") return false;
       const style = getComputedStyle(button);
       return style.display !== "none" && style.visibility !== "hidden";
@@ -383,7 +392,7 @@
 
   function visibleContentSearchUnits() {
     return [...document.querySelectorAll("[data-content-search-unit-key]")]
-      .filter(el => isVisible(el) && (el.innerText || el.textContent || "").trim());
+      .filter(el => isVisible(el) && messageText(el));
   }
 
   function latestUserContains(report) {
@@ -517,11 +526,11 @@
 
   function currentAssistantSignature() {
     const messages = assistantMessages();
-    if (messages.length) return `${messages.length}:${(messages.at(-1).innerText || "").trim()}`;
+    if (messages.length) return `${messages.length}:${messageText(messages.at(-1))}`;
     const units = visibleContentSearchUnits();
     const latest = units.at(-1);
     return latest
-      ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(latest.innerText || latest.textContent || "")}`
+      ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(messageText(latest))}`
       : "";
   }
 
@@ -546,47 +555,83 @@
     assistantWaitObserver = null;
   }
 
+  function queueAssistantWaitTick(wait, method) {
+    assistantWaitTickQueued = true;
+    assistantWaitQueuedWakeCount += 1;
+    if (assistantWaitQueuedWakeLogged) return;
+    assistantWaitQueuedWakeLogged = true;
+    record("assistant_wait_wake_coalesced", {reportId: wait.reportId, method,
+      coalescedWakeCount: assistantWaitQueuedWakeCount});
+  }
+
+  function clearQueuedAssistantWaitTick() {
+    assistantWaitTickQueued = false;
+    assistantWaitQueuedWakeCount = 0;
+    assistantWaitQueuedWakeLogged = false;
+  }
+
   function requestAssistantWaitTick(method) {
     const wait = assistantWaitDiagnostic;
     if (!wait?.active) return;
-    record("assistant_wait_wake_requested", {reportId: wait.reportId, method});
-    if (busy) {
-      assistantWaitTickQueued = true;
+    const now = Date.now();
+    if (busy || (assistantWaitLastWakeAt && now - assistantWaitLastWakeAt < ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS)) {
+      queueAssistantWaitTick(wait, method);
       return;
     }
+    const coalescedWakeCount = assistantWaitQueuedWakeCount;
+    clearQueuedAssistantWaitTick();
+    assistantWaitLastWakeAt = now;
+    record("assistant_wait_wake_requested", {reportId: wait.reportId, method, coalescedWakeCount});
     void tick(method);
   }
 
   function drainQueuedAssistantWaitTick() {
     if (busy || !assistantWaitTickQueued) return;
-    assistantWaitTickQueued = false;
+    if (!assistantWaitDiagnostic?.active) {
+      clearQueuedAssistantWaitTick();
+      return;
+    }
     requestAssistantWaitTick("mutation_observer_queued");
   }
 
-  function mutationTouchesMessageUnit(mutation) {
-    const containsMessageUnit = node => {
-      const element = node?.nodeType === 1 ? node : node?.parentElement;
-      if (!element) return false;
-      if (element.closest?.("[data-content-search-unit-key]") ||
-          element.closest?.('[data-message-author-role="assistant"]')) return true;
-      return !!(element.querySelector?.('[data-content-search-unit-key], [data-message-author-role="assistant"]'));
+  function mutationTouchesAssistantMessage(message, mutation) {
+    if (!message) return false;
+    const elementFor = node => node?.nodeType === 1 ? node : node?.parentElement;
+    const withinMessage = node => {
+      const element = elementFor(node);
+      return !!element && (element === message || message.contains?.(element));
     };
-    if (containsMessageUnit(mutation.target)) return true;
-    return [...(mutation.addedNodes || [])].some(containsMessageUnit);
+    if (withinMessage(mutation.target)) return true;
+    return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some(node => {
+      const element = elementFor(node);
+      return !!element && (element === message || message.contains?.(element) || element.contains?.(message));
+    });
   }
 
-  function mutationTouchesAssistantMessage(mutation) {
-    const containsAssistant = node => {
-      const element = node?.nodeType === 1 ? node : node?.parentElement;
-      if (!element) return false;
-      if (element.closest?.('[data-content-search-unit-key$=":assistant"]') ||
-          element.closest?.('[data-message-author-role="assistant"]')) return true;
-      return !!element.querySelector?.(
-        '[data-content-search-unit-key$=":assistant"], [data-message-author-role="assistant"]');
-    };
-    if (containsAssistant(mutation.target)) return true;
-    return [...(mutation.addedNodes || [])].some(containsAssistant);
+  function mutationAffectsGenerationState(mutation) {
+    if (mutation.type === "childList")
+      return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])]
+        .some(nodeContainsGenerationControl);
+    if (mutation.type !== "attributes" ||
+        !["data-testid", "aria-label", "aria-hidden"].includes(mutation.attributeName)) return false;
+    if (nodeIsGenerationControl(mutation.target)) return true;
+    if (mutation.attributeName === "data-testid" && mutation.oldValue === "stop-button") return true;
+    return mutation.attributeName === "aria-label" &&
+      /Stop generating|停止生成/i.test(mutation.oldValue || "");
   }
+
+  function nodeContainsGenerationControl(node) {
+    const element = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!element) return false;
+    return nodeIsGenerationControl(element) || !!element.querySelector?.(GENERATION_CONTROL_SELECTOR);
+  }
+
+  function nodeIsGenerationControl(element) {
+    return !!element?.matches?.(GENERATION_CONTROL_SELECTOR);
+  }
+
+  const GENERATION_CONTROL_SELECTOR =
+    '[data-testid="stop-button"], button[aria-label*="Stop generating"], button[aria-label*="停止生成"]';
 
   function diagnosticSelectorCount(selector) {
     try { return document.querySelectorAll(selector).length; }
@@ -648,7 +693,8 @@
   }
 
   function startAssistantWaitObserver(diagnostic) {
-    if (typeof MutationObserver !== "function" || !document.body) {
+    const root = document.querySelector("main") || document.body;
+    if (typeof MutationObserver !== "function" || !root) {
       record("assistant_wait_observer_unavailable", {reportId: diagnostic.reportId,
         visibilityState: document.visibilityState || "unknown"}, `assistant_wait_observer_unavailable:${diagnostic.reportId}`);
       return;
@@ -660,12 +706,21 @@
         if (assistantWaitObserver === observer) assistantWaitObserver = null;
         return;
       }
+      const generationMutations = mutations.filter(mutationAffectsGenerationState);
+      const hasContentMutations = mutations.some(mutation =>
+        mutation.type === "childList" || mutation.type === "characterData");
+      if (!hasContentMutations && !generationMutations.length) return;
+      const latestAssistant = hasContentMutations ? assistantMessages().at(-1) : null;
+      const assistantContentMutations = mutations.filter(mutation =>
+        (mutation.type === "childList" || mutation.type === "characterData") &&
+        mutationTouchesAssistantMessage(latestAssistant, mutation));
+      const relevantMutations = [...assistantContentMutations, ...generationMutations];
+      if (!relevantMutations.length) return;
+
       const observedAt = Date.now();
       current.observerCallbackCount = (current.observerCallbackCount || 0) + 1;
-      current.observerMutationCount = (current.observerMutationCount || 0) + mutations.length;
+      current.observerMutationCount = (current.observerMutationCount || 0) + relevantMutations.length;
       current.observerLastMutationAt = observedAt;
-      const assistantContentMutations = mutations.filter(mutation =>
-        mutation.type !== "attributes" && mutationTouchesAssistantMessage(mutation));
       if (assistantContentMutations.length) {
         current.assistantContentMutationCount = (current.assistantContentMutationCount || 0) +
           assistantContentMutations.length;
@@ -683,24 +738,11 @@
             visibilityState: document.visibilityState || "unknown"});
         }
       }
-      const liveMarkerTargets = new Set(mutations
-        .filter(mutation => mutation.type === "attributes" &&
-          mutation.attributeName === "data-cgo-live-hidden")
-        .map(mutation => mutation.target));
-      for (const mutation of mutations) {
+      for (const mutation of relevantMutations) {
         if (mutation.type === "childList") current.observerChildListCount = (current.observerChildListCount || 0) + 1;
         else if (mutation.type === "characterData") current.observerCharacterDataCount = (current.observerCharacterDataCount || 0) + 1;
-        else if (mutation.type === "attributes") {
-          current.observerAttributeCount = (current.observerAttributeCount || 0) + 1;
-          if (mutation.attributeName === "data-cgo-live-hidden" ||
-              (mutation.attributeName === "style" &&
-               (mutation.target?.getAttribute?.("data-cgo-live-hidden") === "true" ||
-                liveMarkerTargets.has(mutation.target)))) {
-            current.optimizerLiveWindowMutationCount = (current.optimizerLiveWindowMutationCount || 0) + 1;
-          }
-          if (mutation.attributeName === "data-cgo-history-boundary")
-            current.optimizerBoundaryMutationCount = (current.optimizerBoundaryMutationCount || 0) + 1;
-        }
+        else if (mutation.type === "attributes") current.observerAttributeCount =
+          (current.observerAttributeCount || 0) + 1;
       }
       if (!current.observerFirstFiredAt) {
         current.observerFirstFiredAt = observedAt;
@@ -712,14 +754,12 @@
       }
       if (current.cardFirstSeen) {
         if (!isGenerating() && assistantContentMutations.length)
-          requestAssistantWaitTick("mutation_observer_card_content");
-        else if (!isGenerating() && current.lastContentChangeAt &&
-            observedAt - current.lastContentChangeAt >= 1800)
-          requestAssistantWaitTick("mutation_observer_stability_threshold");
+          requestAssistantWaitTick("mutation_observer_assistant_content");
+        else if (!isGenerating() && generationMutations.length)
+          requestAssistantWaitTick("mutation_observer_generation_state");
         return;
       }
-      if (!mutations.some(mutation => mutation.type !== "attributes" &&
-          mutationTouchesMessageUnit(mutation))) return;
+      if (!assistantContentMutations.length) return;
       const latest = assistantMessages().at(-1) || visibleContentSearchUnits().at(-1);
       if (!latest) return;
       try {
@@ -745,13 +785,14 @@
       }
     });
     assistantWaitObserver = observer;
-    observer.observe(document.body, {subtree: true, childList: true, characterData: true,
-      attributes: true,
-      attributeFilter: ["data-cgo-live-hidden", "data-cgo-history-boundary", "style"]});
+    observer.observe(root, {subtree: true, childList: true, characterData: true,
+      attributes: true, attributeOldValue: true,
+      attributeFilter: ["data-testid", "aria-label", "aria-hidden"]});
     record("assistant_wait_observer_started", {reportId: diagnostic.reportId,
       diagnosticObserverStarted: true,
       visibilityState: document.visibilityState || "unknown",
-      method: "mutation_observer"}, `assistant_wait_observer_started:${diagnostic.reportId}`);
+      method: root === document.body ? "main_fallback" : "conversation_main"},
+    `assistant_wait_observer_started:${diagnostic.reportId}`);
   }
 
   function drainQueuedReportWake() {
@@ -770,6 +811,8 @@
     }
     await api("/ack", "POST", {reportId, runId});
     const startedAt = Date.now();
+    clearQueuedAssistantWaitTick();
+    assistantWaitLastWakeAt = 0;
     assistantWaitDiagnostic = {
       active: true,
       reportId,
@@ -1059,7 +1102,8 @@
         reason: "run_changed"});
       assistantWaitDiagnostic = null;
     }
-    assistantWaitTickQueued = false;
+    clearQueuedAssistantWaitTick();
+    assistantWaitLastWakeAt = 0;
     disconnectAssistantWaitObserver();
     runId = state.runId;
     sentReport = 0;
@@ -1086,6 +1130,7 @@
   }
 
   async function tick(trigger = "setInterval") {
+    if (trigger === "setInterval" && !busy) clearQueuedAssistantWaitTick();
     const waitDiag = assistantWaitDiagnostic;
     if (waitDiag?.active) {
       const tickAt = Date.now();
@@ -1221,7 +1266,7 @@
         record("page_wait", {reason: "generating"}, "page_wait:generating");
         status("等待 ChatGPT 回复完成"); return;
       }
-      const text = (latest.innerText || "").trim();
+      const text = messageText(latest);
       if (!text) {
         recordAssistantWaitCheckpoint(wait, "empty_assistant_text", {phase: state.phase,
           assistantMessageCount: messages.length, latestTextLength: 0, isGenerating: false});
@@ -1427,7 +1472,8 @@
   function stopAutomaticLoop() {
     if (tickInterval !== null) clearInterval(tickInterval);
     tickInterval = null;
-    assistantWaitTickQueued = false;
+    clearQueuedAssistantWaitTick();
+    assistantWaitLastWakeAt = 0;
     reportWakeQueued = false;
     assistantWaitDiagnostic = null;
     disconnectAssistantWaitObserver();

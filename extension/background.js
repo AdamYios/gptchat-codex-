@@ -13,7 +13,7 @@ const LOG_FIELDS = new Set([
   "reportLength", "filledLength", "latestCardLength", "confirmed", "reason", "method",
   "baselineAvailable", "visibleDelta", "domDelta", "mode", "errorType", "status",
   "elapsedMs", "tickGapMs", "assistantBaselineCount", "assistantCountDelta",
-  "assistantTurnDetected", "stableElapsedMs", "stableThresholdMs", "rafUsed",
+  "assistantTurnDetected", "stableElapsedMs", "stableThresholdMs", "coalescedWakeCount", "rafUsed",
   "setTimeoutUsed", "waitForUsesSetTimeout", "visibilityUsed", "mutationObserverUsed",
   "isGenerating", "cardPresent", "busy", "tickIntervalMs", "diagnosticObserverStarted",
   "observerMutationCount", "observerCallbackCount", "observerChildListCount",
