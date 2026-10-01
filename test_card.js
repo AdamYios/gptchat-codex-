@@ -64,7 +64,7 @@ let contentMessageListener;
 let timerStarts = 0;
 let timerClears = 0;
 const activeTimers = new Set();
-const context = {location: {pathname: "/c/test"}, sessionStorage: {
+const context = {location: {pathname: "/c/test"}, document: {addEventListener() {}}, sessionStorage: {
   getItem: key => saved[key] || null,
   setItem: (key, value) => { saved[key] = value; },
   removeItem: key => { delete saved[key]; }
@@ -519,6 +519,7 @@ context.document = {
   runId = "post-reload-run";
   const reloadedContext = {
     location: {pathname: "/c/test"},
+    document: {addEventListener() {}},
     sessionStorage: {
       getItem: key => saved[key] || null,
       setItem: (key, value) => { saved[key] = value; },
@@ -663,12 +664,17 @@ context.document = {
     wakeEventsBeforeOptimizerAttributes,
     "optimizer style and live-window marker mutations do not wake automatic transfer");
 
-  context.setBusyForTest(true);
   const mutation = {type: "characterData", target: assistantMutationTarget, addedNodes: []};
+  for (let index = 0; index < 200; index += 1) assistantObserverCallback([mutation]);
+  assert.equal(logged.filter(entry => entry.event.startsWith("assistant_wait_wake_") &&
+    entry.data.reportId === 991).length, 0,
+  "hidden-tab assistant mutations do not queue automatic wait processing");
+  context.document.visibilityState = "visible";
+  context.setBusyForTest(true);
   for (let index = 0; index < 200; index += 1) assistantObserverCallback([mutation]);
   assert.equal(logged.filter(entry => entry.event === "assistant_wait_wake_coalesced" &&
     entry.data.reportId === 991).length, 1,
-  "a hidden-tab assistant mutation burst is represented by one coalesced diagnostic event");
+  "a visible assistant mutation burst is represented by one coalesced diagnostic event");
   assert.equal(logged.filter(entry => entry.event === "assistant_wait_wake_requested" &&
     entry.data.reportId === 991).length, 0,
   "busy observer callbacks do not each write a wake-request log");
@@ -677,7 +683,7 @@ context.document = {
   const compactWakeEvents = logged.filter(entry => entry.event.startsWith("assistant_wait_wake_") &&
     entry.data.reportId === 991);
   assert.equal(compactWakeEvents.length, 2,
-    "200 hidden-tab mutations produce one coalesced and one resumed wake record");
+    "200 visible mutations produce one coalesced and one resumed wake record");
   assert.equal(compactWakeEvents.find(entry => entry.event === "assistant_wait_wake_requested")
     .data.coalescedWakeCount, 200,
   "the resumed wake retains the number of coalesced mutations for diagnosis");
@@ -730,6 +736,7 @@ context.document = {
   let reportTimerId = 0;
   let reportMessageListener;
   let reportWindowMessageListener;
+  let reportVisibilityChangeHandler;
   const reportWindow = {addEventListener(type, callback) {
     if (type === "message") reportWindowMessageListener = callback;
   }};
@@ -788,6 +795,9 @@ context.document = {
     }},
     document: {
       visibilityState: "visible",
+      addEventListener: (type, callback) => {
+        if (type === "visibilitychange") reportVisibilityChangeHandler = callback;
+      },
       querySelector: selector => selector === "main" ? reportMain :
         selector === '#prompt-textarea[contenteditable="true"]' ? reportEditor : null,
       querySelectorAll: selector => {
@@ -814,6 +824,12 @@ context.document = {
   }});
   const flushContentWork = async () => {
     for (let index = 0; index < 16; index += 1) await Promise.resolve();
+  };
+  const resumeAssistantWait = async () => {
+    assert.equal(typeof reportVisibilityChangeHandler, "function",
+      "the content script registers a visibility-change listener");
+    reportVisibilityChangeHandler();
+    await flushContentWork();
   };
   assert.equal((await wakeForReport()).ok, true);
   assert.ok(reportLog.some(entry => entry.event === "content_wake_received" &&
@@ -874,6 +890,14 @@ context.document = {
   await reportContext.tickForTest();
   assert.ok(reportLog.some(entry => entry.event === "assistant_wait_observer_fired"),
     "the diagnostic observer logs when ChatGPT mutates an assistant turn");
+  assert.equal(reportLog.some(entry => entry.event === "assistant_turn_detected"), false,
+    "a hidden-page mutation does not advance assistant-turn detection");
+  assert.equal(reportLog.some(entry => entry.event === "assistant_reply_completed"), false,
+    "a hidden-page mutation cannot complete the assistant wait");
+  assert.equal(reportInstructionRequests.length, 0,
+    "a hidden ChatGPT tab does not send an instruction");
+  reportContext.document.visibilityState = "visible";
+  await resumeAssistantWait();
   assert.ok(reportLog.some(entry => entry.event === "assistant_turn_detected" &&
     entry.data.isGenerating === true), "a new assistant turn is logged while the stop button is present");
   assert.ok(reportLog.some(entry => entry.event === "page_stability_checkpoint" &&
@@ -893,19 +917,19 @@ context.document = {
   reportObserver.emit(diagnosticCard);
   emitOptimizerStatus({liveScans: 12, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "new-content"});
   await flushContentWork();
-  assert.equal(reportLog.find(entry => entry.event === "assistant_reply_completed").data.visibilityState, "hidden");
+  assert.equal(reportLog.find(entry => entry.event === "assistant_reply_completed").data.visibilityState, "visible");
   const firstCardSeen = reportLog.find(entry => entry.event === "card_dom_first_seen");
   assert.equal(firstCardSeen.data.method, "mutation_observer",
     "the observer records when the complete card first exists in the DOM");
-  assert.equal(firstCardSeen.data.visibilityState, "hidden");
+  assert.equal(firstCardSeen.data.visibilityState, "visible");
   assert.equal(reportObserver.disconnected, false,
     "the diagnostic observer continues counting DOM changes after it finds the card");
   assert.ok(reportLog.some(entry => entry.event === "page_stability_wait_started"),
     "the signature change starts the existing stability wait");
   const delayedTick = reportLog.filter(entry => entry.event === "assistant_wait_tick").at(-1);
   assert.equal(delayedTick.data.tickGapMs, 62000,
-    "the diagnostic records a long gap between ticks while the tab is hidden");
-  assert.equal(delayedTick.data.visibilityState, "hidden");
+    "the diagnostic records the gap until visible-page card processing resumes");
+  assert.equal(delayedTick.data.visibilityState, "visible");
 
   assert.equal(delayedTick.data.method, "mutation_observer_card_found",
     "the card observer starts the flow directly without waiting for the interval tick");
@@ -929,6 +953,7 @@ context.document = {
   emitOptimizerStatus({liveScans: 13, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "mutation"});
   assert.equal(reportTimers.size, 0,
     "the hidden-page stability wait has no timer callback to depend on");
+  reportContext.document.visibilityState = "hidden";
   fakeNow += 27 * 60 * 1000;
   const wakesBeforeOptimizerMutation = reportLog.filter(entry =>
     entry.event.startsWith("assistant_wait_wake_")).length;
@@ -942,9 +967,17 @@ context.document = {
   fakeNow += 1800;
   await reportContext.tickForTest();
   await flushContentWork();
+  assert.equal(reportLog.some(entry => entry.event === "page_stability_wait_ended"), false,
+    "a hidden-page tick cannot end stability");
+  assert.equal(reportLog.some(entry => entry.event === "card_scan"), false,
+    "the hidden-page wait does not reach card scanning");
+  assert.equal(reportInstructionRequests.length, 0,
+    "the hidden-page wait does not submit the instruction");
+  reportContext.document.visibilityState = "visible";
+  await resumeAssistantWait();
   const stabilityEnded = reportLog.find(entry => entry.event === "page_stability_wait_ended");
-  assert.equal(stabilityEnded.data.method, "setInterval",
-    "the next normal tick evaluates elapsed stability after optimizer mutations are ignored");
+  assert.equal(stabilityEnded.data.method, "visibility_visible",
+    "visibility restoration immediately evaluates elapsed stability");
   assert.ok(stabilityEnded.data.stableElapsedMs >= 27 * 60 * 1000,
     "the delayed tick checks elapsed time from the last assistant-content mutation");
   assert.ok(stabilityEnded.data.lastContentChangeAt > 0);

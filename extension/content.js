@@ -573,6 +573,7 @@
   function requestAssistantWaitTick(method) {
     const wait = assistantWaitDiagnostic;
     if (!wait?.active) return;
+    if (document.visibilityState === "hidden") return;
     const now = Date.now();
     if (busy || (assistantWaitLastWakeAt && now - assistantWaitLastWakeAt < ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS)) {
       queueAssistantWaitTick(wait, method);
@@ -1183,6 +1184,10 @@
         status("正在处理 Codex 最终报告，核对 ChatGPT 发送状态");
         await sendReport(state.report, state.reportId, config); return;
       }
+      if (document.visibilityState === "hidden") {
+        status("ChatGPT 标签页在后台；恢复可见后继续自动检查");
+        return;
+      }
       const messages = assistantMessages();
       const unitFallback = messages.length === 0;
       const units = unitFallback ? visibleContentSearchUnits() : [];
@@ -1484,6 +1489,12 @@
     tickInterval = setInterval(tick, 2000);
     return tick(trigger).then(() => true);
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !assistantWaitDiagnostic?.active) return;
+    assistantWaitLastWakeAt = 0;
+    requestAssistantWaitTick("visibility_visible");
+  });
 
   void startAutomaticLoop("script_started");
 })();
