@@ -42,6 +42,8 @@
   let reportWakeQueued = false;
   let assistantWaitDiagnostic = null;
   let assistantWaitObserver = null;
+  let assistantWaitTickQueued = false;
+  let stabilityWakeTimer = null;
   let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
@@ -160,6 +162,7 @@
   function stopInvalidatedScript() {
     if (tickInterval !== null) clearInterval(tickInterval);
     tickInterval = null;
+    clearStabilityWake();
     const bar = document.getElementById("codex-bridge-status");
     if (bar?.dataset.bridgeInstance === scriptInstance) {
       bar.style.background = "#fff0c2";
@@ -545,6 +548,43 @@
     assistantWaitObserver = null;
   }
 
+  function clearStabilityWake() {
+    if (stabilityWakeTimer !== null) {
+      try { clearTimeout(stabilityWakeTimer); } catch {}
+    }
+    stabilityWakeTimer = null;
+  }
+
+  function requestAssistantWaitTick(method) {
+    const wait = assistantWaitDiagnostic;
+    if (!wait?.active) return;
+    record("assistant_wait_wake_requested", {reportId: wait.reportId, method});
+    if (busy) {
+      assistantWaitTickQueued = true;
+      return;
+    }
+    void tick(method);
+  }
+
+  function drainQueuedAssistantWaitTick() {
+    if (busy || !assistantWaitTickQueued) return;
+    assistantWaitTickQueued = false;
+    requestAssistantWaitTick("mutation_observer_queued");
+  }
+
+  function scheduleStabilityWake(wait, signature) {
+    if (!wait?.active) return;
+    clearStabilityWake();
+    const reportId = wait.reportId;
+    const delay = Math.max(0, 1800 - (Date.now() - stableSince));
+    stabilityWakeTimer = setTimeout(() => {
+      stabilityWakeTimer = null;
+      const current = assistantWaitDiagnostic;
+      if (!current?.active || current.reportId !== reportId || lastSignature !== signature) return;
+      requestAssistantWaitTick("stability_timeout");
+    }, delay);
+  }
+
   function mutationTouchesMessageUnit(mutation) {
     const containsMessageUnit = node => {
       const element = node?.nodeType === 1 ? node : node?.parentElement;
@@ -656,7 +696,13 @@
           visibilityState: document.visibilityState || "unknown"},
         `assistant_wait_observer_fired:${current.reportId}`);
       }
-      if (current.cardFirstSeen || !mutations.some(mutation => mutation.type !== "attributes" &&
+      if (current.cardFirstSeen) {
+        if (mutations.some(mutation => mutation.type !== "attributes" &&
+            mutationTouchesMessageUnit(mutation)) && !isGenerating())
+          requestAssistantWaitTick("mutation_observer_card_content");
+        return;
+      }
+      if (!mutations.some(mutation => mutation.type !== "attributes" &&
           mutationTouchesMessageUnit(mutation))) return;
       const latest = assistantMessages().at(-1) || visibleContentSearchUnits().at(-1);
       if (!latest) return;
@@ -675,6 +721,7 @@
           observerMutationCount: current.observerMutationCount,
           visibilityState: document.visibilityState || "unknown",
           method: "mutation_observer"}, `card_dom_first_seen:${current.reportId}`);
+        requestAssistantWaitTick("mutation_observer_card_found");
       } catch {
         record("card_dom_probe_error", {reportId: current.reportId,
           elapsedMs: observedAt - current.startedAt,
@@ -739,14 +786,14 @@
     record("assistant_wait_started", {reportId,
       assistantBaselineCount: preSendAssistantCount,
       visibilityState: document.visibilityState || "unknown",
-      method: "setInterval",
+      method: "setInterval_and_mutation_observer",
       tickIntervalMs: 2000,
       stableThresholdMs: 1800,
       rafUsed: false,
-      setTimeoutUsed: false,
+      setTimeoutUsed: true,
       waitForUsesSetTimeout: true,
       visibilityUsed: false,
-      mutationObserverUsed: false}, `assistant_wait_started:${reportId}`);
+      mutationObserverUsed: true}, `assistant_wait_started:${reportId}`);
     startAssistantWaitObserver(assistantWaitDiagnostic);
     status("最终报告已发往 ChatGPT，等待下一轮");
   }
@@ -988,6 +1035,8 @@
         reason: "run_changed"});
       assistantWaitDiagnostic = null;
     }
+    clearStabilityWake();
+    assistantWaitTickQueued = false;
     disconnectAssistantWaitObserver();
     runId = state.runId;
     sentReport = 0;
@@ -1013,7 +1062,7 @@
       sessionStorage.removeItem(`bridge.${key}`);
   }
 
-  async function tick() {
+  async function tick(trigger = "setInterval") {
     const waitDiag = assistantWaitDiagnostic;
     if (waitDiag?.active) {
       const tickAt = Date.now();
@@ -1025,7 +1074,7 @@
         replyCompleted: !!waitDiag.replyCompleted,
         visibilityState: document.visibilityState || "unknown",
         busy,
-        method: "setInterval"});
+        method: trigger});
       waitDiag.lastTickAt = tickAt;
     }
     if (busy) {
@@ -1038,6 +1087,7 @@
       const config = await bridgeSettings();
       if (!config.bound) {
         recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_unbound");
+        clearStabilityWake();
         const bar = document.getElementById("codex-bridge-status");
         if (bar?.dataset.bridgeInstance === scriptInstance) bar.remove();
         return;
@@ -1188,17 +1238,19 @@
             signatureChanged: true,
             signatureChangeCount: wait.signatureChangeCount,
             visibilityState: document.visibilityState || "unknown",
-            method: "setInterval",
+            method: "setInterval_and_timeout_wake",
             rafUsed: false,
-            setTimeoutUsed: false,
+            setTimeoutUsed: true,
             visibilityUsed: false,
-            mutationObserverUsed: false},
+            mutationObserverUsed: true},
           `page_stability_wait_started:${wait.reportId}:${stableSince}`);
+          scheduleStabilityWake(wait, signature);
         }
         status("等待页面内容稳定"); return;
       }
       const stableElapsedMs = Date.now() - stableSince;
       if (stableElapsedMs < 1800) {
+        if (wait) scheduleStabilityWake(wait, signature);
         recordAssistantWaitCheckpoint(wait, "stable_threshold", {phase: state.phase,
           stableElapsedMs, assistantMessageCount: messages.length,
           latestTextLength: text.length, isGenerating: false});
@@ -1210,11 +1262,11 @@
             stableElapsedMs,
             signatureChanged: false,
             visibilityState: document.visibilityState || "unknown",
-            method: "setInterval",
+            method: "setInterval_and_timeout_wake",
             rafUsed: false,
-            setTimeoutUsed: false,
+            setTimeoutUsed: true,
             visibilityUsed: false,
-            mutationObserverUsed: false},
+            mutationObserverUsed: true},
           `page_stability_wait_started:${wait.reportId}:${stableSince}`);
         }
         status("等待页面内容稳定"); return;
@@ -1229,11 +1281,12 @@
           reason: "threshold_reached_no_signature_change",
           ...assistantWaitDiagnosticFields(wait),
           visibilityState: document.visibilityState || "unknown",
-          method: "setInterval",
+          method: "setInterval_and_timeout_wake",
           rafUsed: false,
-          setTimeoutUsed: false,
+          setTimeoutUsed: true,
           visibilityUsed: false,
-          mutationObserverUsed: false}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
+          mutationObserverUsed: true}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
+        clearStabilityWake();
       }
       if (signature === lastSubmitted) {
         recordAssistantWaitCheckpoint(wait, "signature_already_submitted", {phase: state.phase,
@@ -1305,6 +1358,7 @@
           elapsedMs: Date.now() - wait.startedAt,
           visibilityState: document.visibilityState || "unknown"});
         wait.active = false;
+        clearStabilityWake();
         disconnectAssistantWaitObserver();
       }
       await api("/instruction", "POST", {instruction: found.instruction, instructionId: id,
@@ -1326,6 +1380,7 @@
       status(String(error), true);
     } finally {
       busy = false;
+      drainQueuedAssistantWaitTick();
       drainQueuedReportWake();
     }
   }
