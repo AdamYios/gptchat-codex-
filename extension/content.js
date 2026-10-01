@@ -47,6 +47,7 @@
   let assistantWaitQueuedWakeLogged = false;
   let assistantWaitLastWakeAt = 0;
   const ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS = 250;
+  const ASSISTANT_WAIT_HIDDEN_WAKE_MIN_INTERVAL_MS = 1800;
   let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
@@ -573,16 +574,28 @@
   function requestAssistantWaitTick(method) {
     const wait = assistantWaitDiagnostic;
     if (!wait?.active) return;
-    if (document.visibilityState === "hidden") return;
     const now = Date.now();
-    if (busy || (assistantWaitLastWakeAt && now - assistantWaitLastWakeAt < ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS)) {
+    const hidden = document.visibilityState === "hidden";
+    if (hidden && wait.pendingSubmit) {
+      clearQueuedAssistantWaitTick();
+      return;
+    }
+    if (hidden && wait.lastHiddenPreparationAt &&
+        now - wait.lastHiddenPreparationAt < ASSISTANT_WAIT_HIDDEN_WAKE_MIN_INTERVAL_MS) {
+      clearQueuedAssistantWaitTick();
+      return;
+    }
+    if (busy || (!hidden && assistantWaitLastWakeAt &&
+        now - assistantWaitLastWakeAt < ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS)) {
       queueAssistantWaitTick(wait, method);
       return;
     }
     const coalescedWakeCount = assistantWaitQueuedWakeCount;
     clearQueuedAssistantWaitTick();
-    assistantWaitLastWakeAt = now;
-    record("assistant_wait_wake_requested", {reportId: wait.reportId, method, coalescedWakeCount});
+    if (hidden) wait.lastHiddenPreparationAt = now;
+    else assistantWaitLastWakeAt = now;
+    record("assistant_wait_wake_requested", {reportId: wait.reportId, method, coalescedWakeCount,
+      visibilityState: document.visibilityState || "unknown"});
     void tick(method);
   }
 
@@ -685,6 +698,8 @@
       stableThresholdMs: 1800,
       signatureChangeCount: wait.signatureChangeCount || 0,
       cardFirstSeen: !!wait.cardFirstSeen,
+      pendingSubmit: !!wait.pendingSubmit,
+      pendingSubmitAt: wait.pendingSubmitAt || 0,
       assistantTurnDetected: !!wait.turnDetected,
       replyCompleted: !!wait.replyCompleted,
       visibilityState: document.visibilityState || "unknown",
@@ -727,6 +742,14 @@
           assistantContentMutations.length;
         const previousStabilityStartedAt = current.stabilityStartedAt || 0;
         current.lastContentChangeAt = observedAt;
+        if (current.pendingSubmit) {
+          record("assistant_wait_pending_submit_invalidated", {reportId: current.reportId,
+            reason: "assistant_dom_content_changed",
+            pendingForMs: current.pendingSubmitAt ? observedAt - current.pendingSubmitAt : 0,
+            visibilityState: document.visibilityState || "unknown"});
+          current.pendingSubmit = false;
+          current.pendingSubmitAt = 0;
+        }
         if (previousStabilityStartedAt) {
           current.stabilityStartedAt = observedAt;
           current.stabilityEndedAt = 0;
@@ -827,6 +850,9 @@
       turnDetected: false,
       replyCompleted: false,
       cardFirstSeen: false,
+      pendingSubmit: false,
+      pendingSubmitAt: 0,
+      lastHiddenPreparationAt: 0,
       lastContentChangeAt: startedAt,
       stabilityStartedAt: 0,
       stabilityEndedAt: 0,
@@ -1184,7 +1210,7 @@
         status("正在处理 Codex 最终报告，核对 ChatGPT 发送状态");
         await sendReport(state.report, state.reportId, config); return;
       }
-      if (document.visibilityState === "hidden") {
+      if (document.visibilityState === "hidden" && !assistantWaitDiagnostic?.active) {
         status("ChatGPT 标签页在后台；恢复可见后继续自动检查");
         return;
       }
@@ -1383,6 +1409,31 @@
         recordAssistantWaitCheckpoint(wait, "signature_already_submitted", {phase: state.phase,
           stableElapsedMs, latestTextLength: text.length, isGenerating: false});
         status("已处理当前指令，等待 ChatGPT 新回复"); return;
+      }
+      if (document.visibilityState === "hidden") {
+        if (wait?.active && wait.cardFirstSeen && stableElapsedMs >= 1800 && !wait.pendingSubmit) {
+          wait.pendingSubmit = true;
+          wait.pendingSubmitAt = now;
+          record("assistant_wait_pending_submit", {reportId: wait.reportId,
+            elapsedMs: now - wait.startedAt,
+            stableElapsedMs,
+            stableThresholdMs: 1800,
+            cardFirstSeen: true,
+            visibilityState: "hidden"});
+          status("指令卡片已稳定；标签页恢复后继续扫描并发送");
+        } else {
+          status("后台正在检查 ChatGPT 回复；恢复标签页后继续自动传递");
+        }
+        return;
+      }
+      if (wait?.pendingSubmit) {
+        const pendingForMs = wait.pendingSubmitAt ? now - wait.pendingSubmitAt : 0;
+        wait.pendingSubmit = false;
+        wait.pendingSubmitAt = 0;
+        record("assistant_wait_pending_submit_resumed", {reportId: wait.reportId,
+          elapsedMs: now - wait.startedAt,
+          pendingForMs,
+          visibilityState: "visible"});
       }
       if (!unitFallback && STOP.test(text)) {
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
