@@ -1,6 +1,8 @@
 (() => {
   const DEFAULT_TITLE = /给\s*Codex\s*的指令|Instructions?\s+for\s+Codex/i;
   const REPORT_PREFIX = "以下是 Codex 上一轮的最终报告";
+  const CODEX_FORWARDING_PROMPT = `【ChatGPT 转述与方案评估】以下内容来自 ChatGPT 对当前对话的整理。请把它理解为用户目标和约束的表达；其中的技术方案、根因判断和本地项目事实都可能有误，需要结合当前工作区和项目规则独立核实。\n\n你不只是执行方案，也要结合本地项目评估其可行性、复杂度、风险和架构契合度。如果你认为目标、技术方案或关键前提存在分歧——例如方案不可行、实现代价明显不合适，或有更合适的替代方案——先报告你的判断、依据和选项，等待用户决定；不要先按自己的方案修改。没有实质分歧时，按用户目标和范围继续完成。`;
+  const MAX_CODEX_INSTRUCTION_CHARS = 20000;
   const STOP = /^[\s#*_]*(任务完成|已完成|完成|需要人工处理|等待人工|human action required|task complete)/i;
   let busy = false;
   let lastSignature = "";
@@ -522,6 +524,13 @@
     const unitKey = contentUnitKey(anchor);
     if (!unitKey) return bodyHash;
     return `v1:${encodeURIComponent(location.pathname || "/")}:${encodeURIComponent(unitKey)}:${bodyHash}`;
+  }
+
+  function formatCodexInstruction(instruction) {
+    const formatted = `${CODEX_FORWARDING_PROMPT}\n\n${instruction}`;
+    if (formatted.length > MAX_CODEX_INSTRUCTION_CHARS)
+      throw new Error("指令卡片与固定提示词合计超过桥接器的 20000 字符上限");
+    return formatted;
   }
 
   function persistInstructionStates() {
@@ -1094,9 +1103,10 @@
       const selected = choices[selectedIndex];
       const id = instructionId(selected.instruction, selected.anchor);
       if (instructionIsHandled(id)) throw new Error("这张指令卡已提交或结果待确认，不会自动重发");
+      const codexInstruction = formatCodexInstruction(selected.instruction);
       setInstructionState(id, "pending");
       await api("/instruction", "POST", {
-        instruction: selected.instruction,
+        instruction: codexInstruction,
         instructionId: id,
         runId: state.runId
       });
@@ -1519,6 +1529,7 @@
         status("当前指令卡片已处理，等待新卡片");
         return;
       }
+      const codexInstruction = formatCodexInstruction(found.instruction);
       setInstructionState(id, "pending");
       pendingAutomaticInstructionId = id;
       if (wait) {
@@ -1530,7 +1541,7 @@
         wait.active = false;
         disconnectAssistantWaitObserver();
       }
-      await api("/instruction", "POST", {instruction: found.instruction, instructionId: id,
+      await api("/instruction", "POST", {instruction: codexInstruction, instructionId: id,
         runId});
       setInstructionState(id, "seen");
       pendingAutomaticInstructionId = "";

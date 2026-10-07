@@ -3,6 +3,13 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
 
+const forwardingPrompt = [
+  "【ChatGPT 转述与方案评估】以下内容来自 ChatGPT 对当前对话的整理。请把它理解为用户目标和约束的表达；其中的技术方案、根因判断和本地项目事实都可能有误，需要结合当前工作区和项目规则独立核实。",
+  "",
+  "你不只是执行方案，也要结合本地项目评估其可行性、复杂度、风险和架构契合度。如果你认为目标、技术方案或关键前提存在分歧——例如方案不可行、实现代价明显不合适，或有更合适的替代方案——先报告你的判断、依据和选项，等待用户决定；不要先按自己的方案修改。没有实质分歧时，按用户目标和范围继续完成。"
+].join("\n");
+const forwardedInstruction = instruction => `${forwardingPrompt}\n\n${instruction}`;
+
 class Element {
   constructor(tag, ownText = "", attributes = {}) {
     this.nodeType = 1;
@@ -380,6 +387,10 @@ context.document = {
   assert.match(submitted, /最新对话里的待确认指令/);
   assert.equal(instructionRequests.at(-1).instructionId, markerlessChoices.data[0].key,
     "manual instruction submission sends the same stable ID used by the choice");
+  assert.equal(instructionRequests.at(-1).instruction,
+    forwardedInstruction("这是最新对话里的待确认指令内容，查看卡片时应该能看到它。"),
+    "manual card submission prepends the fixed prompt while keeping the card body intact");
+  assert.match(instructionRequests.at(-1).instruction, /有更合适的替代方案——先报告/);
 
   // An unmarked response with only a generic message Copy control is not a
   // card-shaped candidate; do not promote the whole response as a fallback.
@@ -450,8 +461,21 @@ context.document = {
   await context.tickForTest();
   context.forceStableForTest();
   await context.tickForTest();
-  assert.equal(instructionRequests.at(-1).instruction, stableBody);
+  assert.equal(instructionRequests.at(-1).instruction, forwardedInstruction(stableBody),
+    "automatic forwarding prepends the same fixed prompt");
   assert.equal(instructionRequests.at(-1).instructionId, stableId);
+  const oversizedForwardedBody = "x".repeat(20000 - forwardingPrompt.length - 1);
+  const oversizedForwardedTurn = makeStrictMessage("thread:oversized-forwarded:assistant", oversizedForwardedBody);
+  const oversizedForwardedId = context.instructionIdForTest(oversizedForwardedBody, oversizedForwardedTurn);
+  showAssistant(oversizedForwardedTurn);
+  const beforeOversizedForwarding = instructionRequests.length;
+  await context.tickForTest();
+  context.forceStableForTest();
+  await context.tickForTest();
+  assert.equal(instructionRequests.length, beforeOversizedForwarding,
+    "a prompt that would exceed the bridge length limit is not sent");
+  assert.equal(JSON.parse(saved["bridge.instructionStates"]).some(([id]) => id === oversizedForwardedId), false,
+    "an oversized formatted instruction is rejected before it is marked pending");
   assert.equal(JSON.parse(saved["bridge.instructionStates"]).find(entry => entry[0] === stableId)[1], "seen");
 
   const textContentFallbackBody = "innerText 为空时仍读取可用的 textContent 并发送这张卡片。";
@@ -466,7 +490,7 @@ context.document = {
   await context.tickForTest();
   assert.equal(instructionRequests.length, beforeTextContentFallback + 1,
     "an assistant message with empty innerText but non-empty textContent continues through automatic send");
-  assert.equal(instructionRequests.at(-1).instruction, textContentFallbackBody);
+  assert.equal(instructionRequests.at(-1).instruction, forwardedInstruction(textContentFallbackBody));
 
   const genuinelyEmptyTurn = new Element("div", "", {"data-content-search-unit-key": "thread:empty:assistant"});
   showAssistant(genuinelyEmptyTurn);
@@ -1034,7 +1058,8 @@ context.document = {
     entry.data.visibilityState === "hidden"),
   "the instruction is submitted in the background after the stability threshold");
   assert.equal(reportInstructionRequests.length, 1);
-  assert.equal(reportInstructionRequests[0].instruction, "诊断后继续检查卡片等待阶段。");
+  assert.equal(reportInstructionRequests[0].instruction,
+    forwardedInstruction("诊断后继续检查卡片等待阶段。"));
   assert.equal(stabilityEnded.data.signatureChangeCount, 1,
     "an optimizer marker mutation does not reset the content signature timer");
   assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1,
