@@ -4,7 +4,7 @@ const vm = require("node:vm");
 const path = require("node:path");
 
 const forwardingPrompt = [
-  "【处理原则】你是一名代码工程师，你负责审核并决定是否执行方案指令，你不只是执行方案，也要结合本地项目评估其可行性、复杂度、风险和架构契合度。如果你认为目标、技术方案或关键前提存在分歧——例如方案不可行、实现代价明显不合适，或有更合适的替代方案——先报告你的判断、依据和选项，等待用户决定；不要先按自己的方案修改。没有实质分歧时，按用户目标和范围继续完成。",
+  "【处理原则】你是一名代码工程师，你负责审核并决定是否执行方案指令。每次执行前，先向用户简要报告方案审核结论：说明对目标和范围的理解、可行性判断及依据，并明确是否存在实质分歧；即使没有分歧，也要说明“无实质分歧”及判断理由。无实质分歧时，报告后直接继续执行，不需等待确认。你不只是执行方案，也要结合本地项目评估其可行性、复杂度、风险和架构契合度。如果你认为目标、技术方案或关键前提存在分歧——例如方案不可行、实现代价明显不合适，或有更合适的替代方案——先报告你的判断、依据和选项，等待用户决定；不要先按自己的方案修改。",
   "【以下为任务指令；请按以上原则核验并处理】"
 ].join("\n");
 const forwardedInstruction = instruction => `${forwardingPrompt}\n\n${instruction}`;
@@ -390,6 +390,8 @@ context.document = {
     forwardedInstruction("这是最新对话里的待确认指令内容，查看卡片时应该能看到它。"),
     "manual card submission prepends the fixed prompt while keeping the card body intact");
   assert.match(instructionRequests.at(-1).instruction, /有更合适的替代方案——先报告/);
+  assert.match(instructionRequests.at(-1).instruction, /每次执行前，先向用户简要报告方案审核结论/);
+  assert.match(instructionRequests.at(-1).instruction, /无实质分歧.*报告后直接继续执行，不需等待确认/);
 
   // An unmarked response with only a generic message Copy control is not a
   // card-shaped candidate; do not promote the whole response as a fallback.
