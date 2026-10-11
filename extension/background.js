@@ -26,7 +26,8 @@ const LOG_FIELDS = new Set([
   "optimizerLiveLastReason",
   "signatureChangeCount", "signatureLength", "unitKeyLength",
   "latestTextLength", "assistantMessageCount", "previousStableElapsedMs", "cardFirstSeen",
-  "replyCompleted", "lastContentChangeAt", "stabilityStartedAt", "assistantContentMutationCount"
+  "replyCompleted", "lastContentChangeAt", "stabilityStartedAt", "assistantContentMutationCount",
+  "composerText", "errorName", "errorMessage", "errorStack"
 ]);
 let logQueue = Promise.resolve();
 let reportPollPromise = null;
@@ -191,6 +192,9 @@ function safeEvent(message, source, connection = null) {
     if (!LOG_FIELDS.has(key)) continue;
     if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
     else if (typeof value === "boolean") data[key] = value;
+    else if (typeof value === "string" && ["composerText", "errorMessage", "errorStack"].includes(key))
+      data[key] = value;
+    else if (typeof value === "string" && key === "errorName") data[key] = value.slice(0, 120);
     else if (typeof value === "string" &&
              /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId|optimizerLiveLastReason)$/.test(key))
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);

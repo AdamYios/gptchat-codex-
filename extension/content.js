@@ -12,6 +12,7 @@
   let attemptedReport = Number(sessionStorage.getItem("bridge.attemptedReport") || "0");
   let attemptedAt = Number(sessionStorage.getItem("bridge.attemptedAt") || "0");
   let preSendAssistant = sessionStorage.getItem("bridge.preSendAssistant") || "";
+  let preSendAssistantContentSignature = sessionStorage.getItem("bridge.preSendAssistantContentSignature") || "";
   let preSendAssistantCount = Number(sessionStorage.getItem("bridge.preSendAssistantCount") || "0");
   let preSendAssistantUnitKey = "";
   let preSendUserCount = Number(sessionStorage.getItem("bridge.preSendUserCount") || "0");
@@ -63,6 +64,8 @@
   const LOG_REPEAT_INTERVAL_MS = 30000;
   const RATE_LIMITED_LOG_EVENTS = new Set(["assistant_wait_tick", "assistant_wait_pending_submit"]);
   const rateLimitedLogStates = new Map();
+  const STATUS_WIDGET_POSITION_KEY = "bridge.statusWidgetPosition";
+  const STATUS_WIDGET_COLLAPSED_KEY = "bridge.statusWidgetCollapsed";
 
   try {
     if (typeof window !== "undefined" && window.addEventListener) {
@@ -148,23 +151,178 @@
     return result;
   }
 
+  function statusWidgetPosition(bar) {
+    const width = Number(typeof window !== "undefined" && window.innerWidth) ||
+      Number(document.documentElement?.clientWidth) || 1280;
+    const height = Number(typeof window !== "undefined" && window.innerHeight) ||
+      Number(document.documentElement?.clientHeight) || 800;
+    const barWidth = Number(bar.offsetWidth) || 320;
+    const barHeight = Number(bar.offsetHeight) || 96;
+    let saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(STATUS_WIDGET_POSITION_KEY) || "null"); }
+    catch { saved = null; }
+    if (!Number.isFinite(saved?.left) || !Number.isFinite(saved?.top)) return null;
+    return {
+      left: Math.min(Math.max(0, saved.left), Math.max(0, width - barWidth)),
+      top: Math.min(Math.max(0, saved.top), Math.max(0, height - barHeight))
+    };
+  }
+
+  function setStatusWidgetPosition(bar, left, top, persist = false) {
+    const width = Number(typeof window !== "undefined" && window.innerWidth) ||
+      Number(document.documentElement?.clientWidth) || 1280;
+    const height = Number(typeof window !== "undefined" && window.innerHeight) ||
+      Number(document.documentElement?.clientHeight) || 800;
+    const barWidth = Number(bar.offsetWidth) || 320;
+    const barHeight = Number(bar.offsetHeight) || 96;
+    const position = {
+      left: Math.min(Math.max(0, left), Math.max(0, width - barWidth)),
+      top: Math.min(Math.max(0, top), Math.max(0, height - barHeight))
+    };
+    Object.assign(bar.style, {
+      left: `${position.left}px`, top: `${position.top}px`, right: "auto", bottom: "auto"
+    });
+    if (persist) {
+      try { sessionStorage.setItem(STATUS_WIDGET_POSITION_KEY, JSON.stringify(position)); }
+      catch { /* Widget placement is optional. */ }
+    }
+    return position;
+  }
+
+  function keepStatusWidgetInViewport(bar, persist = false) {
+    if (typeof bar?.getBoundingClientRect !== "function") return null;
+    const rect = bar.getBoundingClientRect();
+    return setStatusWidgetPosition(bar, rect.left, rect.top, persist);
+  }
+
+  function setStatusWidgetCollapsed(bar, collapsed, persist = true) {
+    const body = bar.querySelector?.(".codex-bridge-status-body");
+    const toggle = bar.querySelector?.(".codex-bridge-status-toggle");
+    if (!body || !toggle) return;
+    bar.dataset.bridgeCollapsed = String(collapsed);
+    body.style.display = collapsed ? "none" : "block";
+    toggle.textContent = collapsed ? "+" : "−";
+    toggle.title = collapsed ? "展开状态窗口" : "收起状态窗口";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    if (persist) {
+      try { sessionStorage.setItem(STATUS_WIDGET_COLLAPSED_KEY, String(collapsed)); }
+      catch { /* Widget collapse state is optional. */ }
+    }
+    if (!collapsed && typeof bar.getBoundingClientRect === "function") {
+      const rect = bar.getBoundingClientRect();
+      setStatusWidgetPosition(bar, rect.left, rect.top, true);
+    }
+  }
+
+  function initializeStatusWidget(bar) {
+    if (bar.querySelector?.(".codex-bridge-status-body") &&
+        bar.querySelector?.(".codex-bridge-status-toggle")) return true;
+    if (typeof document.createElement !== "function" || typeof bar.appendChild !== "function") return false;
+
+    const header = document.createElement("div");
+    header.className = "codex-bridge-status-header";
+    Object.assign(header.style, {
+      display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px",
+      padding: "6px 8px", cursor: "move", userSelect: "none", touchAction: "none"
+    });
+    const label = document.createElement("span");
+    label.textContent = "Codex 桥接";
+    label.style.fontWeight = "600";
+    const toggle = document.createElement("button");
+    toggle.className = "codex-bridge-status-toggle";
+    toggle.type = "button";
+    toggle.textContent = "−";
+    Object.assign(toggle.style, {
+      border: "0", borderRadius: "4px", padding: "0 5px", background: "transparent",
+      color: "inherit", cursor: "pointer", font: "16px system-ui", lineHeight: "20px"
+    });
+    const body = document.createElement("div");
+    body.className = "codex-bridge-status-body";
+    Object.assign(body.style, {padding: "0 8px 8px", maxWidth: "340px", whiteSpace: "pre-wrap"});
+    header.appendChild(label);
+    header.appendChild(toggle);
+    if (typeof bar.replaceChildren === "function") bar.replaceChildren(header, body);
+    else {
+      bar.textContent = "";
+      bar.appendChild(header);
+      bar.appendChild(body);
+    }
+    Object.assign(bar.style, {
+      position: "fixed", bottom: "8px", left: "8px", right: "auto", zIndex: "2147483647",
+      padding: "0", borderRadius: "7px", font: "12px system-ui",
+      maxWidth: "min(360px, calc(100vw - 16px))", maxHeight: "calc(100vh - 16px)", whiteSpace: "pre-wrap",
+      boxShadow: "0 1px 7px #0004", overflow: "auto"
+    });
+    bar.dataset.bridgeWidgetVersion = "1";
+    let initiallyCollapsed = false;
+    try { initiallyCollapsed = sessionStorage.getItem(STATUS_WIDGET_COLLAPSED_KEY) === "true"; }
+    catch { /* Start expanded if session storage is unavailable. */ }
+    const savedPosition = statusWidgetPosition(bar);
+    if (savedPosition) setStatusWidgetPosition(bar, savedPosition.left, savedPosition.top);
+    setStatusWidgetCollapsed(bar, initiallyCollapsed, false);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("resize", () => keepStatusWidgetInViewport(bar, true));
+    }
+
+    toggle.addEventListener("click", event => {
+      event.stopPropagation?.();
+      setStatusWidgetCollapsed(bar, bar.dataset.bridgeCollapsed !== "true");
+    });
+    let drag = null;
+    header.addEventListener("pointerdown", event => {
+      if (event.target?.closest?.("button") || event.button > 0) return;
+      const rect = bar.getBoundingClientRect();
+      drag = {pointerId: event.pointerId, offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top};
+      try { header.setPointerCapture(event.pointerId); } catch { /* Pointer capture is optional. */ }
+      header.style.cursor = "grabbing";
+      event.preventDefault?.();
+    });
+    header.addEventListener("pointermove", event => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      setStatusWidgetPosition(bar, event.clientX - drag.offsetX, event.clientY - drag.offsetY);
+    });
+    const finishDrag = event => {
+      if (!drag || (event.pointerId !== undefined && drag.pointerId !== event.pointerId)) return;
+      const rect = bar.getBoundingClientRect();
+      setStatusWidgetPosition(bar, rect.left, rect.top, true);
+      drag = null;
+      header.style.cursor = "move";
+    };
+    header.addEventListener("pointerup", finishDrag);
+    header.addEventListener("pointercancel", finishDrag);
+    return true;
+  }
+
+  function setStatusWidgetMessage(bar, message) {
+    const body = bar.querySelector?.(".codex-bridge-status-body");
+    if (body) body.textContent = message;
+    else bar.textContent = message;
+    // The initial empty widget is shorter than its first status message. Clamp
+    // again after the content has changed so the expanded widget stays visible.
+    if (bar.style?.top && bar.style.top !== "auto") keepStatusWidgetInViewport(bar, true);
+  }
+
   function renderStatus() {
     let bar = document.getElementById("codex-bridge-status");
     if (!bar) {
       bar = document.createElement("div"); bar.id = "codex-bridge-status";
-      Object.assign(bar.style, {position: "fixed", bottom: "8px", right: "8px", zIndex: "2147483647",
-        padding: "8px 10px", borderRadius: "7px", font: "12px system-ui", maxWidth: "360px",
-        whiteSpace: "pre-wrap",
-        boxShadow: "0 1px 7px #0004"});
       document.body.appendChild(bar);
+    }
+    const widgetReady = initializeStatusWidget(bar);
+    if (!widgetReady) {
+      Object.assign(bar.style, {position: "fixed", bottom: "8px", left: "8px", zIndex: "2147483647",
+        padding: "8px 10px", borderRadius: "7px", font: "12px system-ui", maxWidth: "360px",
+        whiteSpace: "pre-wrap", boxShadow: "0 1px 7px #0004"});
     }
     bar.dataset.bridgeInstance = scriptInstance;
     bar.style.background = phaseStatusError || actionStatusError ? "#ffdfdf" : "#e5f4e9";
     bar.style.color = "#222";
     const clock = time => new Date(time).toLocaleTimeString();
-    bar.textContent = `Codex 桥接：${phaseStatus}\n状态更新：${clock(phaseChangedAt)}` +
+    setStatusWidgetMessage(bar, `Codex 桥接：${phaseStatus}\n状态更新：${clock(phaseChangedAt)}` +
       (actionStatus ? `\n最近操作 ${clock(actionChangedAt)}：${actionStatus}` : "") +
-      (lastCheckAt ? `\n连接检查：${clock(lastCheckAt)}` : "");
+      (lastCheckAt ? `\n连接检查：${clock(lastCheckAt)}` : ""));
   }
 
   function status(text, error = false) {
@@ -197,7 +355,7 @@
     if (bar?.dataset.bridgeInstance === scriptInstance) {
       bar.style.background = "#fff0c2";
       bar.style.color = "#222";
-      bar.textContent = "Codex 桥接：扩展已重新加载。请刷新当前 ChatGPT 标签页，然后在弹窗中重新绑定。";
+      setStatusWidgetMessage(bar, "扩展已重新加载。请刷新当前 ChatGPT 标签页，然后在弹窗中重新绑定。");
     }
   }
 
@@ -457,6 +615,26 @@
     return String(text || "").replace(/\s+/g, " ").trim();
   }
 
+  function reportMessage(report) {
+    return `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题栏为“给 Codex 的指令”、带复制按钮和打开编辑器按钮的writingblock卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
+  }
+
+  function readComposerText(editor) {
+    const innerText = editor?.innerText;
+    if (innerText) return {text: String(innerText), source: "innerText"};
+    return {text: String(editor?.textContent || ""), source: "textContent"};
+  }
+
+  function errorDiagnostics(error) {
+    const message = String(error?.message || error || "未知错误");
+    return {
+      reason: message.slice(0, 2000),
+      errorName: String(error?.name || "Error").slice(0, 120),
+      errorMessage: message.slice(0, 2000),
+      errorStack: String(error?.stack || "").slice(0, 4000)
+    };
+  }
+
   function reportSamples(report) {
     const raw = normalize(report);
     const rendered = normalize(report.replace(/[`*_#>\[\]]/g, ""));
@@ -514,6 +692,80 @@
     return `${text.length}:${hash.toString(16)}`;
   }
 
+  function reportComposerDiagnostics(composerText, message, report, source = "innerText_or_textContent") {
+    const normalizedComposer = normalize(composerText);
+    const normalizedMessage = normalize(message);
+    const expectedPrefix = normalizedMessage.slice(0, 90);
+    const reportSample = normalize(report).slice(0, 120);
+    const prefixMatch = normalizedComposer.startsWith(expectedPrefix);
+    const reportSampleMatch = normalizedComposer.includes(reportSample);
+    let firstPrefixMismatchAt = -1;
+    if (!prefixMatch) {
+      const limit = Math.min(normalizedComposer.length, expectedPrefix.length);
+      firstPrefixMismatchAt = 0;
+      while (firstPrefixMismatchAt < limit &&
+          normalizedComposer[firstPrefixMismatchAt] === expectedPrefix[firstPrefixMismatchAt])
+        firstPrefixMismatchAt += 1;
+    }
+    const containsReportWrapper = normalizedComposer.includes(REPORT_PREFIX) &&
+      normalizedComposer.includes("Codex 最终报告：");
+    const composerMatchesExpectedMessage = normalizedComposer === normalizedMessage;
+    const diagnostics = {
+      composerTextSource: source,
+      composerRawLength: String(composerText || "").length,
+      composerNormalizedLength: normalizedComposer.length,
+      composerStartsWithExpectedPrefix: prefixMatch,
+      composerContainsReportSample: reportSampleMatch,
+      composerContainsReportWrapper: containsReportWrapper,
+      composerMatchesExpectedMessage,
+      ownDraftMatch: composerMatchesExpectedMessage,
+      firstPrefixMismatchAt,
+      expectedPrefixLength: expectedPrefix.length,
+      expectedMessageFingerprint: cardKey(normalizedMessage),
+      expectedReportFingerprint: cardKey(report)
+    };
+    // Include fingerprints and code points only when the text contains the
+    // bridge's report wrapper. Arbitrary user drafts are logged verbatim by
+    // the blocking/error event, but are not additionally fingerprinted here.
+    if (containsReportWrapper) {
+      diagnostics.composerFingerprint = cardKey(normalizedComposer);
+      diagnostics.composerLeadingCodePoints = [...normalizedComposer].slice(0, 8)
+        .map(char => char.codePointAt(0));
+    }
+    return diagnostics;
+  }
+
+  function pendingReportMessageFingerprint(reportId, message) {
+    return cardKey(`${Number(reportId)}:${normalize(message)}`);
+  }
+
+  function readPendingReport() {
+    try {
+      const value = JSON.parse(sessionStorage.getItem("bridge.pendingReport") || "null");
+      return value && typeof value === "object" ? value : null;
+    } catch { return null; }
+  }
+
+  function pendingReportMatches(pending, reportId, message) {
+    return Number(pending?.reportId) === Number(reportId) &&
+      String(pending?.runId || "") === String(runId || "") &&
+      pending?.messageFingerprint === pendingReportMessageFingerprint(reportId, message);
+  }
+
+  function savePendingReport(reportId, message, stage) {
+    const pending = {reportId: Number(reportId), runId: String(runId || ""),
+      messageFingerprint: pendingReportMessageFingerprint(reportId, message),
+      normalizedLength: normalize(message).length, stage, updatedAt: Date.now()};
+    sessionStorage.setItem("bridge.pendingReport", JSON.stringify(pending));
+    return pending;
+  }
+
+  function clearPendingReport(reportId) {
+    const pending = readPendingReport();
+    if (reportId === undefined || !pending || Number(pending.reportId) === Number(reportId))
+      sessionStorage.removeItem("bridge.pendingReport");
+  }
+
   function contentUnitKey(anchor) {
     const unit = anchor?.closest?.("[data-content-search-unit-key]");
     return unit?.getAttribute("data-content-search-unit-key") || "";
@@ -567,6 +819,75 @@
     return latest
       ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(messageText(latest))}`
       : "";
+  }
+
+  function assistantContentSignature(element, titlePattern = DEFAULT_TITLE.source, selector = "") {
+    let text = normalize(messageText(element));
+    if (!element) return text;
+    try {
+      const found = extractCard(element, new RegExp(titlePattern || DEFAULT_TITLE.source, "i"), selector || "");
+      const entries = cardEntries(found);
+      if (entries.length) {
+        for (const entry of entries) {
+          const cardTextValue = normalize(entry.instruction);
+          if (cardTextValue) text = text.replace(cardTextValue, " ");
+        }
+        text = text.replace(/给\s*Codex\s*的指令|Instructions?\s+for\s+Codex|Codex\s*指令卡|复制代码|复制|copy code/gi, " ");
+      }
+    } catch { /* Card parsing is only a turn-detection aid. */ }
+    return normalize(text);
+  }
+
+  function assistantSignatureFingerprint(signature) {
+    const value = String(signature || "");
+    return {length: value.length, fingerprint: value ? cardKey(value) : ""};
+  }
+
+  function assistantWaitSelectionDiagnostics(wait, messages, latest) {
+    const assistant = messages.at(-1) || null;
+    const signature = messages.length
+      ? `${messages.length}:${messageText(assistant)}`
+      : latest
+        ? `content-search-unit:${latest.getAttribute("data-content-search-unit-key") || ""}:${normalize(messageText(latest))}`
+        : "";
+    const baselineUnitKey = wait.baselineUnitKey || "";
+    const latestUnitKey = contentUnitKey(latest);
+    const unitKeyComparable = !!baselineUnitKey && !!latestUnitKey;
+    const baselineSignature = String(wait.baselineSignature || "");
+    const baselineSignatureDetails = assistantSignatureFingerprint(baselineSignature);
+    const currentSignatureDetails = assistantSignatureFingerprint(signature);
+    const baselineContentSignature = String(wait.baselineContentSignature || "");
+    const currentContentSignature = assistantContentSignature(assistant || latest,
+      wait.cardTitle, wait.cardSelector);
+    return {
+      baselineAssistantUnitKey: baselineUnitKey,
+      latestAssistantUnitKey: contentUnitKey(assistant),
+      latestSelectedUnitKey: latestUnitKey,
+      assistantSelectionSource: assistant ? "assistant_role" : latest ? "content_unit_fallback" : "none",
+      assistantUnitKeyComparable: unitKeyComparable,
+      assistantUnitKeyChanged: unitKeyComparable ? latestUnitKey !== baselineUnitKey : null,
+      baselineAssistantSignature: baselineSignatureDetails,
+      currentAssistantSignature: currentSignatureDetails,
+      assistantSignatureChanged: signature !== baselineSignature,
+      baselineAssistantContentSignature: assistantSignatureFingerprint(baselineContentSignature),
+      currentAssistantContentSignature: assistantSignatureFingerprint(currentContentSignature),
+      assistantContentSignatureChanged: currentContentSignature !== baselineContentSignature,
+      baselineAssistantCount: wait.baselineCount,
+      assistantCount: messages.length,
+      assistantCountChanged: messages.length !== wait.baselineCount,
+      assistantCountDelta: messages.length - wait.baselineCount
+    };
+  }
+
+  function assistantTurnChanged(wait, diagnostics, messages) {
+    const unitKeysComparable = !!wait.baselineUnitKey && !!diagnostics.latestSelectedUnitKey;
+    return unitKeysComparable
+      ? diagnostics.assistantUnitKeyChanged || diagnostics.assistantContentSignatureChanged
+      : diagnostics.assistantContentSignatureChanged || messages.length > wait.baselineCount;
+  }
+
+  function assistantWaitCanScan(wait) {
+    return !wait || (wait.turnDetected && wait.replyCompleted);
   }
 
   function sendButton(editor) {
@@ -868,6 +1189,7 @@
       sessionStorage.setItem("bridge.lastSubmitted", lastSubmitted);
     }
     await api("/ack", "POST", {reportId, runId});
+    clearPendingReport(reportId);
     const startedAt = Date.now();
     clearQueuedAssistantWaitTick();
     assistantWaitLastWakeAt = 0;
@@ -876,6 +1198,7 @@
       reportId,
       startedAt,
       baselineSignature: preSendAssistant,
+      baselineContentSignature: preSendAssistantContentSignature,
       baselineCount: preSendAssistantCount,
       baselineUnitKey: preSendAssistantUnitKey,
       cardTitle: diagnosticConfig?.title || DEFAULT_TITLE.source,
@@ -905,7 +1228,11 @@
       lastOptimizerLiveScans: optimizerDiagnosticStatus?.liveScans ?? null,
       lastDiagnosticSnapshot: null
     };
-    record("report_acknowledged", {reportId}, `report_acknowledged:${reportId}`);
+    record("report_acknowledged", {reportId,
+      baselineAssistantUnitKey: preSendAssistantUnitKey,
+      baselineAssistantSignature: assistantSignatureFingerprint(preSendAssistant),
+      baselineAssistantContentSignature: assistantSignatureFingerprint(preSendAssistantContentSignature),
+      baselineAssistantCount: preSendAssistantCount}, `report_acknowledged:${reportId}`);
     record("assistant_wait_started", {reportId,
       assistantBaselineCount: preSendAssistantCount,
       visibilityState: document.visibilityState || "unknown",
@@ -922,82 +1249,190 @@
   }
 
   async function sendReport(report, reportId, diagnosticConfig = null) {
-    const currentState = await api("/state");
-    if (currentState.phase !== "report_ready" || currentState.reportId !== reportId) {
-      status(currentState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
-      return;
+    let stage = "read_bridge_state";
+    let editor = null;
+    let message = "";
+    try {
+      const currentState = await api("/state");
+      if (currentState.phase !== "report_ready" || currentState.reportId !== reportId) {
+        status(currentState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
+        return;
+      }
+      if (sentReport === reportId) {
+        await api("/ack", "POST", {reportId, runId});
+        clearPendingReport(reportId);
+        return;
+      }
+      record("report_send_started", {reportId}, `report_send_started:${reportId}`);
+      record("report_ready", {reportId, reportLength: report.length}, `report_ready:${reportId}`);
+      if (baselinedReport !== reportId) {
+        stage = "load_report_settings";
+        const config = await bridgeSettings();
+        rememberVisibleCards(new RegExp(config.title || DEFAULT_TITLE.source, "i"), config.card || "");
+        baselinedReport = reportId;
+        sessionStorage.setItem("bridge.baselinedReport", String(reportId));
+      }
+      stage = "find_composer";
+      editor = composer();
+      if (!editor) {
+        record("composer_missing", {reportId}, `composer_missing:${reportId}`);
+        throw new Error("找不到 ChatGPT 输入框");
+      }
+      message = reportMessage(report);
+      if (reportWasSent(report, reportId)) {
+        stage = "acknowledge_already_sent_report";
+        await acknowledgeReport(reportId, attemptedReport === reportId, diagnosticConfig); return;
+      }
+      stage = "check_existing_composer_text";
+      const existingValue = readComposerText(editor);
+      const existing = existingValue.text.trim();
+      const existingDiagnostics = reportComposerDiagnostics(
+        existingValue.text, message, report, existingValue.source);
+      const ownDraft = existingDiagnostics.ownDraftMatch;
+      const pending = readPendingReport();
+      const pendingMatches = pendingReportMatches(pending, reportId, message);
+      const normalizedExisting = normalize(existing);
+      const normalizedExpectedMessage = normalize(message);
+      const pendingPartial = !!existing && pendingMatches && !!normalizedExisting &&
+        normalizedExpectedMessage.startsWith(normalizedExisting);
+      if (existing) {
+        record("report_draft_check", {reportId, stage,
+          classification: ownDraft ? "bridge_report_draft" : pendingPartial ? "bridge_report_fill_pending" : "user_draft",
+          pendingReportId: pending?.reportId || null,
+          pendingReportStage: pendingMatches ? pending.stage : null,
+          ...existingDiagnostics,
+          ...(!ownDraft && !pendingPartial ? {composerText: existingValue.text} : {})},
+        `report_draft_check:${reportId}:${existingDiagnostics.composerFingerprint || cardKey(existing)}`);
+      }
+      if (existing && !ownDraft && pendingPartial) {
+        record("report_fill_pending", {reportId,
+          pendingStage: pending.stage || "filling",
+          composerLength: existingValue.text.length,
+          composerFingerprint: cardKey(normalizedExisting),
+          expectedMessageFingerprint: pendingReportMessageFingerprint(reportId, message)},
+        `report_fill_pending:${reportId}:${pendingReportMessageFingerprint(reportId, message)}`);
+        status("报告仍在写入输入框；确认完整后再发送");
+        return;
+      }
+      if (existing && !ownDraft && pendingMatches) {
+        record("report_fill_conflict", {reportId,
+          composerFingerprint: cardKey(normalizedExisting),
+          expectedMessageFingerprint: pendingReportMessageFingerprint(reportId, message)},
+        `report_fill_conflict:${reportId}:${pendingReportMessageFingerprint(reportId, message)}`);
+        status("输入框内容与待发送报告不一致；为保护草稿，已暂停自动发送", true);
+        return;
+      }
+      if (existing && !ownDraft)
+        throw new Error("ChatGPT 输入框中有你的未发送草稿；桥接已暂停发送");
+      if (ownDraft && !pendingMatches) savePendingReport(reportId, message, "filled");
+      if (attemptedReport === reportId) {
+        const elapsed = Date.now() - (attemptedAt || Date.now());
+        status(elapsed > 30000 ? "发送已触发，但仍未确认；请在扩展弹窗选择恢复操作" : "发送已触发，继续核对网页消息", elapsed > 30000);
+        return;
+      }
+      if (!ownDraft) {
+        savePendingReport(reportId, message, "filling");
+        stage = "save_report_baseline";
+        if (confirmationBaselineId !== reportId) saveReportBaseline(report, reportId);
+        stage = "fill_composer";
+        editor.focus();
+        document.execCommand("insertText", false, message);
+        editor.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: message}));
+        const expectedNormalized = normalize(message);
+        const fillConfirmed = await waitFor(() =>
+          normalize(readComposerText(editor).text) === expectedNormalized, 2000);
+        const filledValue = readComposerText(editor);
+        const fillDiagnostics = reportComposerDiagnostics(filledValue.text, message, report, filledValue.source);
+        record("report_fill", {reportId, filledLength: filledValue.text.length,
+          fillContainsReport: normalize(filledValue.text).includes(normalize(report)),
+          fillConfirmed, ...fillDiagnostics}, `report_fill:${reportId}`);
+        stage = "verify_filled_composer";
+        if (!fillConfirmed) {
+          const normalizedFilled = normalize(filledValue.text);
+          if (normalizedFilled && expectedNormalized.startsWith(normalizedFilled)) {
+            record("report_fill_pending", {reportId, pendingStage: "filling",
+              composerLength: filledValue.text.length,
+              composerFingerprint: cardKey(normalizedFilled),
+              expectedMessageFingerprint: pendingReportMessageFingerprint(reportId, message)},
+            `report_fill_pending:${reportId}:${pendingReportMessageFingerprint(reportId, message)}`);
+            status("报告仍在写入输入框；确认完整后再发送");
+            return;
+          }
+          record("report_fill_conflict", {reportId,
+            composerFingerprint: cardKey(normalizedFilled),
+            expectedMessageFingerprint: pendingReportMessageFingerprint(reportId, message)},
+          `report_fill_conflict:${reportId}:${pendingReportMessageFingerprint(reportId, message)}`);
+          status("输入框内容与待发送报告不一致；为保护草稿，已暂停自动发送", true);
+          return;
+        }
+        savePendingReport(reportId, message, "filled");
+      }
+      stage = "wait_for_send_button";
+      const buttonReady = await waitFor(() => {
+        const button = sendButton(editor);
+        return !!button && !button.disabled && button.getAttribute("aria-disabled") !== "true";
+      }, 2000);
+      if (!buttonReady) {
+        record("send_button_unavailable", {reportId}, `send_button_unavailable:${reportId}`);
+        status("报告已填入输入框；发送按钮暂不可用，桥接将在下一轮重试");
+        return;
+      }
+      stage = "recheck_bridge_state";
+      const latestState = await api("/state");
+      if (latestState.phase !== "report_ready" || latestState.reportId !== reportId) {
+        status(latestState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
+        return;
+      }
+      stage = "capture_pre_send_baseline";
+      preSendAssistant = currentAssistantSignature();
+      sessionStorage.setItem("bridge.preSendAssistant", preSendAssistant);
+      const preSendAssistantMessages = assistantMessages();
+      preSendAssistantContentSignature = assistantContentSignature(preSendAssistantMessages.at(-1),
+        diagnosticConfig?.title || DEFAULT_TITLE.source, diagnosticConfig?.card || "");
+      sessionStorage.setItem("bridge.preSendAssistantContentSignature", preSendAssistantContentSignature);
+      preSendAssistantCount = preSendAssistantMessages.length;
+      preSendAssistantUnitKey = contentUnitKey(preSendAssistantMessages.at(-1));
+      sessionStorage.setItem("bridge.preSendAssistantCount", String(preSendAssistantCount));
+      capturePreSendUserBaseline(reportId);
+      attemptedReport = reportId;
+      sessionStorage.setItem("bridge.attemptedReport", String(reportId));
+      attemptedAt = Date.now();
+      sessionStorage.setItem("bridge.attemptedAt", String(attemptedAt));
+      savePendingReport(reportId, message, "sending");
+      stage = "click_send_button";
+      record("send_click", {reportId}, `send_click:${reportId}`);
+      sendButton(editor).click();
+      stage = "confirm_report_message";
+      if (!await waitFor(() => reportWasSent(report, reportId), 10000)) {
+        record("report_unconfirmed", {reportId, confirmed: false,
+          ...reportTextEvidence(report, reportId),
+          ...reportConfirmationSignals(report, reportId)}, `report_unconfirmed:${reportId}`);
+        status("发送已触发，正在继续核对网页消息；如长时间未确认，可在扩展弹窗处理");
+        return;
+      }
+      stage = "acknowledge_report";
+      await acknowledgeReport(reportId, true, diagnosticConfig);
+    } catch (error) {
+      if (error && typeof error === "object") {
+        error.bridgeReportStage = stage;
+        error.reportId = reportId;
+      }
+      let composerEvidence = {};
+      if (editor) {
+        try {
+          const currentValue = readComposerText(editor);
+          composerEvidence = {
+            composerText: currentValue.text,
+            ...(message ? reportComposerDiagnostics(currentValue.text, message, report, currentValue.source)
+              : {composerTextSource: currentValue.source, composerRawLength: currentValue.text.length})
+          };
+        } catch (diagnosticError) {
+          composerEvidence = {composerReadError: errorDiagnostics(diagnosticError)};
+        }
+      }
+      await record("report_send_error", {reportId, stage, ...errorDiagnostics(error), ...composerEvidence});
+      throw error;
     }
-    if (sentReport === reportId) { await api("/ack", "POST", {reportId, runId}); return; }
-    record("report_send_started", {reportId}, `report_send_started:${reportId}`);
-    record("report_ready", {reportId, reportLength: report.length}, `report_ready:${reportId}`);
-    if (baselinedReport !== reportId) {
-      const config = await bridgeSettings();
-      rememberVisibleCards(new RegExp(config.title || DEFAULT_TITLE.source, "i"), config.card || "");
-      baselinedReport = reportId;
-      sessionStorage.setItem("bridge.baselinedReport", String(reportId));
-    }
-    const editor = composer();
-    if (!editor) {
-      record("composer_missing", {reportId}, `composer_missing:${reportId}`);
-      throw new Error("找不到 ChatGPT 输入框");
-    }
-    const message = `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题为“给 Codex 的指令”、带复制按钮的内容卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
-    if (reportWasSent(report, reportId)) {
-      await acknowledgeReport(reportId, attemptedReport === reportId, diagnosticConfig); return;
-    }
-    const existing = (editor.innerText || editor.textContent || "").trim();
-    const ownDraft = normalize(existing).startsWith(normalize(message).slice(0, 90)) &&
-      normalize(existing).includes(normalize(report).slice(0, 120));
-    if (existing && !ownDraft) throw new Error("ChatGPT 输入框中有你的未发送草稿；桥接已暂停发送");
-    if (attemptedReport === reportId) {
-      const elapsed = Date.now() - (attemptedAt || Date.now());
-      status(elapsed > 30000 ? "发送已触发，但仍未确认；请在扩展弹窗选择恢复操作" : "发送已触发，继续核对网页消息", elapsed > 30000);
-      return;
-    }
-    if (!ownDraft) {
-      if (confirmationBaselineId !== reportId) saveReportBaseline(report, reportId);
-      editor.focus();
-      document.execCommand("insertText", false, message);
-      editor.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: message}));
-      const filledLength = (editor.innerText || editor.textContent || "").length;
-      record("report_fill", {reportId, filledLength}, `report_fill:${reportId}`);
-      if (!(editor.innerText || editor.textContent || "").includes(report)) throw new Error("输入框填充校验失败");
-    }
-    const buttonReady = await waitFor(() => {
-      const button = sendButton(editor);
-      return !!button && !button.disabled && button.getAttribute("aria-disabled") !== "true";
-    }, 2000);
-    if (!buttonReady) {
-      record("send_button_unavailable", {reportId}, `send_button_unavailable:${reportId}`);
-      status("报告已填入输入框；发送按钮暂不可用，桥接将在下一轮重试");
-      return;
-    }
-    const latestState = await api("/state");
-    if (latestState.phase !== "report_ready" || latestState.reportId !== reportId) {
-      status(latestState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
-      return;
-    }
-    preSendAssistant = currentAssistantSignature();
-    sessionStorage.setItem("bridge.preSendAssistant", preSendAssistant);
-    const preSendAssistantMessages = assistantMessages();
-    preSendAssistantCount = preSendAssistantMessages.length;
-    preSendAssistantUnitKey = contentUnitKey(preSendAssistantMessages.at(-1));
-    sessionStorage.setItem("bridge.preSendAssistantCount", String(preSendAssistantCount));
-    capturePreSendUserBaseline(reportId);
-    attemptedReport = reportId;
-    sessionStorage.setItem("bridge.attemptedReport", String(reportId));
-    attemptedAt = Date.now();
-    sessionStorage.setItem("bridge.attemptedAt", String(attemptedAt));
-    record("send_click", {reportId}, `send_click:${reportId}`);
-    sendButton(editor).click();
-    if (!await waitFor(() => reportWasSent(report, reportId), 10000)) {
-      record("report_unconfirmed", {reportId, confirmed: false,
-        ...reportTextEvidence(report, reportId),
-        ...reportConfirmationSignals(report, reportId)}, `report_unconfirmed:${reportId}`);
-      status("发送已触发，正在继续核对网页消息；如长时间未确认，可在扩展弹窗处理");
-      return;
-    }
-    await acknowledgeReport(reportId, true, diagnosticConfig);
   }
 
   async function recover(action) {
@@ -1172,6 +1607,7 @@
     attemptedReport = 0;
     attemptedAt = 0;
     preSendAssistant = "";
+    preSendAssistantContentSignature = "";
     preSendAssistantCount = 0;
     preSendAssistantUnitKey = "";
     preSendUserCount = 0;
@@ -1187,7 +1623,7 @@
     recordedEvents.clear();
     stableSince = Date.now();
     sessionStorage.setItem("bridge.runId", runId);
-    for (const key of ["sentReport", "attemptedReport", "attemptedAt", "preSendAssistant", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "preSendUserUnitKeys", "preSendUserUnitKeysReportId", "preSendGenerating", "preSendGeneratingReportId", "baselinedReport", "confirmationBaselineId", "confirmationBaselineCounts"])
+    for (const key of ["sentReport", "attemptedReport", "attemptedAt", "pendingReport", "preSendAssistant", "preSendAssistantContentSignature", "preSendAssistantCount", "preSendUserCount", "preSendUserText", "preSendUserUnitKeys", "preSendUserUnitKeysReportId", "preSendGenerating", "preSendGeneratingReportId", "baselinedReport", "confirmationBaselineId", "confirmationBaselineCounts"])
       sessionStorage.removeItem(`bridge.${key}`);
   }
 
@@ -1196,6 +1632,9 @@
     const waitDiag = assistantWaitDiagnostic;
     if (waitDiag?.active) {
       const tickAt = Date.now();
+      const tickMessages = assistantMessages();
+      const tickUnits = tickMessages.length ? [] : visibleContentSearchUnits();
+      const tickLatest = tickMessages.at(-1) || tickUnits.at(-1) || null;
       record("assistant_wait_tick", {reportId: waitDiag.reportId,
         elapsedMs: tickAt - waitDiag.startedAt,
         tickGapMs: waitDiag.lastTickAt ? tickAt - waitDiag.lastTickAt : 0,
@@ -1204,7 +1643,8 @@
         replyCompleted: !!waitDiag.replyCompleted,
         visibilityState: document.visibilityState || "unknown",
         busy,
-        method: trigger});
+        method: trigger,
+        ...assistantWaitSelectionDiagnostics(waitDiag, tickMessages, tickLatest)});
       waitDiag.lastTickAt = tickAt;
     }
     if (busy) {
@@ -1273,20 +1713,26 @@
             isGenerating: generating});
         }
         const latestUnitKey = contentUnitKey(latest);
-        const newTurn = wait.baselineUnitKey && latestUnitKey
-          ? latestUnitKey !== wait.baselineUnitKey
-          : currentAssistantSignature() !== wait.baselineSignature || messages.length > wait.baselineCount;
+        const turnDiagnostics = assistantWaitSelectionDiagnostics(wait, messages, latest);
+        const newTurn = assistantTurnChanged(wait, turnDiagnostics, messages);
         if (newTurn && !wait.turnDetected) {
           wait.turnDetected = true;
+          const turnDetectionReasons = turnDiagnostics.assistantUnitKeyChanged
+            ? ["unit_key_changed"]
+            : turnDiagnostics.assistantContentSignatureChanged
+              ? ["signature_changed"]
+              : messages.length > wait.baselineCount ? ["count_changed"] : [];
           record("assistant_turn_detected", {reportId: wait.reportId,
             elapsedMs: Date.now() - wait.startedAt,
             assistantMessages: messages.length,
             assistantBaselineCount: wait.baselineCount,
             assistantCountDelta: messages.length - wait.baselineCount,
             assistantTurnDetected: true,
+            turnDetectionReasons,
+            ...turnDiagnostics,
             isGenerating: generating,
             visibilityState: document.visibilityState || "unknown",
-            method: latestUnitKey ? "unit_key" : "signature"},
+            method: turnDiagnostics.assistantUnitKeyChanged ? "unit_key" : "signature"},
           `assistant_turn_detected:${wait.reportId}`);
         }
         if (newTurn && !generating && !wait.replyCompleted) {
@@ -1337,6 +1783,16 @@
         recordAssistantWaitCheckpoint(wait, "empty_assistant_text", {phase: state.phase,
           assistantMessageCount: messages.length, latestTextLength: 0, isGenerating: false});
         status("等待 ChatGPT 回复内容"); return;
+      }
+      if (wait && !assistantWaitCanScan(wait)) {
+        recordAssistantWaitCheckpoint(wait, "waiting_for_new_assistant_turn", {
+          assistantMessageCount: messages.length,
+          latestTextLength: text.length,
+          assistantTurnDetected: !!wait.turnDetected,
+          replyCompleted: !!wait.replyCompleted,
+          ...assistantWaitSelectionDiagnostics(wait, messages, latest)
+        });
+        status("等待 ChatGPT 新回复"); return;
       }
       const unitKey = contentUnitKey(latest);
       const signature = unitKey
@@ -1556,7 +2012,10 @@
         stopInvalidatedScript();
         return;
       }
-      record("tick_error", {reason: "exception"}, `tick_error:${String(error)}`);
+      const details = errorDiagnostics(error);
+      record("tick_error", {...details,
+        stage: error?.bridgeReportStage || "automatic_tick",
+        ...(Number.isFinite(Number(error?.reportId)) ? {reportId: Number(error.reportId)} : {})});
       status(String(error), true);
     } finally {
       busy = false;

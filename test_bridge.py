@@ -1,5 +1,6 @@
 import ctypes
 import errno
+import io
 import json
 import multiprocessing
 import sqlite3
@@ -7,7 +8,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,8 +17,8 @@ from unittest.mock import patch
 
 from bridge import (Bridge, EventLog, create_bridge_server, latest_turn, local_sessions, make_handler,
                     probe_codex_executable, read_clipboard_text, read_latest_codex_final,
-                    resolve_codex_executable, safe_log_title, select_session, task_log_path,
-                    task_log_title)
+                    print_session_list, resolve_codex_executable, safe_log_title, select_session, task_log_path,
+                    task_log_title, DEFAULT_TURN_TIMEOUT_SECONDS, content_sha256)
 
 
 def _write_log_records(path, prefix):
@@ -27,6 +28,35 @@ def _write_log_records(path, prefix):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_default_turn_timeout_is_five_hours(self):
+        self.assertEqual(DEFAULT_TURN_TIMEOUT_SECONDS, 5 * 60 * 60)
+
+    def test_bridge_rounds_are_unlimited_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", None, 10)
+            bridge.start("A")
+            bridge.round = 20
+            with patch("bridge.threading.Thread") as thread_factory:
+                self.assertTrue(bridge.submit("第 21 轮", bridge.run_id))
+                self.assertEqual(bridge.snapshot()["round"], 21)
+                self.assertIsNone(bridge.snapshot()["maxRounds"])
+                thread_factory.assert_called_once()
+
+            bridge.active_codex_run_id = None
+            bridge.phase = "report_ready"
+            bridge.report_id = 1
+            bridge.acknowledge(1, bridge.run_id)
+            self.assertEqual(bridge.snapshot()["phase"], "await_instruction")
+
+    def test_explicit_bridge_round_limit_is_still_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge("task", Path(directory), "codex", 1, 10)
+            bridge.start("A")
+            bridge.round = 1
+            with self.assertRaisesRegex(ValueError, "已达到最大轮数"):
+                bridge.submit("超出上限", bridge.run_id)
+            self.assertEqual(bridge.snapshot()["phase"], "stopped")
+
     def test_log_appends_are_safe_across_bridge_processes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "logs" / "bridge.jsonl")
@@ -106,6 +136,7 @@ class BridgeTests(unittest.TestCase):
                              "reportId": 12, "elapsedMs": 5000, "tickGapMs": 62000,
                              "visibilityState": "hidden", "mutationObserverUsed": False,
                              "diagnosticObserverStarted": True, "observerMutationCount": 3,
+                             "composerText": "保留这段未发送草稿",
                              "token": "secret"}}]}).encode()
                 request = urllib.request.Request(base + "/events", body, method="POST",
                     headers={"X-Bridge-Token": "test-token", "Content-Type": "application/json"})
@@ -135,12 +166,47 @@ class BridgeTests(unittest.TestCase):
                 self.assertFalse(records[0]["data"]["mutationObserverUsed"])
                 self.assertTrue(records[0]["data"]["diagnosticObserverStarted"])
                 self.assertEqual(records[0]["data"]["observerMutationCount"], 3)
+                self.assertEqual(records[0]["data"]["composerText"], "保留这段未发送草稿")
                 self.assertEqual(records[1]["taskId"], "task")
                 self.assertNotIn("secret", log.path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
                 worker.join(timeout=2)
+
+    def test_task_log_keeps_exact_codex_exchange(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = EventLog(Path(directory) / "logs" / "bridge.jsonl", task_id="task")
+            bridge = Bridge("task", Path(directory), "codex", None, 10, log)
+            bridge.start("A")
+            instruction = "执行这个本地检查\n不要修改文件"
+            report = "检查完成：工作区干净。\n没有执行修改。"
+            run_id = bridge.run_id
+            with patch("bridge.threading.Thread"):
+                self.assertTrue(bridge.submit(instruction, run_id, "instruction-key"))
+
+            before = {"ordinal": 4, "status": "completed", "user": None,
+                      "final": None, "error": None}
+            after = {"ordinal": 5, "status": "completed",
+                     "user": {"type": "userMessage", "content": [
+                         {"type": "text", "text": instruction}]},
+                     "final": {"type": "agentMessage", "phase": "final_answer", "text": report},
+                     "error": None}
+            with patch("bridge.latest_turn", side_effect=[before, after]), \
+                    patch("bridge.queued_count", return_value=0), \
+                    patch("bridge.subprocess.run", return_value=SimpleNamespace(
+                        returncode=0, stdout="", stderr="")), \
+                    patch("bridge.time.sleep"):
+                bridge.run_codex(instruction, 1, run_id)
+
+            records = log.tail(20)
+            submitted = next(record for record in records if record["event"] == "instruction_received")
+            completed = next(record for record in records if record["event"] == "report_ready")
+            self.assertEqual(submitted["data"]["conversationInput"], instruction)
+            self.assertEqual(submitted["data"]["contentSha256"], content_sha256(instruction))
+            self.assertEqual(completed["data"]["conversationOutput"], report)
+            self.assertEqual(completed["data"]["contentSha256"], content_sha256(report))
+            self.assertEqual(completed["data"]["reportId"], 1)
 
     def test_task_log_paths_use_safe_title_and_unique_start_time(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +332,29 @@ class BridgeTests(unittest.TestCase):
                 conn.commit()
             with patch.dict("bridge.os.environ", {"CODEX_HOME": directory}):
                 self.assertEqual(local_sessions(), [("user-id", "Visible task name", directory, "First message")])
+
+    def test_session_listing_defaults_to_ten_most_recent_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state_5.sqlite"
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE threads (id TEXT, name TEXT, cwd TEXT, title TEXT, "
+                             "archived INTEGER, thread_source TEXT, updated_at INTEGER)")
+                conn.executemany("INSERT INTO threads VALUES (?,?,?,?,?,?,?)", [
+                    (f"task-{number}", f"Task {number}", directory, "First message", 0, "user", number)
+                    for number in range(1, 13)
+                ])
+                conn.commit()
+            with patch.dict("bridge.os.environ", {"CODEX_HOME": directory}):
+                sessions = local_sessions()
+            self.assertEqual(len(sessions), 10)
+            self.assertEqual([row[0] for row in sessions], [f"task-{number}" for number in range(12, 2, -1)])
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                print_session_list(sessions + [("extra", "Extra task", directory, "Extra")])
+            self.assertIn("最近 10 条", output.getvalue())
+            self.assertIn("Task 12", output.getvalue())
+            self.assertNotIn("Extra task", output.getvalue())
 
     def test_task_selection_uses_saved_directory(self):
         with tempfile.TemporaryDirectory() as directory:

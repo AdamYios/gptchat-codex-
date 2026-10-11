@@ -85,7 +85,8 @@ async function main() {
   assert.equal(configB.card, "");
 
   await send({type: "bridgeLog", event: "send_click", data: {
-    reportId: 2, token: "secret", instruction: "private text", phase: "report_ready"
+    reportId: 2, token: "secret", instruction: "private text", composerText: "这是未发送草稿",
+    phase: "report_ready"
   }}, tabA);
   await send({type: "bridgeLog", event: "bind_error", data: {reason: "receiver_missing", token: "secret"}, tabId: 8});
   await send({type: "bridgeLog", event: "card_choices_viewed",
@@ -122,6 +123,8 @@ async function main() {
     "a freshly queued event is not mislabeled as delayed");
   assert.equal(saved.bridgePendingEvents_taskA[0].data.token, undefined);
   assert.equal(saved.bridgePendingEvents_taskA[0].data.instruction, undefined);
+  assert.equal(saved.bridgePendingEvents_taskA[0].data.composerText, "这是未发送草稿",
+    "the exact unsent composer draft survives the extension logging allowlist");
   assert.equal(saved.bridgePendingEvents_taskB[1].data.manualCandidateCount, 2);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.latestOnly, true);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.method, "main_manual_loose");

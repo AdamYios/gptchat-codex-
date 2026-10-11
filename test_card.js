@@ -53,7 +53,7 @@ class Element {
 const file = path.join(__dirname, "extension", "content.js");
 const source = fs.readFileSync(file, "utf8").replace(
   /  void startAutomaticLoop\("script_started"\);/,
-  "  globalThis.extractCardForTest = extractCard; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.recordForTest = record; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.prepareAssistantWaitObserverForTest = () => { assistantWaitDiagnostic = {active: true, reportId: 991, startedAt: Date.now(), cardFirstSeen: true, lastContentChangeAt: Date.now() - 2000, observerMutationCount: 0, observerCallbackCount: 0, observerChildListCount: 0, observerCharacterDataCount: 0, observerAttributeCount: 0}; startAssistantWaitObserver(assistantWaitDiagnostic); }; globalThis.setBusyForTest = value => { busy = value; }; globalThis.drainQueuedAssistantWaitTickForTest = drainQueuedAssistantWaitTick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
+  "  globalThis.extractCardForTest = extractCard; globalThis.assistantContentSignatureForTest = assistantContentSignature; globalThis.assistantWaitSelectionDiagnosticsForTest = assistantWaitSelectionDiagnostics; globalThis.assistantTurnChangedForTest = assistantTurnChanged; globalThis.assistantWaitCanScanForTest = assistantWaitCanScan; globalThis.reportWasSentForTest = reportWasSent; globalThis.reportTextEvidenceForTest = reportTextEvidence; globalThis.reportMessageForTest = reportMessage; globalThis.sendReportForTest = sendReport; globalThis.saveReportBaselineForTest = saveReportBaseline; globalThis.capturePreSendUserBaselineForTest = capturePreSendUserBaseline; globalThis.assistantMessagesForTest = assistantMessages; globalThis.userMessagesForTest = userMessages; globalThis.tickForTest = tick; globalThis.recordForTest = record; globalThis.startAutomaticLoopForTest = startAutomaticLoop; globalThis.stopAutomaticLoopForTest = stopAutomaticLoop; globalThis.prepareAssistantWaitObserverForTest = () => { assistantWaitDiagnostic = {active: true, reportId: 991, startedAt: Date.now(), cardFirstSeen: true, lastContentChangeAt: Date.now() - 2000, observerMutationCount: 0, observerCallbackCount: 0, observerChildListCount: 0, observerCharacterDataCount: 0, observerAttributeCount: 0}; startAssistantWaitObserver(assistantWaitDiagnostic); }; globalThis.setBusyForTest = value => { busy = value; }; globalThis.drainQueuedAssistantWaitTickForTest = drainQueuedAssistantWaitTick; globalThis.stopInvalidatedForTest = stopInvalidatedScript; globalThis.instructionIdForTest = instructionId; globalThis.statusForTest = status; globalThis.actionFeedbackForTest = actionFeedback; globalThis.setStatusWidgetMessageForTest = setStatusWidgetMessage; globalThis.statusSnapshotForTest = () => ({actionStatus, actionStatusError, actionChangedAt}); globalThis.forceStableForTest = () => { stableSince = Date.now() - 2000; };"
 );
 const saved = {"bridge.attemptedReport": "1", "bridge.preSendUserCount": "1", "bridge.preSendUserText": "以下是 Codex 上一轮的最终报告。 完整报告正文"};
 let submitted = "";
@@ -120,6 +120,18 @@ assert.equal(context.statusSnapshotForTest().actionChangedAt, manualActionChange
 context.statusForTest("报告已发往 ChatGPT，等待下一轮");
 assert.equal(context.statusSnapshotForTest().actionStatus, "报告已发往 ChatGPT，等待下一轮",
   "the next automatic status transition should become the recent activity");
+
+context.window = {innerWidth: 800, innerHeight: 600};
+context.document.documentElement = {clientWidth: 800, clientHeight: 600};
+const widgetBody = {textContent: ""};
+const statusWidget = {
+  style: {left: "10px", top: "500px"}, offsetWidth: 250, offsetHeight: 180,
+  querySelector: selector => selector === ".codex-bridge-status-body" ? widgetBody : null,
+  getBoundingClientRect() { return {left: Number.parseFloat(this.style.left), top: Number.parseFloat(this.style.top)}; }
+};
+context.setStatusWidgetMessageForTest(statusWidget, "状态内容增加后仍应完整位于视口内");
+assert.equal(statusWidget.style.top, "420px",
+  "the status widget should be clamped using its rendered height after status text changes");
 
 const message = new Element("div", "", {"data-content-search-unit-key": "thread:latest:assistant"});
 message.append(new Element("p", "所以我建议先检查现有 schema。"));
@@ -458,6 +470,38 @@ context.document = {
     "conversation pathname scopes keyed IDs");
   context.location.pathname = "/c/test";
 
+  const baselineAssistant = new Element("div", "上一轮助手正文", {
+    "data-content-search-unit-key": "thread:reused-unit:assistant"
+  });
+  const baselineContentSignature = context.assistantContentSignatureForTest(baselineAssistant);
+  const resurfacedCard = baselineAssistant.append(new Element("div"));
+  const resurfacedHeader = resurfacedCard.append(new Element("div"));
+  resurfacedHeader.append(new Element("span", "给 Codex 的指令"));
+  resurfacedHeader.append(new Element("button", "", {"aria-label": "复制"}));
+  resurfacedCard.append(new Element("p", "旧轮次重新挂载的指令卡片。"));
+  assert.equal(context.assistantContentSignatureForTest(baselineAssistant), baselineContentSignature,
+    "resurfacing an old card does not change the assistant-content signature");
+  const assistantWait = {baselineUnitKey: "thread:reused-unit:assistant",
+    baselineContentSignature, baselineCount: 1, cardTitle: "给\\s*Codex\\s*的指令", cardSelector: ""};
+  const staleDiagnostics = context.assistantWaitSelectionDiagnosticsForTest(
+    assistantWait, [baselineAssistant], baselineAssistant);
+  assert.equal(context.assistantTurnChangedForTest(assistantWait, staleDiagnostics, [baselineAssistant]), false,
+    "an old card on the baseline assistant turn is not mistaken for a new turn");
+  assert.equal(context.assistantWaitCanScanForTest({turnDetected: false, replyCompleted: false,
+    cardFirstSeen: true}), false,
+  "card discovery cannot reach scanning before a new assistant turn completes");
+  const reusedUnitNewReply = new Element("div", "复用同一 unit key 的新助手回复", {
+    "data-content-search-unit-key": "thread:reused-unit:assistant"
+  });
+  const reusedUnitDiagnostics = context.assistantWaitSelectionDiagnosticsForTest(
+    assistantWait, [reusedUnitNewReply], reusedUnitNewReply);
+  assert.equal(reusedUnitDiagnostics.assistantUnitKeyChanged, false);
+  assert.equal(reusedUnitDiagnostics.assistantContentSignatureChanged, true);
+  assert.equal(context.assistantTurnChangedForTest(assistantWait, reusedUnitDiagnostics, [reusedUnitNewReply]), true,
+    "changed assistant content detects a new reply even when ChatGPT reuses its unit key");
+  assert.equal(context.assistantWaitCanScanForTest({turnDetected: true, replyCompleted: true}), true,
+    "scanning resumes after the new assistant reply completes");
+
   showAssistant(stableTurn);
   await context.tickForTest();
   context.forceStableForTest();
@@ -726,6 +770,7 @@ context.document = {
   const reportSession = {"bridge.runId": "report-run"};
   let reportPhase = "report_ready";
   let reportEditorText = "";
+  let reportFillCalls = 0;
   let reportSendButtonAvailable = false;
   let reportAckCount = 0;
   let reportGenerating = false;
@@ -839,7 +884,13 @@ context.document = {
       getElementById: id => id === "codex-bridge-status" ? reportStatusBar : null,
       createElement: () => reportStatusBar,
       body: {appendChild() {}},
-      execCommand: (_command, _ui, text) => { reportEditorText = text; return true; }
+      execCommand: (_command, _ui, text) => {
+        reportFillCalls += 1;
+        // ChatGPT's contenteditable can serialize paragraph breaks differently
+        // from the source string while preserving the same visible message.
+        reportEditorText = text.replace(/\n\n/g, "\n\n\n\n");
+        return true;
+      }
     },
     console
   };
@@ -867,11 +918,30 @@ context.document = {
     entry.data.reportId === 1), "content logs when automatic report sending begins");
   assert.match(reportEditorText, /Codex 最终报告：/,
     "an event wake sends the report without waiting for the content-script interval");
+  const normalizedFill = reportLog.find(entry => entry.event === "report_fill" && entry.data.reportId === 1);
+  assert.equal(normalizedFill.data.fillConfirmed, true,
+    "contenteditable paragraph normalization still confirms the complete expected report");
+  assert.equal(normalizedFill.data.composerMatchesExpectedMessage, true,
+    "the whole normalized bridge message, rather than only a report sample, identifies the inserted text");
+  assert.equal(normalizedFill.data.fillContainsReport, true);
+  assert.equal(reportFillCalls, 1);
+  const pendingReport = JSON.parse(reportSession["bridge.pendingReport"]);
+  assert.equal(pendingReport.reportId, 1);
+  assert.equal(pendingReport.stage, "filled",
+    "the report ID and message fingerprint persist while waiting for ChatGPT's send button");
   assert.equal(reportLog.some(entry => entry.event === "send_button_unavailable"), true);
   assert.equal(reportLog.some(entry => entry.event === "tick_error"), false,
     "a temporarily missing send button is retried without becoming a tick error");
+  delete reportSession["bridge.pendingReport"];
+  // Simulate the exact editor state left by an older extension build before
+  // it persisted report ownership across retries.
   reportSendButtonAvailable = true;
   assert.equal((await wakeForReport()).ok, true);
+  assert.equal(reportFillCalls, 1,
+    "a retry recognizes the existing normalized report and does not insert it again");
+  assert.ok(reportLog.some(entry => entry.event === "report_draft_check" &&
+    entry.data.classification === "bridge_report_draft"),
+  "the retry classifies its own pending report separately from a user draft");
   assert.equal(reportAckCount, 0,
     "an empty composer and started generation do not confirm delivery without a new user message");
   assert.equal(reportPhase, "report_ready",
@@ -884,8 +954,21 @@ context.document = {
   assert.equal((await wakeForReport()).ok, true);
   assert.equal(reportAckCount, 1,
     "a new user message unit key confirms delivery and allows the bridge acknowledgement");
+  assert.equal(reportSession["bridge.pendingReport"], undefined,
+    "report ownership state is cleared only after the bridge acknowledges delivery");
   assert.ok(reportLog.some(entry => entry.event === "report_acknowledged" && entry.data.reportId === 1),
     "the assistant-wait diagnostics start only after the bridge acknowledges the report");
+  const reportAcknowledged = reportLog.find(entry => entry.event === "report_acknowledged");
+  assert.equal(reportAcknowledged.data.baselineAssistantUnitKey, "report:before:assistant",
+    "report acknowledgement records the assistant unit key used as the new-turn baseline");
+  assert.equal(reportAcknowledged.data.baselineAssistantCount, 1,
+    "report acknowledgement records the assistant count baseline");
+  assert.equal(reportAcknowledged.data.baselineAssistantSignature.length > 0, true);
+  assert.match(reportAcknowledged.data.baselineAssistantSignature.fingerprint, /^\d+:[0-9a-f]+$/);
+  assert.match(reportAcknowledged.data.baselineAssistantContentSignature.fingerprint, /^\d+:[0-9a-f]+$/,
+    "the pre-send baseline also fingerprints assistant content without card text");
+  assert.doesNotMatch(JSON.stringify(reportAcknowledged.data.baselineAssistantSignature), /之前的助手消息/,
+    "assistant signature diagnostics use a fingerprint instead of logging assistant text");
   const waitStarted = reportLog.find(entry => entry.event === "assistant_wait_started");
   assert.equal(waitStarted.data.method, "setInterval_and_mutation_observer");
   assert.equal(waitStarted.data.tickIntervalMs, 2000);
@@ -909,6 +992,83 @@ context.document = {
   assert.equal(reportAckCount, 1, "a stale repeated wake after acknowledgement does not resend the report");
   assert.equal(reportLog.filter(entry => entry.event === "send_click").length, 1);
 
+  // Capture a reproduced report-draft mismatch, including its reason and the
+  // exact composer text needed to inspect how the ownership check classified it.
+  {
+    const diagnosticLog = [];
+    const diagnosticReport = "用于复现草稿归属判断的报告正文。";
+    let diagnosticComposerText = "";
+    const diagnosticForm = {querySelectorAll: () => []};
+    const diagnosticEditor = {
+      get innerText() { return diagnosticComposerText; },
+      get textContent() { return diagnosticComposerText; },
+      focus() {}, dispatchEvent() {}, closest: () => diagnosticForm
+    };
+    const diagnosticSession = {};
+    let diagnosticMessageListener;
+    const diagnosticContext = {
+      console,
+      location: {pathname: "/c/report-diagnostic"},
+      sessionStorage: {
+        getItem: key => diagnosticSession[key] || null,
+        setItem: (key, value) => { diagnosticSession[key] = value; },
+        removeItem: key => { delete diagnosticSession[key]; }
+      },
+      setInterval: () => 1,
+      clearInterval() {},
+      chrome: {runtime: {
+        onMessage: {addListener(callback) { diagnosticMessageListener = callback; }},
+        sendMessage: async request => {
+          if (request.type === "bridgeLog") { diagnosticLog.push(request); return {ok: true}; }
+          if (request.type === "bridgeGetConfig") return {ok: true, bound: false, title: "", card: ""};
+          if (request.type === "bridgeRequest" && request.path === "/state")
+            return {ok: true, data: {runId: "diagnostic-run", phase: "report_ready",
+              report: diagnosticReport, reportId: 51}};
+          return {ok: true, data: {}};
+        }
+      }},
+      window: {addEventListener() {}},
+      document: {
+        visibilityState: "visible",
+        addEventListener() {},
+        querySelector: selector => selector === "main" ? {innerText: "已有对话", textContent: "已有对话"} :
+          selector === '#prompt-textarea[contenteditable="true"]' ? diagnosticEditor : null,
+        querySelectorAll: () => [],
+        getElementById: () => null,
+        createElement: () => ({style: {}, dataset: {}, textContent: ""}),
+        body: {appendChild() {}}
+      },
+      getComputedStyle: () => ({display: "block", visibility: "visible", contentVisibility: "visible"}),
+      InputEvent: class InputEvent {}
+    };
+    vm.runInNewContext(source, diagnosticContext, {filename: `${file}:draft-diagnostics`});
+    await diagnosticContext.stopAutomaticLoopForTest();
+    diagnosticComposerText = `\u200B${diagnosticContext.reportMessageForTest(diagnosticReport)}`;
+    await assert.rejects(diagnosticContext.sendReportForTest(diagnosticReport, 51), /未发送草稿/);
+    const draftCheck = diagnosticLog.find(entry => entry.event === "report_draft_check");
+    assert.equal(draftCheck.data.classification, "user_draft");
+    assert.equal(draftCheck.data.composerText, diagnosticComposerText,
+      "the draft-check event captures the input text when the ownership test rejects it");
+    const sendError = diagnosticLog.find(entry => entry.event === "report_send_error");
+    assert.ok(sendError, "a report-send exception gets its own diagnostic event");
+    assert.equal(sendError.data.stage, "check_existing_composer_text");
+    assert.equal(sendError.data.errorMessage, "ChatGPT 输入框中有你的未发送草稿；桥接已暂停发送");
+    assert.match(sendError.data.errorStack, /sendReport/);
+    assert.equal(sendError.data.composerText, diagnosticComposerText,
+      "the full composer draft is saved so the ownership decision can be reproduced");
+    assert.equal(sendError.data.composerStartsWithExpectedPrefix, false);
+    assert.equal(sendError.data.composerContainsReportSample, true);
+    assert.equal(sendError.data.composerContainsReportWrapper, true);
+    assert.match(sendError.data.composerFingerprint, /^\d+:[0-9a-f]+$/);
+    assert.match(sendError.data.expectedMessageFingerprint, /^\d+:[0-9a-f]+$/);
+    assert.match(sendError.data.expectedReportFingerprint, /^\d+:[0-9a-f]+$/);
+    assert.equal(sendError.data.firstPrefixMismatchAt, 0,
+      "the log identifies the first mismatching offset instead of only reporting a generic exception");
+    assert.deepEqual(Array.from(sendError.data.composerLeadingCodePoints.slice(0, 1)), [0x200b],
+      "the log preserves invisible leading characters as code points for diagnosis");
+    assert.equal(sendError.data.composerRawLength, diagnosticComposerText.length);
+  }
+
   reportGenerating = true;
   const reportAssistantAfter = new Element("div", "ChatGPT 回复正在生成", {
     "data-content-search-unit-key": "report:after:assistant"
@@ -930,7 +1090,22 @@ context.document = {
   reportContext.document.visibilityState = "visible";
   await resumeAssistantWait();
   assert.ok(reportLog.some(entry => entry.event === "assistant_turn_detected" &&
-    entry.data.isGenerating === true), "a new assistant turn is logged while the stop button is present");
+    entry.data.isGenerating === true), "visibility restoration immediately rechecks the new assistant turn");
+  const turnTick = reportLog.filter(entry => entry.event === "assistant_wait_tick" &&
+    entry.data.latestAssistantUnitKey === "report:after:assistant").at(-1);
+  assert.equal(turnTick.data.assistantSelectionSource, "assistant_role");
+  assert.equal(turnTick.data.assistantCount, 2);
+  assert.equal(turnTick.data.assistantUnitKeyChanged, true);
+  assert.equal(turnTick.data.assistantSignatureChanged, true);
+  assert.equal(turnTick.data.assistantCountChanged, true);
+  assert.ok(turnTick.data.currentAssistantSignature.fingerprint);
+  const turnDetected = reportLog.find(entry => entry.event === "assistant_turn_detected" &&
+    entry.data.reportId === 1);
+  assert.deepEqual(Array.from(turnDetected.data.turnDetectionReasons), ["unit_key_changed"],
+    "turn detection diagnostics identify the condition that actually triggered the existing key-based branch");
+  assert.equal(turnDetected.data.latestAssistantUnitKey, "report:after:assistant");
+  assert.equal(turnDetected.data.assistantSignatureChanged, true);
+  assert.equal(turnDetected.data.assistantCountChanged, true);
   assert.ok(reportLog.some(entry => entry.event === "page_stability_checkpoint" &&
     entry.data.reason === "assistant_generating"),
   "the stability diagnostics identify assistant generation as an early return gate");

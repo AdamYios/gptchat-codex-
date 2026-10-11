@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import secrets
@@ -22,6 +23,9 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+DEFAULT_TURN_TIMEOUT_SECONDS = 5 * 60 * 60
+SESSION_LIST_LIMIT = 10
 
 
 class BridgeHTTPServer(ThreadingHTTPServer):
@@ -46,7 +50,9 @@ LOG_FIELDS = {"phase", "round", "reportId", "taskId", "tabId", "boundTabFound", 
               "assistantBaselineCount", "assistantCountDelta", "assistantTurnDetected", "stableElapsedMs",
               "stableThresholdMs", "rafUsed", "setTimeoutUsed", "waitForUsesSetTimeout", "visibilityUsed",
               "mutationObserverUsed", "isGenerating", "cardPresent", "busy", "tickIntervalMs",
-              "diagnosticObserverStarted", "observerMutationCount"}
+              "diagnosticObserverStarted", "observerMutationCount", "conversationInput",
+              "conversationOutput", "composerText", "contentSha256", "errorName",
+              "errorMessage", "errorStack"}
 
 
 def safe_log_data(data):
@@ -61,10 +67,19 @@ def safe_log_data(data):
             result[key] = value
         elif isinstance(value, str) and key == "instructionId":
             result[key] = value[:4096]
+        elif isinstance(value, str) and key in {"conversationInput", "conversationOutput", "composerText",
+                                                 "errorMessage", "errorStack"}:
+            result[key] = value
+        elif isinstance(value, str) and key in {"contentSha256", "errorName"}:
+            result[key] = value[:128]
         elif isinstance(value, str) and key in {"phase", "taskId", "composerTag", "reason", "method",
                                                        "mode", "errorType", "status", "visibilityState"}:
             result[key] = "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_-"))[:50]
     return result
+
+
+def content_sha256(value: str):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def error_code(exc):
@@ -318,7 +333,8 @@ def local_sessions(thread_id: str | None = None):
                     rows = conn.execute(
                         "SELECT id, name, cwd, title FROM threads "
                         "WHERE archived = 0 AND thread_source = 'user' "
-                        "ORDER BY updated_at DESC LIMIT 30"
+                        "ORDER BY updated_at DESC LIMIT ?",
+                        (SESSION_LIST_LIMIT,)
                     ).fetchall()
                 if rows:
                     return rows
@@ -330,7 +346,8 @@ def local_sessions(thread_id: str | None = None):
 def print_session_list(sessions):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
-    print("本机 Codex 普通任务列表（最近 30 条）：")
+    sessions = sessions[:SESSION_LIST_LIMIT]
+    print(f"本机 Codex 普通任务列表（最近 {SESSION_LIST_LIMIT} 条）：")
     for number, (sid, name, cwd, first_message) in enumerate(sessions, 1):
         if name and name.strip():
             label = " ".join(name.split())[:100]
@@ -391,11 +408,12 @@ def select_session(thread_id: str | None, cwd_override: Path | None):
         if not thread_id or not cwd_override:
             raise
     if not thread_id:
-        print_session_list(sessions)
+        selectable_sessions = sessions[:SESSION_LIST_LIMIT]
+        print_session_list(selectable_sessions)
         choice = input("输入序号：").strip()
-        if not choice.isdecimal() or not 1 <= int(choice) <= len(sessions):
+        if not choice.isdecimal() or not 1 <= int(choice) <= len(selectable_sessions):
             raise ValueError("无效的任务序号")
-        thread_id = sessions[int(choice) - 1][0]
+        thread_id = selectable_sessions[int(choice) - 1][0]
     try:
         uuid.UUID(thread_id)
     except (ValueError, TypeError) as exc:
@@ -487,6 +505,10 @@ class Bridge:
             self.last_instruction = ""
             self.phase = "report_ready" if mode == "B" else "await_instruction"
         self.log("start", {"mode": mode, "phase": self.phase})
+        if initial:
+            self.log("report_ready", {"round": self.round, "reportId": self.report_id,
+                                       "reportLength": len(initial), "conversationOutput": initial,
+                                       "contentSha256": content_sha256(initial)})
         print(f"已从扩展选择方式 {mode}；{'等待报告发往 ChatGPT' if mode == 'B' else '等待 ChatGPT 指令卡片'}", flush=True)
 
     def snapshot(self):
@@ -500,6 +522,10 @@ class Bridge:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 20_000:
             raise ValueError("指令长度必须为 1–20000 字符（Windows 命令行长度限制）")
+        self.log("instruction_received", {"instructionLength": len(instruction),
+                                           "instructionId": str(instruction_id or "").strip() or None,
+                                           "conversationInput": instruction,
+                                           "contentSha256": content_sha256(instruction)})
         normalized_instruction = " ".join(instruction.split())
         instruction_id = str(instruction_id or "").strip()
         if len(instruction_id) > 4096:
@@ -525,7 +551,7 @@ class Bridge:
                     raise ValueError("Codex 上一轮仍在执行；请等待完成后再投递新指令")
                 if self.phase != "await_instruction":
                     raise ValueError(f"not accepting instructions in phase {self.phase}")
-                if self.round >= self.max_rounds:
+                if self.max_rounds is not None and self.round >= self.max_rounds:
                     self.phase = "stopped"
                     self.detail = "已达到最大轮数"
                     raise ValueError(self.detail)
@@ -594,7 +620,9 @@ class Bridge:
                         return
                     print(f"第 {number} 轮：Codex 最终报告已就绪", flush=True)
                     self.log("report_ready", {"round": number, "reportLength": len(report),
-                                              "reportId": report_id})
+                                              "reportId": report_id,
+                                              "conversationOutput": report,
+                                              "contentSha256": content_sha256(report)})
                     return
                 if turn["status"] not in ("inProgress", "pending"):
                     raise RuntimeError(f"Codex 本轮未完成（状态 {turn['status']}）：{turn['error'] or ''}")
@@ -620,7 +648,9 @@ class Bridge:
             if self.phase != "report_ready" or report_id != self.report_id:
                 raise ValueError("report acknowledgement does not match current report")
             self.report = ""
-            self.phase = "await_instruction" if self.round < self.max_rounds else "stopped"
+            self.phase = ("await_instruction"
+                          if self.max_rounds is None or self.round < self.max_rounds
+                          else "stopped")
             if self.phase == "stopped":
                 self.detail = "已达到最大轮数"
         self.log("report_acknowledged", {"reportId": report_id, "phase": self.phase})
@@ -737,8 +767,10 @@ def main():
     parser.add_argument("--cwd", type=Path, help="兼容旧命令；新版本仅用任务 UUID 定位，不需要工作目录")
     parser.add_argument("--codex", default="codex", help="Codex CLI 可执行文件")
     parser.add_argument("--port", type=int, help="本机端口；默认 8765 被占用时自动选择空闲端口")
-    parser.add_argument("--max-rounds", type=int, default=20)
-    parser.add_argument("--timeout", type=int, default=7200, help="每轮 Codex 超时秒数（默认 7200）")
+    parser.add_argument("--max-rounds", type=int, default=None,
+                        help="可选：设置桥接流程最大轮数；默认不限轮数")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TURN_TIMEOUT_SECONDS,
+                        help="每轮 Codex 最长等待秒数（默认 18000，即 5 小时）")
     parser.add_argument("--list-tasks", action="store_true", help="仅列出本机任务，不启动桥接或发送消息")
     start = parser.add_mutually_exclusive_group()
     start.add_argument("--initial-report-file", type=Path, help="首次启动时要发给 ChatGPT 的既有 Codex 最终报告")
@@ -752,8 +784,8 @@ def main():
         except RuntimeError as exc:
             parser.error(str(exc))
         return
-    if args.max_rounds < 1 or args.timeout < 1:
-        parser.error("max-rounds/timeout must be positive")
+    if (args.max_rounds is not None and args.max_rounds < 1) or args.timeout < 1:
+        parser.error("max-rounds（若指定）和 timeout 必须为正数")
     if args.port is not None and not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     try:
@@ -788,7 +820,7 @@ def main():
         bridge.report = initial
         bridge.report_id = 1
         bridge.phase = "report_ready"
-        print(f"已从剪贴板读取 Codex 最终报告（{len(initial)} 字）；内容不会写入文件", flush=True)
+        print(f"已从剪贴板读取 Codex 最终报告（{len(initial)} 字）；内容会写入当前任务本地操作记录", flush=True)
     elif args.initial_report_file:
         try:
             initial = args.initial_report_file.read_text(encoding="utf-8").strip()
@@ -801,6 +833,11 @@ def main():
         bridge.phase = "report_ready"
     elif args.start_from_existing_card:
         bridge.phase = "await_instruction"
+    if bridge.phase == "report_ready" and bridge.report:
+        bridge.log("report_ready", {"round": bridge.round, "reportLength": len(bridge.report),
+                                     "reportId": bridge.report_id,
+                                     "conversationOutput": bridge.report,
+                                     "contentSha256": content_sha256(bridge.report)})
     requested_port = args.port if args.port is not None else 8765
     handler = make_handler(bridge, token, event_log)
     try:
