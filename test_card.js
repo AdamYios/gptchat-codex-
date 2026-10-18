@@ -272,7 +272,7 @@ context.capturePreSendUserBaselineForTest(1);
 assert.equal(context.userMessagesForTest().length, 1);
 currentUserUnits = [nextUserUnit];
 assert.equal(context.userMessagesForTest().length, 1,
-  "the optimizer may hide the old node so the total mounted message count stays unchanged");
+  "the page may hide the old node so the total mounted message count stays unchanged");
 const noTextDelta = context.reportTextEvidenceForTest(repeatedReport, 1);
 assert.equal(noTextDelta.baselineAvailable, true);
 assert.equal(noTextDelta.visibleDelta, 0);
@@ -721,17 +721,17 @@ context.document = {
     "the wait observer is scoped to the conversation main root");
   assert.deepEqual(Array.from(assistantObserverConfiguration.options.attributeFilter),
     ["data-testid", "aria-label", "aria-hidden"],
-    "style and optimizer marker attributes are excluded from observation");
-  const wakeEventsBeforeOptimizerAttributes = logged.filter(entry =>
+    "style and unrelated marker attributes are excluded from observation");
+  const wakeEventsBeforeIrrelevantAttributes = logged.filter(entry =>
     entry.event.startsWith("assistant_wait_wake_")).length;
   assistantObserverCallback([
     {type: "attributes", attributeName: "style", target: assistantMutationTarget},
-    {type: "attributes", attributeName: "data-cgo-live-hidden", target: assistantMutationTarget},
-    {type: "attributes", attributeName: "data-cgo-history-boundary", target: assistantMutationTarget}
+    {type: "attributes", attributeName: "data-test-hidden", target: assistantMutationTarget},
+    {type: "attributes", attributeName: "data-test-boundary", target: assistantMutationTarget}
   ]);
   assert.equal(logged.filter(entry => entry.event.startsWith("assistant_wait_wake_")).length,
-    wakeEventsBeforeOptimizerAttributes,
-    "optimizer style and live-window marker mutations do not wake automatic transfer");
+    wakeEventsBeforeIrrelevantAttributes,
+    "style and unrelated marker mutations do not wake automatic transfer");
 
   const mutation = {type: "characterData", target: assistantMutationTarget, addedNodes: []};
   for (let index = 0; index < 200; index += 1) assistantObserverCallback([mutation]);
@@ -809,11 +809,8 @@ context.document = {
   const reportTimers = new Map();
   let reportTimerId = 0;
   let reportMessageListener;
-  let reportWindowMessageListener;
   let reportVisibilityChangeHandler;
-  const reportWindow = {addEventListener(type, callback) {
-    if (type === "message") reportWindowMessageListener = callback;
-  }};
+  const reportWindow = {addEventListener() {}};
   let reportObserver;
   class ReportMutationObserver {
     constructor(callback) { this.callback = callback; this.disconnected = false; reportObserver = this; }
@@ -899,9 +896,6 @@ context.document = {
     const keepChannelOpen = reportMessageListener({type: "bridgeReportReady", reportId: 1}, null, resolve);
     assert.equal(keepChannelOpen, true, "report-ready notification waits for the page-side wake tick");
   });
-  const emitOptimizerStatus = payload => reportWindowMessageListener({source: reportWindow, data: {
-    source: "CHATGPT_LONG_CHAT_OPTIMIZER", direction: "FROM_MAIN", type: "STATUS", payload
-  }});
   const flushContentWork = async () => {
     for (let index = 0; index < 16; index += 1) await Promise.resolve();
   };
@@ -985,7 +979,7 @@ context.document = {
   "the observer remains active to timestamp content changes and wake card processing");
   assert.deepEqual(Array.from(reportObserver.options.attributeFilter),
     ["data-testid", "aria-label", "aria-hidden"],
-    "the observer watches only assistant-affecting generation attributes, not optimizer markers or style");
+    "the observer watches only assistant-affecting generation attributes, not unrelated markers or style");
   assert.ok(reportLog.some(entry => entry.event === "report_unconfirmed"),
     "the failed early confirmation remains recorded for diagnosis");
   assert.equal((await wakeForReport()).ok, true);
@@ -1121,7 +1115,6 @@ context.document = {
   diagnosticBody.append(new Element("p", "诊断后继续检查卡片等待阶段。"));
   reportContext.document.visibilityState = "hidden";
   reportObserver.emit(diagnosticCard);
-  emitOptimizerStatus({liveScans: 12, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "new-content"});
   await flushContentWork();
   await reportContext.tickForTest();
   await flushContentWork();
@@ -1164,12 +1157,9 @@ context.document = {
   assert.equal(stabilityStarted.data.stableElapsedMs, 0);
   assert.equal(reportTimers.size, 0,
     "no delayed stability timer is scheduled in the hidden page");
-  diagnosticCard.attributes["data-cgo-live-hidden"] = "true";
   reportContext.document.querySelectorAll = selector => {
     if (selector === '[data-content-search-unit-key$=":assistant"]') return reportAssistantUnits;
     if (selector === '[data-content-search-unit-key$=":user"]') return reportUserUnits;
-    if (selector === '[data-cgo-live-hidden="true"]') return [diagnosticCard];
-    if (selector === '[data-cgo-history-boundary="true"]') return [];
     if (selector.includes('data-testid="stop-button"'))
       return reportGenerating ? [{getAttribute: () => null}] : [];
     return [];
@@ -1190,16 +1180,15 @@ context.document = {
     "a hidden card remains unstable at 1 ms below the threshold");
   assert.equal(reportInstructionRequests.length, 0);
   fakeNow += 1;
-  const wakesBeforeOptimizerMutation = reportLog.filter(entry =>
+  const wakesBeforeStyleMutation = reportLog.filter(entry =>
     entry.event.startsWith("assistant_wait_wake_")).length;
   reportObserver.emitAttribute(diagnosticCard, "style");
   await flushContentWork();
   assert.equal(reportLog.filter(entry => entry.event.startsWith("assistant_wait_wake_")).length,
-    wakesBeforeOptimizerMutation,
-    "optimizer style changes do not wake the assistant wait observer");
+    wakesBeforeStyleMutation,
+    "unrelated style changes do not wake the assistant wait observer");
   assert.equal(reportLog.some(entry => entry.event === "page_stability_wait_ended"), false,
-    "an optimizer-only mutation cannot drive card scanning");
-  emitOptimizerStatus({liveScans: 13, liveUnits: 8, liveHiddenUnits: 3, liveLastReason: "mutation"});
+    "a style-only mutation cannot drive card scanning");
   await reportContext.tickForTest();
   await flushContentWork();
   const pendingSubmit = reportLog.find(entry => entry.event === "assistant_wait_pending_submit");
@@ -1219,14 +1208,6 @@ context.document = {
   assert.ok(stabilityEnded.data.stabilityStartedAt > 0);
   assert.equal(stabilityEnded.data.assistantContentMutationCount, 4,
     "the observer timestamps the new assistant turn, card, and subsequent reply changes");
-  assert.equal(stabilityEnded.data.optimizerLiveScanDelta, 1,
-    "optimizer scan status remains diagnostic without becoming a wake source");
-  assert.equal(stabilityEnded.data.optimizerLiveWindowMutationDelta, 0);
-  assert.equal(stabilityEnded.data.optimizerHiddenMarkerCount, 1);
-  assert.equal(stabilityEnded.data.optimizerLiveScans, 13);
-  assert.equal(stabilityEnded.data.optimizerLiveUnits, 8);
-  assert.equal(stabilityEnded.data.optimizerLiveHiddenUnits, 3);
-  assert.equal(stabilityEnded.data.optimizerLiveLastReason, "mutation");
   assert.ok(reportLog.some(entry => entry.event === "card_scan" &&
     entry.data.visibilityState === "hidden" && entry.data.reason === "matched"),
   "the original card scan runs in the background after the stability threshold");
@@ -1237,9 +1218,9 @@ context.document = {
   assert.equal(reportInstructionRequests[0].instruction,
     forwardedInstruction("诊断后继续检查卡片等待阶段。"));
   assert.equal(stabilityEnded.data.signatureChangeCount, 1,
-    "an optimizer marker mutation does not reset the content signature timer");
+    "a style mutation does not reset the content signature timer");
   assert.equal(reportLog.filter(entry => entry.event === "page_stability_reset").length, 1,
-    "optimizer marker mutations do not reset the assistant-content stability clock");
+    "style mutations do not reset the assistant-content stability clock");
   assert.ok(reportLog.some(entry => entry.event === "assistant_wait_wake_requested" &&
     entry.data.method === "mutation_observer_card_found"),
   "card discovery requests an immediate processing pass");

@@ -45,19 +45,6 @@
 
     <p id="status" class="feedback global-feedback" role="status" aria-live="polite"></p>
 
-    <section class="card optimizer-card">
-      <h2>长对话加速</h2>
-      <label class="check-row"><input id="optimizerEnabled" type="checkbox">启用</label>
-      <div class="settings-row">
-        <label for="optimizerKeepRounds">最近 N 轮</label>
-        <input id="optimizerKeepRounds" type="number" min="1" max="500" step="1">
-      </div>
-      <label class="check-row"><input id="optimizerLiveWindow" type="checkbox">实时滑动窗口</label>
-      <label class="check-row"><input id="optimizerRenderOptimize" type="checkbox">屏幕外渲染优化</label>
-      <button id="optimizerApply" class="button secondary full">应用并刷新</button>
-      <p id="optimizerStatus" class="hint" aria-live="polite">读取加速器设置…</p>
-    </section>
-
     <details class="card task-list-card">
       <summary>已连接任务</summary>
       <div id="connections" class="connection-list"></div>

@@ -19,11 +19,7 @@ const LOG_FIELDS = new Set([
   "isGenerating", "cardPresent", "busy", "tickIntervalMs", "diagnosticObserverStarted",
   "observerMutationCount", "observerCallbackCount", "observerChildListCount",
   "observerCharacterDataCount", "observerAttributeCount", "observerCallbackDelta",
-  "observerMutationDelta", "optimizerLiveWindowMutationCount", "optimizerLiveWindowMutationDelta",
-  "optimizerBoundaryMutationCount", "optimizerBoundaryMutationDelta", "optimizerHiddenMarkerCount",
-  "optimizerBoundaryMarkerCount", "optimizerStatusAvailable", "optimizerLiveScans",
-  "optimizerLiveScanDelta", "optimizerLiveUnits", "optimizerLiveHiddenUnits",
-  "optimizerLiveLastReason",
+  "observerMutationDelta",
   "signatureChangeCount", "signatureLength", "unitKeyLength",
   "latestTextLength", "assistantMessageCount", "previousStableElapsedMs", "cardFirstSeen",
   "replyCompleted", "lastContentChangeAt", "stabilityStartedAt", "assistantContentMutationCount",
@@ -197,7 +193,7 @@ function safeEvent(message, source, connection = null) {
       data[key] = value;
     else if (typeof value === "string" && key === "errorName") data[key] = value.slice(0, 120);
     else if (typeof value === "string" &&
-             /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId|optimizerLiveLastReason)$/.test(key))
+             /^(phase|taskId|composerTag|reason|method|mode|errorType|status|visibilityState|instructionId)$/.test(key))
       data[key] = value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 50);
   }
   const taskId = String(connection?.threadId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);

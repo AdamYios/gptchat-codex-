@@ -7,13 +7,6 @@ const PHASE_HELP = {
   stopped: "当前流程已结束，可选择新起点",
 };
 const CHAT_URL = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//;
-const OPTIMIZER_KEYS = {
-  enabled: "optimizer.enabled",
-  keepRounds: "optimizer.keepRounds",
-  renderOptimize: "optimizer.renderOptimize",
-  liveWindow: "optimizer.liveWindow"
-};
-
 function phaseLabel(state) {
   const help = PHASE_HELP[state.phase] || "未知状态，请检查桥接器输出";
   const round = state.phase === "await_instruction" && state.round === 0
@@ -37,82 +30,6 @@ async function readConnections() {
       port: config.port, token: config.token, title: config.title || "", card: config.card || ""};
   }
   return connections;
-}
-
-function clampOptimizerRounds(value) {
-  const n = Number.parseInt(value, 10);
-  return Number.isFinite(n) ? Math.max(1, Math.min(500, n)) : 10;
-}
-
-function optimizerSettingsFromControls() {
-  return {
-    enabled: $("optimizerEnabled").checked,
-    keepRounds: clampOptimizerRounds($("optimizerKeepRounds").value),
-    renderOptimize: $("optimizerRenderOptimize").checked,
-    liveWindow: $("optimizerLiveWindow").checked
-  };
-}
-
-async function loadOptimizerSettings() {
-  const stored = await chrome.storage.local.get(Object.values(OPTIMIZER_KEYS));
-  $("optimizerEnabled").checked = stored[OPTIMIZER_KEYS.enabled] !== false;
-  $("optimizerKeepRounds").value = clampOptimizerRounds(stored[OPTIMIZER_KEYS.keepRounds]);
-  $("optimizerRenderOptimize").checked = stored[OPTIMIZER_KEYS.renderOptimize] !== false;
-  $("optimizerLiveWindow").checked = stored[OPTIMIZER_KEYS.liveWindow] !== false;
-}
-
-async function saveOptimizerSettings() {
-  const settings = optimizerSettingsFromControls();
-  $("optimizerKeepRounds").value = settings.keepRounds;
-  await chrome.storage.local.set({
-    [OPTIMIZER_KEYS.enabled]: settings.enabled,
-    [OPTIMIZER_KEYS.keepRounds]: settings.keepRounds,
-    [OPTIMIZER_KEYS.renderOptimize]: settings.renderOptimize,
-    [OPTIMIZER_KEYS.liveWindow]: settings.liveWindow
-  });
-  return settings;
-}
-
-async function refreshOptimizerStatus(tab) {
-  const status = $("optimizerStatus");
-  if (!tab) {
-    status.textContent = "请切换到 ChatGPT 对话页查看加速器状态";
-    return;
-  }
-  try {
-    const reply = await chrome.tabs.sendMessage(tab.id, {type: "OPTIMIZER_STATUS"});
-    if (!reply?.ok) throw new Error(reply?.error || "优化器页面脚本无响应");
-    const live = reply.mainStatus?.liveDiagnostic || {};
-    status.textContent = reply.mainStatus
-      ? `页面脚本已连接 · 当前识别 ${live.userUnits ?? 0} 个用户轮次，隐藏 ${live.hiddenUnits ?? 0} 个消息单元`
-      : "页面脚本已连接，等待优化器状态";
-  } catch {
-    status.textContent = "页面脚本尚未连接；应用设置时会刷新当前 ChatGPT 页面";
-  }
-}
-
-async function applyOptimizerAndReload() {
-  const tab = await activeChatTab();
-  if (!tab) {
-    $("optimizerStatus").textContent = "请先切换到目标 ChatGPT 对话页";
-    return;
-  }
-  try {
-    const settings = await saveOptimizerSettings();
-    const applied = await chrome.tabs.sendMessage(tab.id, {type: "OPTIMIZER_APPLY", settings});
-    if (!applied?.ok) throw new Error(applied?.error || "优化器未能应用设置");
-    const live = await chrome.tabs.sendMessage(tab.id, {type: "OPTIMIZER_LIVE_NOW"});
-    if (!live?.ok) throw new Error(live?.error || "优化器未能更新当前消息窗口");
-    $("optimizerStatus").textContent = "设置已应用，正在刷新当前 ChatGPT 页面…";
-  } catch (error) {
-    if (!missingReceiver(error)) {
-      $("optimizerStatus").textContent = String(error);
-      return;
-    }
-    $("optimizerStatus").textContent = "设置已保存；正在刷新以加载优化器脚本…";
-  }
-  try { await chrome.tabs.reload(tab.id); }
-  catch (error) { $("optimizerStatus").textContent = `刷新失败：${error}`; }
 }
 
 async function connectionFor(tabId) {
@@ -297,7 +214,6 @@ async function show() {
     empty.textContent = "尚无连接。每个任务在独立终端启动 bridge.py，再把该终端的连接信息绑定到 ChatGPT 标签页。";
     list.appendChild(empty);
   }
-  await refreshOptimizerStatus(tab);
 }
 
 let refreshingActiveTask = false;
@@ -353,16 +269,6 @@ $("endFlow").onclick = () => act(async tabId => {
     ? "当前流程已结束；Codex 仍会继续运行，后续报告不会自动发送到 ChatGPT。"
     : "当前流程已结束；桥接连接和标签页绑定保持不变。";
 }, "end_flow");
-
-for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize"])
-  $(id).addEventListener("change", async () => {
-    try {
-      await saveOptimizerSettings();
-      $("optimizerStatus").textContent = "设置已保存；点击下方按钮将应用并刷新当前对话。";
-    } catch (error) { $("optimizerStatus").textContent = String(error); }
-  });
-
-$("optimizerApply").onclick = applyOptimizerAndReload;
 
 function parseConnectionCode(value) {
   const match = String(value || "").trim().match(/^(?:127\.0\.0\.1:)?(\d{1,5})\|([A-Za-z0-9_-]{20,})$/);
@@ -509,8 +415,6 @@ for (const [id, action] of [["recheck", "recheck"], ["confirmSent", "confirmSent
 }
 
 async function initializePopup() {
-  try { await loadOptimizerSettings(); }
-  catch (error) { $("optimizerStatus").textContent = `读取优化器设置失败：${error}`; }
   await show();
 }
 

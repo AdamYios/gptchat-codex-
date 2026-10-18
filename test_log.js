@@ -100,11 +100,6 @@ async function main() {
     observerCallbackCount: 7, observerChildListCount: 11,
     observerCharacterDataCount: 5, observerAttributeCount: 9,
     observerCallbackDelta: 2, observerMutationDelta: 6,
-    optimizerLiveWindowMutationCount: 3, optimizerLiveWindowMutationDelta: 1,
-    optimizerBoundaryMutationCount: 2, optimizerBoundaryMutationDelta: 0,
-    optimizerHiddenMarkerCount: 4, optimizerBoundaryMarkerCount: 1,
-    optimizerStatusAvailable: true, optimizerLiveScans: 14, optimizerLiveScanDelta: 2,
-    optimizerLiveUnits: 10, optimizerLiveHiddenUnits: 4, optimizerLiveLastReason: "new-content",
     latestTextLength: 123, assistantMessageCount: 6,
     coalescedWakeCount: 11,
     previousStableElapsedMs: 1900, cardFirstSeen: true, replyCompleted: true,
@@ -142,18 +137,6 @@ async function main() {
   assert.equal(saved.bridgePendingEvents_taskB[1].data.observerAttributeCount, 9);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.observerCallbackDelta, 2);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.observerMutationDelta, 6);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveWindowMutationCount, 3);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveWindowMutationDelta, 1);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMutationCount, 2);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMutationDelta, 0);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerHiddenMarkerCount, 4);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerBoundaryMarkerCount, 1);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerStatusAvailable, true);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveScans, 14);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveScanDelta, 2);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveUnits, 10);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveHiddenUnits, 4);
-  assert.equal(saved.bridgePendingEvents_taskB[1].data.optimizerLiveLastReason, "new-content");
   assert.equal(saved.bridgePendingEvents_taskB[1].data.latestTextLength, 123);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.assistantMessageCount, 6);
   assert.equal(saved.bridgePendingEvents_taskB[1].data.coalescedWakeCount, 11,

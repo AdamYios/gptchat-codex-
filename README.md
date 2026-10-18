@@ -1,6 +1,6 @@
 # ChatGPT ↔ Codex 自动桥接
 
-这个项目把 Edge 中的 ChatGPT 会话连接到本机 Codex 桌面任务。Edge 扩展负责识别指令卡片和回传最终报告；`bridge.py` 负责把指令投递到所选 Codex 任务并等待最终回答。长对话加速器已集成在同一个扩展里，不需要安装另一个扩展。
+这个项目把 Edge 中的 ChatGPT 会话连接到本机 Codex 桌面任务。Edge 扩展负责识别指令卡片和回传最终报告；`bridge.py` 负责把指令投递到所选 Codex 任务并等待最终回答。
 
 适用于 Windows、已登录的 Edge/ChatGPT、Codex 桌面应用和可用的 Codex CLI。桥接器只用 Python 标准库。
 
@@ -11,7 +11,6 @@
 - 防重复：扩展根据会话路径、消息单元标记和规范化正文生成稳定的 `instructionId`；无消息单元标记时回退到正文 hash。发送前在当前标签页的 `sessionStorage` 记为 `pending`，成功后记为 `seen`；两种状态都不会自动重发。bridge 对已接受的相同 ID 返回幂等成功，不会再次启动 Codex。
 - “结束当前流程”：结束桥接的自动流程，但保留 bridge 连接和标签页绑定。已经运行的 Codex 不会被取消，它之后的报告不会自动发送。Codex 仍在运行时，新流程的“开始”按钮会暂时禁用；任务完成后可选择 A/B 重新开始。
 - popup 按当前状态切换工作流：未绑定时显示连接配置；连接处于 `setup` 或 `stopped` 时显示起点选择；活动阶段显示当前任务。查看卡片、报告恢复和操作记录放在“更多操作”。
-- 内置长对话加速：启用后，首次会话请求限制为最近 N 轮；阻止 `messages?before=...` 的旧历史分页，并将响应的 `page_info.has_previous_page` 设为 `false`。可设置实时滑动窗口和屏幕外渲染优化。
 - 每个 ChatGPT 标签页可绑定一个独立 Codex 任务；同一个扩展可管理多个任务。
 
 ## 安装和启动
@@ -68,17 +67,7 @@ python .\bridge.py
 | 已连接，phase 为 `setup` 或 `stopped` | A/B 起点选择和“开始” |
 | phase 为 `await_instruction`、`codex_running` 或 `report_ready` | 当前任务和“结束当前流程” |
 
-报告恢复控件只会在存在待处理报告时显示，并位于“更多操作”中。长对话加速始终是独立区域；日志和“查看卡片”等低频操作也位于“更多操作”。
-
-长对话加速区域包括：
-
-- **启用**：默认开启。
-- **最近 N 轮**：默认 10，范围 1–500。
-- **实时滑动窗口**：将页面中保留的消息窗口维持在最近轮次附近。
-- **屏幕外渲染优化**：减少屏幕外消息的渲染开销。
-- **应用并刷新**：保存设置、应用到当前 ChatGPT 页面并刷新。
-
-优化器不会删除 ChatGPT 服务端历史；它限制首次请求，并阻止扩展尝试加载更早的分页历史。设置只在 ChatGPT 页面启用该扩展时生效。
+报告恢复控件只会在存在待处理报告时显示，并位于“更多操作”中。日志和“查看卡片”等低频操作也位于“更多操作”。
 
 ## 操作记录和常见事项
 
@@ -102,7 +91,6 @@ node test_card.js
 node test_content_scheduler.js
 node test_popup.js
 node test_log.js
-node test_optimizer.js
 ```
 
 检查扩展 JavaScript 语法：

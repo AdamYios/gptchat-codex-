@@ -51,7 +51,6 @@
   let assistantWaitLastWakeAt = 0;
   const ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS = 250;
   const ASSISTANT_WAIT_HIDDEN_WAKE_MIN_INTERVAL_MS = 1800;
-  let optimizerDiagnosticStatus = null;
   let phaseStatus = "等待桥接器状态";
   let phaseStatusError = false;
   let phaseChangedAt = Date.now();
@@ -85,23 +84,6 @@
   const rateLimitedLogStates = new Map();
   const STATUS_WIDGET_POSITION_KEY = "bridge.statusWidgetPosition";
   const STATUS_WIDGET_COLLAPSED_KEY = "bridge.statusWidgetCollapsed";
-
-  try {
-    if (typeof window !== "undefined" && window.addEventListener) {
-      window.addEventListener("message", event => {
-        const message = event.data;
-        if (event.source !== window || message?.source !== "CHATGPT_LONG_CHAT_OPTIMIZER" ||
-            message.direction !== "FROM_MAIN" || !["READY", "STATUS"].includes(message.type)) return;
-        const payload = message.payload || {};
-        optimizerDiagnosticStatus = {
-          liveScans: Number.isFinite(Number(payload.liveScans)) ? Number(payload.liveScans) : null,
-          liveUnits: Number.isFinite(Number(payload.liveUnits)) ? Number(payload.liveUnits) : null,
-          liveHiddenUnits: Number.isFinite(Number(payload.liveHiddenUnits)) ? Number(payload.liveHiddenUnits) : null,
-          liveLastReason: typeof payload.liveLastReason === "string" ? payload.liveLastReason : ""
-        };
-      });
-    }
-  } catch { /* Optimizer diagnostics are optional and must not affect bridge startup. */ }
 
   function operationSnapshot() {
     const editor = composer();
@@ -1164,13 +1146,7 @@ ${report}`;
   const GENERATION_CONTROL_SELECTOR =
     '[data-testid="stop-button"], button[aria-label*="Stop generating"], button[aria-label*="停止生成"]';
 
-  function diagnosticSelectorCount(selector) {
-    try { return document.querySelectorAll(selector).length; }
-    catch { return 0; }
-  }
-
   function assistantWaitDiagnosticFields(wait) {
-    const liveScans = optimizerDiagnosticStatus?.liveScans;
     const fields = {
       lastContentChangeAt: wait.lastContentChangeAt || 0,
       stabilityStartedAt: wait.stabilityStartedAt || 0,
@@ -1179,28 +1155,11 @@ ${report}`;
       observerMutationCount: wait.observerMutationCount || 0,
       observerChildListCount: wait.observerChildListCount || 0,
       observerCharacterDataCount: wait.observerCharacterDataCount || 0,
-      observerAttributeCount: wait.observerAttributeCount || 0,
-      optimizerLiveWindowMutationCount: wait.optimizerLiveWindowMutationCount || 0,
-      optimizerBoundaryMutationCount: wait.optimizerBoundaryMutationCount || 0,
-      optimizerHiddenMarkerCount: diagnosticSelectorCount('[data-cgo-live-hidden="true"]'),
-      optimizerBoundaryMarkerCount: diagnosticSelectorCount('[data-cgo-history-boundary="true"]'),
-      optimizerStatusAvailable: !!optimizerDiagnosticStatus,
-      optimizerLiveScans: liveScans ?? 0,
-      optimizerLiveUnits: optimizerDiagnosticStatus?.liveUnits ?? 0,
-      optimizerLiveHiddenUnits: optimizerDiagnosticStatus?.liveHiddenUnits ?? 0,
-      optimizerLiveLastReason: optimizerDiagnosticStatus?.liveLastReason || ""
+      observerAttributeCount: wait.observerAttributeCount || 0
     };
     const previous = wait.lastDiagnosticSnapshot || {};
     fields.observerCallbackDelta = fields.observerCallbackCount - (previous.observerCallbackCount || 0);
     fields.observerMutationDelta = fields.observerMutationCount - (previous.observerMutationCount || 0);
-    fields.optimizerLiveWindowMutationDelta = fields.optimizerLiveWindowMutationCount -
-      (previous.optimizerLiveWindowMutationCount || 0);
-    fields.optimizerBoundaryMutationDelta = fields.optimizerBoundaryMutationCount -
-      (previous.optimizerBoundaryMutationCount || 0);
-    fields.optimizerLiveScanDelta = liveScans === null || liveScans === undefined ||
-      wait.lastOptimizerLiveScans === null || wait.lastOptimizerLiveScans === undefined
-      ? 0 : liveScans - wait.lastOptimizerLiveScans;
-    if (liveScans !== null && liveScans !== undefined) wait.lastOptimizerLiveScans = liveScans;
     wait.lastDiagnosticSnapshot = fields;
     return fields;
   }
@@ -1405,11 +1364,8 @@ ${report}`;
       observerChildListCount: 0,
       observerCharacterDataCount: 0,
       observerAttributeCount: 0,
-      optimizerLiveWindowMutationCount: 0,
-      optimizerBoundaryMutationCount: 0,
       signatureChangeCount: 0,
       lastSignatureChangedAt: 0,
-      lastOptimizerLiveScans: optimizerDiagnosticStatus?.liveScans ?? null,
       lastDiagnosticSnapshot: null
     };
     record("report_acknowledged", {reportId,

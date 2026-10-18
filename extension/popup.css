@@ -66,9 +66,6 @@ h3 { margin: 0 0 7px; font-size: 12px; font-weight: 650; }
 .full { width: 100%; }
 .current-task .primary { margin-top: 7px; }
 
-.check-row { display: flex; align-items: center; gap: 7px; margin: 6px 0; }
-.check-row input { margin: 0; accent-color: #2867d7; }
-.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 7px 0; }
 input, select {
   min-width: 0;
   padding: 6px 7px;
@@ -78,8 +75,6 @@ input, select {
   color: inherit;
   font: inherit;
 }
-#optimizerKeepRounds { width: 82px; }
-.optimizer-card > .button { margin-top: 4px; }
 
 details > summary { cursor: pointer; font-weight: 650; list-style-position: inside; }
 .details-content { margin-top: 10px; }

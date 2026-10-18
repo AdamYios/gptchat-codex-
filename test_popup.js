@@ -8,8 +8,7 @@ async function main() {
   for (const id of ["connectionCode", "status", "connectionConfigSection", "startSection",
     "startConnectionStatus", "startTaskPhase", "currentTaskSection", "connectionStatus", "currentTaskName", "taskPhase",
     "endFlow", "bind", "startMode", "startSelected", "reportRecoveryActions", "moreActions",
-    "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog",
-    "optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
+    "viewCards", "cardChoices", "connections", "recheck", "confirmSent", "retrySend", "viewLog", "operationLog"])
     elements.set(id, {value: "", checked: false, disabled: false, textContent: "", onclick: null, children: [], listeners: {},
       addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); },
       replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
@@ -17,7 +16,7 @@ async function main() {
   const popupHtml = fs.readFileSync(path.join(__dirname, "extension", "popup.html"), "utf8");
   assert.match(popupHtml, /href="popup\.css"/);
   assert.match(popupHtml, /当前任务/);
-  assert.match(popupHtml, /长对话加速/);
+  assert.doesNotMatch(popupHtml, /长对话加速|optimizer/i);
   assert.match(popupHtml, /<summary>更多操作<\/summary>/);
   assert.ok(popupHtml.indexOf('id="connectionConfigSection"') < popupHtml.indexOf('id="startSection"'));
   assert.ok(popupHtml.indexOf('id="startSection"') < popupHtml.indexOf('id="currentTaskSection"'));
@@ -29,14 +28,9 @@ async function main() {
   assert.doesNotMatch(popupHtml, /autoPaused|暂停自动传递|恢复自动传递|autoTransfer/);
   assert.doesNotMatch(popupHtml, /id="(?:title|card)"/,
     "connection setup only asks for the bridge port and token");
-  for (const id of ["optimizerEnabled", "optimizerKeepRounds", "optimizerLiveWindow", "optimizerRenderOptimize", "optimizerApply", "optimizerStatus"])
-    assert.match(popupHtml, new RegExp(`id="${id}"`));
-  assert.match(popupHtml, /应用并刷新/);
   const state = {
     connections: undefined,
-    tabId: 7, port: 8765, token: "abcdefghijklmnopqrstuvwxyz123456", title: "旧标题覆盖项", card: ".legacy-card",
-    "optimizer.enabled": true, "optimizer.keepRounds": 18,
-    "optimizer.renderOptimize": false, "optimizer.liveWindow": true
+    tabId: 7, port: 8765, token: "abcdefghijklmnopqrstuvwxyz123456", title: "旧标题覆盖项", card: ".legacy-card"
   };
   const tabStates = new Map([[7, {url: "https://chatgpt.com/c/a", title: "Chat A"}],
     [8, {url: "https://chatgpt.com/c/b", title: "Chat B"}]]);
@@ -46,9 +40,7 @@ async function main() {
   let selectedKey = "";
   const starts = [];
   const pageNotifications = [];
-  const optimizerMessages = [];
   const lifecycleMessages = [];
-  const reloadedTabs = [];
   let activeId = 7;
   const intervals = [];
   const codexInProgressByPort = new Map([[8765, false], [8766, false]]);
@@ -82,15 +74,8 @@ async function main() {
       get: async id => ({id, ...(tabStates.get(id) || {url: "", title: "Closed tab"})}),
       query: async () => [{id: activeId, ...(tabStates.get(activeId) || {})}],
       update: async (id, options) => { if (options.active) activeId = id; },
-      reload: async id => { reloadedTabs.push(id); },
       sendMessage: async (id, message) => {
         if (message.type === "bridgeFlowStarted") lifecycleMessages.push({type: message.type, tabId: id});
-        if (message.type.startsWith("OPTIMIZER_")) {
-          optimizerMessages.push({tabId: id, type: message.type, settings: message.settings});
-          if (message.type === "OPTIMIZER_STATUS") return {ok: true,
-            mainStatus: {liveDiagnostic: {userUnits: 4, hiddenUnits: 6}}};
-          return {ok: true};
-        }
         if (message.type === "bridgePing") {
           if (!injected.has(id)) throw new Error("Could not establish connection. Receiving end does not exist.");
           return {ok: true};
@@ -154,12 +139,6 @@ async function main() {
   vm.runInNewContext(source, {chrome, fetch, document, console, URL, Date, Math, Number, String, Object, RegExp,
     setInterval: (callback, delay) => { intervals.push({callback, delay}); return intervals.length; }});
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(elements.get("optimizerEnabled").checked, true);
-  assert.equal(elements.get("optimizerKeepRounds").value, 18);
-  assert.equal(elements.get("optimizerRenderOptimize").checked, false);
-  assert.equal(elements.get("optimizerLiveWindow").checked, true);
-  assert.match(elements.get("optimizerStatus").textContent, /页面脚本已连接/);
-  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_STATUS"));
   assert.equal(elements.get("connectionConfigSection").hidden, true);
   assert.equal(elements.get("startSection").hidden, true);
   assert.equal(elements.get("currentTaskSection").hidden, false);
@@ -295,21 +274,7 @@ async function main() {
   assert.equal(elements.get("startSelected").disabled, false,
     "the new flow becomes available when the old Codex run finishes");
 
-  elements.get("optimizerEnabled").checked = false;
-  elements.get("optimizerKeepRounds").value = "24";
-  elements.get("optimizerLiveWindow").checked = false;
-  elements.get("optimizerRenderOptimize").checked = true;
-  await elements.get("optimizerKeepRounds").listeners.change[0]();
-  assert.equal(state["optimizer.enabled"], false);
-  assert.equal(state["optimizer.keepRounds"], 24);
-  assert.equal(state["optimizer.liveWindow"], false);
-  assert.equal(state["optimizer.renderOptimize"], true);
-  await elements.get("optimizerApply").onclick();
-  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_APPLY" &&
-    message.settings.keepRounds === 24 && message.settings.enabled === false));
-  assert.ok(optimizerMessages.some(message => message.type === "OPTIMIZER_LIVE_NOW"));
-  assert.deepEqual(reloadedTabs, [8]);
-  console.log("Popup preserves Codex bridge and applies long-chat optimizer settings");
+  console.log("Popup preserves Codex bridge workflow");
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });
