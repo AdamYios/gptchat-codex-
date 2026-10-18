@@ -52,7 +52,8 @@ LOG_FIELDS = {"phase", "round", "reportId", "taskId", "tabId", "boundTabFound", 
               "mutationObserverUsed", "isGenerating", "cardPresent", "busy", "tickIntervalMs",
               "diagnosticObserverStarted", "observerMutationCount", "conversationInput",
               "conversationOutput", "composerText", "contentSha256", "errorName",
-              "errorMessage", "errorStack"}
+              "errorMessage", "errorStack", "checkCount", "cardParseCount", "cardCacheHits",
+              "cardParseMs", "pollDelayMs"}
 
 
 def safe_log_data(data):
@@ -756,7 +757,11 @@ def create_bridge_server(port: int, handler, auto_fallback: bool):
     try:
         return BridgeHTTPServer(("127.0.0.1", port), handler), False
     except OSError as exc:
-        if not auto_fallback or exc.errno != errno.EADDRINUSE:
+        # Windows excluded port ranges and exclusive listeners can reject a
+        # bind with WSAEACCES (10013), rather than WSAEADDRINUSE (10048).
+        unavailable = (exc.errno in (errno.EADDRINUSE, errno.EACCES)
+                       or getattr(exc, "winerror", None) in (10013, 10048))
+        if not auto_fallback or not unavailable:
             raise
         return BridgeHTTPServer(("127.0.0.1", 0), handler), True
 
@@ -766,7 +771,7 @@ def main():
     parser.add_argument("--thread-id", help="可选：直接指定现有 Codex 桌面任务 UUID；省略则显示任务列表")
     parser.add_argument("--cwd", type=Path, help="兼容旧命令；新版本仅用任务 UUID 定位，不需要工作目录")
     parser.add_argument("--codex", default="codex", help="Codex CLI 可执行文件")
-    parser.add_argument("--port", type=int, help="本机端口；默认 8765 被占用时自动选择空闲端口")
+    parser.add_argument("--port", type=int, help="本机端口；默认 8765 被占用或禁止使用时自动选择空闲端口；0 表示由系统分配")
     parser.add_argument("--max-rounds", type=int, default=None,
                         help="可选：设置桥接流程最大轮数；默认不限轮数")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TURN_TIMEOUT_SECONDS,
@@ -843,12 +848,12 @@ def main():
     try:
         server, auto_selected = create_bridge_server(requested_port, handler, args.port is None)
     except OSError as exc:
-        parser.error(f"无法监听本机端口 {requested_port}；可能已有桥接器在运行：{exc}")
+        parser.error(f"无法监听本机端口（请求端口 {requested_port}）；端口可能被占用或被系统禁止使用：{exc}")
     actual_port = server.server_address[1]
     print(f"已选任务「{safe_log_title(title)}」[{thread_id}]；任务记录中的工作目录 {cwd}（仅供核对，无需填写）", flush=True)
     print(f"Codex CLI 检查通过：{codex_executable}（{codex_version}）", flush=True)
     if auto_selected:
-        print(f"默认端口 {requested_port} 已占用，已自动选择空闲端口", flush=True)
+        print(f"默认端口 {requested_port} 被占用或被系统禁止使用，已自动选择空闲端口 {actual_port}", flush=True)
     print(f"监听 http://127.0.0.1:{actual_port}", flush=True)
     print("扩展连接信息（请复制下一行到对应 ChatGPT 标签页）:", flush=True)
     print(f"{actual_port}|{token}", flush=True)

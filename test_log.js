@@ -260,6 +260,8 @@ async function main() {
   const taskBStateChecksBeforeStop = apiRouted.filter(port => port === 8766).length;
   phaseByPort.set(8767, "stopped");
   await send({type: "bridgeTaskStopped", tabId: 7});
+  assert.ok(reportWakeMessages.some(({tabId, message}) => tabId === 7 && message.type === "bridgeFlowStopped"),
+    "ending a flow immediately tells the content script to cancel polling and in-flight checks");
   phaseByPort.set(8770, "stopped");
   await send({type: "bridgeTaskStopped", tabId: 10});
   phaseByPort.set(8766, "stopped");

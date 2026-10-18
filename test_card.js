@@ -25,7 +25,7 @@ class Element {
   getClientRects() { for (let node = this; node; node = node.parentElement) if (node.hidden) return []; return [{}]; }
   contains(other) { for (let node = other; node; node = node.parentElement) if (node === this) return true; return false; }
   closest(selector) {
-    const wantsAnyUnit = selector === "[data-content-search-unit-key]";
+    const wantsAnyUnit = selector.includes("[data-content-search-unit-key]");
     const wantsAssistantUnit = selector.includes('data-content-search-unit-key$=":assistant"');
     const wantsAssistantRole = selector.includes('data-message-author-role="assistant"');
     if (!wantsAnyUnit && !wantsAssistantUnit && !wantsAssistantRole) return null;

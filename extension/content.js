@@ -61,8 +61,27 @@
   let actionChangedAt = 0;
   const scriptInstance = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let tickInterval = null;
+  let flowEpoch = 0;
+  let automaticLoopStopped = false;
+  let pageObserver = null;
+  let focusedPageObserver = null;
+  let pageCheckQueued = false;
+  let pageWakeTimer = null;
+  let observedAssistant = null;
+  let pageRevision = 0;
+  let nextAutomaticCheckAt = 0;
+  let emptyCardChecks = 0;
+  let pageIsGenerating = false;
+  let scanPass = null;
+  let cardScanCache = new WeakMap();
+  const signatureFingerprints = new Map();
+  let scanMetrics = {checkCount: 0, cardParseCount: 0, cardCacheHits: 0, cardParseMs: 0};
+  let lastScanMetricsAt = 0;
+  const CARD_CACHE_MAX_AGE_MS = 30000;
+  const EMPTY_CARD_DELAYS_MS = [2000, 5000, 10000, 30000];
   const LOG_REPEAT_INTERVAL_MS = 30000;
-  const RATE_LIMITED_LOG_EVENTS = new Set(["assistant_wait_tick", "assistant_wait_pending_submit"]);
+  const RATE_LIMITED_LOG_EVENTS = new Set(["assistant_wait_tick", "assistant_wait_pending_submit",
+    "page_stability_checkpoint", "page_stability_reset", "page_stability_wait_started"]);
   const rateLimitedLogStates = new Map();
   const STATUS_WIDGET_POSITION_KEY = "bridge.statusWidgetPosition";
   const STATUS_WIDGET_COLLAPSED_KEY = "bridge.statusWidgetCollapsed";
@@ -109,7 +128,8 @@
         "busy", "phase", "isGenerating", "assistantCount", "latestAssistantUnitKey",
         "assistantUnitKeyChanged", "assistantSignatureChanged", "assistantCountChanged",
         "assistantSelectionSource"]
-      : ["reportId", "cardFirstSeen", "visibilityState", "phase"];
+      : ["reportId", "cardFirstSeen", "visibilityState", "phase", "reason", "pendingSubmit",
+        "assistantTurnDetected", "replyCompleted", "isGenerating"];
     return JSON.stringify(fields.map(field => [field, data?.[field] ?? null]));
   }
 
@@ -117,21 +137,26 @@
     if (!RATE_LIMITED_LOG_EVENTS.has(event)) return true;
     const now = Date.now();
     const signature = logStateSignature(event, data);
-    const previous = rateLimitedLogStates.get(event);
+    const key = event === "page_stability_reset" ? `${event}:${data.reason || ""}` : event;
+    const previous = rateLimitedLogStates.get(key);
     if (previous && previous.signature === signature &&
         now - previous.loggedAt < LOG_REPEAT_INTERVAL_MS) return false;
-    rateLimitedLogStates.set(event, {signature, loggedAt: now});
+    rateLimitedLogStates.set(key, {signature, loggedAt: now});
     return true;
   }
 
   function record(event, data = {}, onceKey = "") {
     if (onceKey) {
       if (recordedEvents.has(onceKey)) return Promise.resolve();
+      if (recordedEvents.size >= 512) recordedEvents.delete(recordedEvents.values().next().value);
       recordedEvents.add(onceKey);
     }
     if (!shouldRecordRateLimitedEvent(event, data)) return Promise.resolve();
     let snapshot;
-    try { snapshot = operationSnapshot(); }
+    try {
+      snapshot = scanPass?.snapshot || operationSnapshot();
+      if (scanPass) scanPass.snapshot = snapshot;
+    }
     catch { snapshot = {reason: "snapshot_failed"}; }
     try {
       return chrome.runtime.sendMessage({type: "bridgeLog", occurredAt: new Date().toISOString(), event,
@@ -297,6 +322,7 @@
 
   function setStatusWidgetMessage(bar, message) {
     const body = bar.querySelector?.(".codex-bridge-status-body");
+    if ((body || bar).textContent === message) return;
     if (body) body.textContent = message;
     else bar.textContent = message;
     // The initial empty widget is shorter than its first status message. Clamp
@@ -326,6 +352,8 @@
   }
 
   function status(text, error = false) {
+    const unchanged = phaseStatus === text && phaseStatusError === error;
+    if (unchanged && Date.now() - lastCheckAt < LOG_REPEAT_INTERVAL_MS) return;
     if (phaseStatus !== text || phaseStatusError !== error) {
       phaseStatus = text;
       phaseStatusError = error;
@@ -349,8 +377,7 @@
   }
 
   function stopInvalidatedScript() {
-    if (tickInterval !== null) clearInterval(tickInterval);
-    tickInterval = null;
+    stopAutomaticLoop();
     const bar = document.getElementById("codex-bridge-status");
     if (bar?.dataset.bridgeInstance === scriptInstance) {
       bar.style.background = "#fff0c2";
@@ -360,23 +387,29 @@
   }
 
   function assistantMessages() {
+    if (scanPass?.messages) return scanPass.messages;
     const current = [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')]
       .filter(el => isVisible(el) && messageText(el));
-    if (current.length) return current;
+    if (current.length) return scanPass ? (scanPass.messages = current) : current;
     const direct = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
       .filter(el => isVisible(el) && messageText(el));
-    if (direct.length) return direct;
+    if (direct.length) return scanPass ? (scanPass.messages = direct) : direct;
     // A generic conversation turn or article may be a user message. Only use
     // a fallback when the DOM explicitly identifies the assistant author.
-    return [...document.querySelectorAll(
+    const fallback = [...document.querySelectorAll(
       '[data-author-role="assistant"], [data-role="assistant"], [data-testid*="assistant-message"]'
     )].filter(el => isVisible(el) && messageText(el));
+    return scanPass ? (scanPass.messages = fallback) : fallback;
   }
 
   function messageText(element) {
-    const rendered = typeof element?.innerText === "string" ? element.innerText : "";
+    if (element && scanPass?.texts.has(element)) return scanPass.texts.get(element);
+    const innerText = element?.innerText;
+    const rendered = typeof innerText === "string" ? innerText : "";
     const source = rendered.trim() ? rendered : element?.textContent || "";
-    return String(source).trim();
+    const text = String(source).trim();
+    if (element && scanPass) scanPass.texts.set(element, text);
+    return text;
   }
 
   function isGenerating() {
@@ -393,6 +426,13 @@
   }
 
   function isVisible(el) {
+    if (scanPass?.visibility.has(el)) return scanPass.visibility.get(el);
+    const visible = computeVisibility(el);
+    if (scanPass) scanPass.visibility.set(el, visible);
+    return visible;
+  }
+
+  function computeVisibility(el) {
     if (el.getClientRects && !el.getClientRects().length) return false;
     for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
       if (node.hidden || node.getAttribute?.("aria-hidden") === "true") return false;
@@ -411,9 +451,9 @@
 
   function titleElements(el, titleRegex) {
     return [...el.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],span,div,p,strong")]
-      .filter(node => isVisible(node) && node.children.length === 0 &&
-        (node.innerText || node.textContent || "").trim().length < 100 &&
-        isExactTitle((node.innerText || node.textContent || "").trim(), titleRegex));
+      .filter(node => node.children.length === 0 &&
+        (node.textContent || "").trim().length < 100 &&
+        isExactTitle((node.textContent || "").trim(), titleRegex) && isVisible(node));
   }
 
   function isExactTitle(text, titleRegex) {
@@ -458,6 +498,25 @@
   }
 
   function extractCard(message, titleRegex, selector) {
+    // Direct/manual callers always recheck the DOM. Automatic passes share both
+    // positive and negative results, with a bounded fallback for missed mutations.
+    if (!scanPass || !message) return parseCard(message, titleRegex, selector);
+    const key = `${titleRegex.source}/${titleRegex.flags}:${selector || ""}:${contentUnitKey(message)}`;
+    const cached = cardScanCache.get(message);
+    if (cached && cached.key === key && cached.revision === pageRevision &&
+        Date.now() - cached.at < CARD_CACHE_MAX_AGE_MS) {
+      scanPass.cardCacheHits += 1;
+      return cached.result;
+    }
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const result = parseCard(message, titleRegex, selector);
+    cardScanCache.set(message, {key, revision: pageRevision, at: Date.now(), result});
+    scanPass.cardScans += 1;
+    scanPass.cardScanMs += (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+    return result;
+  }
+
+  function parseCard(message, titleRegex, selector) {
     let candidates = [];
     if (selector) {
       try { candidates = [...message.querySelectorAll(selector)]; }
@@ -577,8 +636,94 @@
   }
 
   function visibleContentSearchUnits() {
-    return [...document.querySelectorAll("[data-content-search-unit-key]")]
+    if (scanPass?.units) return scanPass.units;
+    const units = [...document.querySelectorAll("[data-content-search-unit-key]")]
       .filter(el => isVisible(el) && messageText(el));
+    return scanPass ? (scanPass.units = units) : units;
+  }
+
+  function invalidatePageScan() {
+    pageRevision += 1;
+    emptyCardChecks = 0;
+    nextAutomaticCheckAt = 0;
+  }
+
+  function schedulePageCheck() {
+    if (automaticLoopStopped || tickInterval === null) return;
+    // Streaming text is sampled by the 2-second fallback. Generation-control
+    // transitions explicitly clear this flag to promptly check the final reply.
+    if (pageIsGenerating) return;
+    if (busy) { pageCheckQueued = true; return; }
+    if (pageWakeTimer !== null || document.visibilityState === "hidden") return;
+    pageWakeTimer = setTimeout(() => {
+      pageWakeTimer = null;
+      void tick("page_changed");
+    }, ASSISTANT_WAIT_WAKE_MIN_INTERVAL_MS);
+  }
+
+  const ASSISTANT_DISCOVERY_SELECTOR = '[data-content-search-unit-key], ' +
+    '[data-message-author-role="assistant"], [data-author-role="assistant"], ' +
+    '[data-role="assistant"], [data-testid*="assistant-message"]';
+
+  function nodeHasMessageUnit(node) {
+    if (node?.nodeType !== 1) return false;
+    return !!node.matches?.(ASSISTANT_DISCOVERY_SELECTOR) ||
+      !!node.querySelector?.(ASSISTANT_DISCOVERY_SELECTOR);
+  }
+
+  function observeLatestAssistant(latest) {
+    if (!pageObserver || observedAssistant === latest) return;
+    focusedPageObserver?.disconnect();
+    focusedPageObserver = null;
+    observedAssistant = latest;
+    if (!latest) return;
+    const epoch = flowEpoch;
+    focusedPageObserver = new MutationObserver(mutations => {
+      if (epoch !== flowEpoch || observedAssistant !== latest || automaticLoopStopped) return;
+      if (mutations.some(mutationAffectsGenerationState)) pageIsGenerating = false;
+      invalidatePageScan();
+      schedulePageCheck();
+    });
+    focusedPageObserver.observe(latest, {subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-label",
+        "title", "data-testid", "data-content-search-unit-key"]});
+  }
+
+  function startPageObserver() {
+    const root = document.body || document.querySelector("main");
+    if (pageObserver || !root || typeof MutationObserver !== "function") return;
+    // Discovery only: content and card attributes are observed on the latest
+    // reply. Changes in the composer, status widget or old replies do no scans.
+    const epoch = flowEpoch;
+    pageObserver = new MutationObserver(mutations => {
+      if (epoch !== flowEpoch || automaticLoopStopped) return;
+      const relevant = mutations.some(mutation => {
+        if (mutation.target?.closest?.("#codex-bridge-status")) return false;
+        if (observedAssistant && (mutation.target === observedAssistant ||
+            observedAssistant.contains?.(mutation.target))) return false;
+        if (mutationAffectsGenerationState(mutation)) {
+          pageIsGenerating = false;
+          return true;
+        }
+        if (mutation.type === "attributes") return !!observedAssistant &&
+          !!mutation.target?.contains?.(observedAssistant);
+        return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])]
+          .some(node => nodeHasMessageUnit(node) || node === observedAssistant ||
+            !!node.contains?.(observedAssistant));
+      });
+      if (!relevant) return;
+      invalidatePageScan();
+      schedulePageCheck();
+    });
+    pageObserver.observe(root, {subtree: true, childList: true, attributes: true,
+      attributeOldValue: true, attributeFilter: ["class", "style", "hidden", "aria-hidden",
+        "aria-label", "data-testid", "data-message-author-role", "data-content-search-unit-key"]});
+  }
+
+  function deferEmptyCardCheck() {
+    const delay = EMPTY_CARD_DELAYS_MS[Math.min(emptyCardChecks, EMPTY_CARD_DELAYS_MS.length - 1)];
+    emptyCardChecks += 1;
+    nextAutomaticCheckAt = Date.now() + delay;
   }
 
   function latestUserContains(report) {
@@ -616,7 +761,16 @@
   }
 
   function reportMessage(report) {
-    return `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。若需继续，请把**仅给 Codex 的指令**放在一张标题栏为“给 Codex 的指令”、带复制按钮和打开编辑器按钮的writingblock卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，Codex 当前使用 Luna 模型，可能无法可靠遵循过长指令，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。\n\nCodex 最终报告：\n${report}`;
+    return `以下是 Codex 上一轮的最终报告。请先分析，再决定下一步。
+
+【交互与文件边界】本桥接只在 ChatGPT 与 Codex 之间传递文本，不会传递文件或附件。若下一步需要在 ChatGPT 与本机/Codex 之间打开、选择、上传、下载或转交文件，请暂停该步骤，以“需要人工处理”开头说明具体要用户做什么，并且不要生成指令卡片。不得假设附件已传给 Codex，也不得声称已读取或处理实际无法访问的文件。
+
+【证据核验】Codex 当前使用 Luna 模型，可能出现幻觉、误读、把未执行的检查说成已完成，也可能无法可靠遵循过长指令。对关键事实、文件内容、代码行为、执行结果以及“已修复/已通过”等结论，要求 Codex 尽量用可重复核查的确定性证据验证，例如实际文件内容及路径/行号、命令及其实际输出、测试或构建结果、日志。不要把模型记忆或推断当作证据；没有足够证据或未实际验证时，必须明确标为“未验证”“推测”或“未知”，并指出需要人工确认的事项。
+
+若需继续，请把**仅给 Codex 的指令**放在一张标题栏为“给 Codex 的指令”、带复制按钮和打开编辑器按钮的writingblock卡片中；卡片外可写分析。若任务完成，请以“任务完成”开头且不要生成指令卡片。若需要人工处理，请以“需要人工处理”开头且不要生成指令卡片。另外，请尽量把后续指令拆成简短、明确的步骤，不要让codex执行过长的任务，以免发生错误。若项目使用 Git 版本管理，请在阶段性工作完成后及时提醒 Codex 提交更改。
+
+Codex 最终报告：
+${report}`;
   }
 
   function readComposerText(editor) {
@@ -840,10 +994,16 @@
 
   function assistantSignatureFingerprint(signature) {
     const value = String(signature || "");
-    return {length: value.length, fingerprint: value ? cardKey(value) : ""};
+    if (signatureFingerprints.has(value)) return signatureFingerprints.get(value);
+    const details = {length: value.length, fingerprint: value ? cardKey(value) : ""};
+    if (signatureFingerprints.size >= 4) signatureFingerprints.delete(signatureFingerprints.keys().next().value);
+    signatureFingerprints.set(value, details);
+    return details;
   }
 
   function assistantWaitSelectionDiagnostics(wait, messages, latest) {
+    if (scanPass?.selection?.wait === wait && scanPass.selection.latest === latest)
+      return scanPass.selection.details;
     const assistant = messages.at(-1) || null;
     const signature = messages.length
       ? `${messages.length}:${messageText(assistant)}`
@@ -859,7 +1019,7 @@
     const baselineContentSignature = String(wait.baselineContentSignature || "");
     const currentContentSignature = assistantContentSignature(assistant || latest,
       wait.cardTitle, wait.cardSelector);
-    return {
+    const details = {
       baselineAssistantUnitKey: baselineUnitKey,
       latestAssistantUnitKey: contentUnitKey(assistant),
       latestSelectedUnitKey: latestUnitKey,
@@ -877,6 +1037,8 @@
       assistantCountChanged: messages.length !== wait.baselineCount,
       assistantCountDelta: messages.length - wait.baselineCount
     };
+    if (scanPass) scanPass.selection = {wait, latest, details};
+    return details;
   }
 
   function assistantTurnChanged(wait, diagnostics, messages) {
@@ -1046,6 +1208,11 @@
   function recordAssistantWaitCheckpoint(wait, reason, details = {}) {
     if (!wait?.active) return;
     const now = Date.now();
+    const signature = JSON.stringify([reason, document.visibilityState, wait.cardFirstSeen,
+      wait.pendingSubmit, wait.turnDetected, wait.replyCompleted, details.phase, details.isGenerating]);
+    if (wait.lastCheckpoint?.signature === signature &&
+        now - wait.lastCheckpoint.at < LOG_REPEAT_INTERVAL_MS) return;
+    wait.lastCheckpoint = {signature, at: now};
     record("page_stability_checkpoint", {reportId: wait.reportId,
       elapsedMs: now - wait.startedAt,
       stableElapsedMs: wait?.lastContentChangeAt
@@ -1070,6 +1237,7 @@
         visibilityState: document.visibilityState || "unknown"}, `assistant_wait_observer_unavailable:${diagnostic.reportId}`);
       return;
     }
+    diagnostic.latestObservedAssistant = assistantMessages().at(-1) || null;
     const observer = new MutationObserver(mutations => {
       const current = assistantWaitDiagnostic;
       if (!current?.active || current.reportId !== diagnostic.reportId) {
@@ -1081,12 +1249,23 @@
       const hasContentMutations = mutations.some(mutation =>
         mutation.type === "childList" || mutation.type === "characterData");
       if (!hasContentMutations && !generationMutations.length) return;
-      const latestAssistant = hasContentMutations ? assistantMessages().at(-1) : null;
+      const previous = current.latestObservedAssistant;
+      const outsideMessage = hasContentMutations && mutations.some(mutation => {
+        if (!["childList", "characterData"].includes(mutation.type) ||
+            mutationTouchesAssistantMessage(previous, mutation)) return false;
+        const unit = mutation.target?.closest?.(ASSISTANT_DISCOVERY_SELECTOR);
+        if (unit && (!previous?.compareDocumentPosition || (previous.compareDocumentPosition(unit) & 4)))
+          return true;
+        return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some(nodeHasMessageUnit);
+      });
+      if (!previous || outsideMessage) current.latestObservedAssistant = assistantMessages().at(-1) || null;
+      const latestAssistant = current.latestObservedAssistant;
       const assistantContentMutations = mutations.filter(mutation =>
         (mutation.type === "childList" || mutation.type === "characterData") &&
         mutationTouchesAssistantMessage(latestAssistant, mutation));
       const relevantMutations = [...assistantContentMutations, ...generationMutations];
       if (!relevantMutations.length) return;
+      invalidatePageScan();
 
       const observedAt = Date.now();
       current.observerCallbackCount = (current.observerCallbackCount || 0) + 1;
@@ -1139,7 +1318,9 @@
         return;
       }
       if (!assistantContentMutations.length) return;
-      const latest = assistantMessages().at(-1) || visibleContentSearchUnits().at(-1);
+      if (current.lastCardProbeAt && observedAt - current.lastCardProbeAt < 1000) return;
+      current.lastCardProbeAt = observedAt;
+      const latest = latestAssistant || visibleContentSearchUnits().at(-1);
       if (!latest) return;
       try {
         const title = new RegExp(current.cardTitle || DEFAULT_TITLE.source, "i");
@@ -1180,7 +1361,9 @@
     void tick();
   }
 
-  async function acknowledgeReport(reportId, skipPreviousAssistant = false, diagnosticConfig = null) {
+  async function acknowledgeReport(reportId, skipPreviousAssistant = false, diagnosticConfig = null,
+      epoch = flowEpoch) {
+    if (epoch !== flowEpoch) return;
     record("report_confirmed", {reportId, confirmed: true}, `report_confirmed:${reportId}`);
     sentReport = reportId;
     sessionStorage.setItem("bridge.sentReport", String(reportId));
@@ -1189,6 +1372,7 @@
       sessionStorage.setItem("bridge.lastSubmitted", lastSubmitted);
     }
     await api("/ack", "POST", {reportId, runId});
+    if (epoch !== flowEpoch) return;
     clearPendingReport(reportId);
     const startedAt = Date.now();
     clearQueuedAssistantWaitTick();
@@ -1248,12 +1432,13 @@
     status("最终报告已发往 ChatGPT，等待下一轮");
   }
 
-  async function sendReport(report, reportId, diagnosticConfig = null) {
+  async function sendReport(report, reportId, diagnosticConfig = null, epoch = flowEpoch) {
     let stage = "read_bridge_state";
     let editor = null;
     let message = "";
     try {
       const currentState = await api("/state");
+      if (epoch !== flowEpoch) return;
       if (currentState.phase !== "report_ready" || currentState.reportId !== reportId) {
         status(currentState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
         return;
@@ -1268,6 +1453,7 @@
       if (baselinedReport !== reportId) {
         stage = "load_report_settings";
         const config = await bridgeSettings();
+        if (epoch !== flowEpoch) return;
         rememberVisibleCards(new RegExp(config.title || DEFAULT_TITLE.source, "i"), config.card || "");
         baselinedReport = reportId;
         sessionStorage.setItem("bridge.baselinedReport", String(reportId));
@@ -1281,7 +1467,7 @@
       message = reportMessage(report);
       if (reportWasSent(report, reportId)) {
         stage = "acknowledge_already_sent_report";
-        await acknowledgeReport(reportId, attemptedReport === reportId, diagnosticConfig); return;
+        await acknowledgeReport(reportId, attemptedReport === reportId, diagnosticConfig, epoch); return;
       }
       stage = "check_existing_composer_text";
       const existingValue = readComposerText(editor);
@@ -1340,7 +1526,8 @@
         editor.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: message}));
         const expectedNormalized = normalize(message);
         const fillConfirmed = await waitFor(() =>
-          normalize(readComposerText(editor).text) === expectedNormalized, 2000);
+          epoch !== flowEpoch || normalize(readComposerText(editor).text) === expectedNormalized, 2000);
+        if (epoch !== flowEpoch) return;
         const filledValue = readComposerText(editor);
         const fillDiagnostics = reportComposerDiagnostics(filledValue.text, message, report, filledValue.source);
         record("report_fill", {reportId, filledLength: filledValue.text.length,
@@ -1369,9 +1556,11 @@
       }
       stage = "wait_for_send_button";
       const buttonReady = await waitFor(() => {
+        if (epoch !== flowEpoch) return true;
         const button = sendButton(editor);
         return !!button && !button.disabled && button.getAttribute("aria-disabled") !== "true";
       }, 2000);
+      if (epoch !== flowEpoch) return;
       if (!buttonReady) {
         record("send_button_unavailable", {reportId}, `send_button_unavailable:${reportId}`);
         status("报告已填入输入框；发送按钮暂不可用，桥接将在下一轮重试");
@@ -1379,6 +1568,7 @@
       }
       stage = "recheck_bridge_state";
       const latestState = await api("/state");
+      if (epoch !== flowEpoch) return;
       if (latestState.phase !== "report_ready" || latestState.reportId !== reportId) {
         status(latestState.detail || "当前流程已结束或报告状态已变化；未自动发送报告", true);
         return;
@@ -1403,7 +1593,9 @@
       record("send_click", {reportId}, `send_click:${reportId}`);
       sendButton(editor).click();
       stage = "confirm_report_message";
-      if (!await waitFor(() => reportWasSent(report, reportId), 10000)) {
+      const confirmed = await waitFor(() => epoch !== flowEpoch || reportWasSent(report, reportId), 10000);
+      if (epoch !== flowEpoch) return;
+      if (!confirmed) {
         record("report_unconfirmed", {reportId, confirmed: false,
           ...reportTextEvidence(report, reportId),
           ...reportConfirmationSignals(report, reportId)}, `report_unconfirmed:${reportId}`);
@@ -1411,7 +1603,7 @@
         return;
       }
       stage = "acknowledge_report";
-      await acknowledgeReport(reportId, true, diagnosticConfig);
+      await acknowledgeReport(reportId, true, diagnosticConfig, epoch);
     } catch (error) {
       if (error && typeof error === "object") {
         error.bridgeReportStage = stage;
@@ -1439,8 +1631,10 @@
     if (busy) await waitFor(() => !busy, 12000);
     if (busy) throw new Error("桥接器仍在检查页面，请稍后重试");
     busy = true;
+    const epoch = flowEpoch;
     try {
       const state = await api("/state");
+      if (epoch !== flowEpoch) throw new Error("当前流程已结束，请重新开始后再恢复报告");
       syncRun(state);
       record("recovery", {phase: state.phase, reportId: state.reportId, method: action});
       if (state.phase === "await_instruction" || state.phase === "codex_running")
@@ -1473,8 +1667,11 @@
     if (busy) await waitFor(() => !busy, 12000);
     if (busy) throw new Error("桥接器仍在检查页面，请稍后重试");
     busy = true;
+    const epoch = flowEpoch;
+    invalidatePageScan();
     try {
       const config = await bridgeSettings();
+      if (epoch !== flowEpoch) throw new Error("当前流程已结束，请重新开始后再选择卡片");
       if (!config.bound) throw new Error("当前 ChatGPT 标签页未绑定桥接任务");
       if (isGenerating()) throw new Error("ChatGPT 当前回复仍在生成，请等待停止生成按钮消失");
       const title = new RegExp(config.title || DEFAULT_TITLE.source, "i");
@@ -1526,6 +1723,7 @@
             latestOnly: scopedLatestOnly}));
       }
       const state = await api("/state");
+      if (epoch !== flowEpoch) throw new Error("当前流程已结束，请重新开始后再选择卡片");
       syncRun(state);
       if (state.phase !== "await_instruction")
         throw new Error(`当前状态 ${state.phase}；若先前因卡片歧义已停止，请先在扩展点 A 重新开始`);
@@ -1546,6 +1744,7 @@
         runId: state.runId
       });
       setInstructionState(id, "seen");
+      if (epoch !== flowEpoch) return "当前流程已结束";
       record("manual_card_submit", {instructionLength: choices[selectedIndex].instruction.length,
         cardChoices: choices.length});
       lastSubmitted = signature;
@@ -1557,12 +1756,18 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, respond) => {
     if (message.type === "bridgePing") { respond({ok: true}); return false; }
+    if (message.type === "bridgeFlowStopped") {
+      stopAutomaticLoop();
+      status("当前流程已结束；自动检查已停止");
+      respond({ok: true}); return false;
+    }
     if (message.type === "bridgeFlowStarted") {
       startAutomaticLoop("flow_started").then(() => respond({ok: true}),
         error => respond({ok: false, error: String(error)}));
       return true;
     }
     if (message.type === "bridgeReportReady") {
+      if (automaticLoopStopped) { respond({ok: true, stopped: true}); return false; }
       const reportId = Number(message.reportId);
       if (!Number.isSafeInteger(reportId) || reportId <= 0) {
         respond({ok: false, error: "无效的报告编号"}); return false;
@@ -1572,7 +1777,7 @@
         reportWakeQueued = true;
         respond({ok: true, queued: true}); return false;
       }
-      tick().then(() => respond({ok: true}), error => respond({ok: false, error: String(error)}));
+      tick("report_ready").then(() => respond({ok: true}), error => respond({ok: false, error: String(error)}));
       return true;
     }
     if (message.type === "bridgeUiAction") {
@@ -1594,6 +1799,8 @@
 
   function syncRun(state) {
     if (state.runId === runId) return;
+    invalidatePageScan();
+    signatureFingerprints.clear();
     if (assistantWaitDiagnostic?.active) {
       record("assistant_wait_abandoned", {reportId: assistantWaitDiagnostic.reportId,
         reason: "run_changed"});
@@ -1627,34 +1834,22 @@
       sessionStorage.removeItem(`bridge.${key}`);
   }
 
-  async function tick(trigger = "setInterval") {
-    if (trigger === "setInterval" && !busy) clearQueuedAssistantWaitTick();
-    const waitDiag = assistantWaitDiagnostic;
-    if (waitDiag?.active) {
-      const tickAt = Date.now();
-      const tickMessages = assistantMessages();
-      const tickUnits = tickMessages.length ? [] : visibleContentSearchUnits();
-      const tickLatest = tickMessages.at(-1) || tickUnits.at(-1) || null;
-      record("assistant_wait_tick", {reportId: waitDiag.reportId,
-        elapsedMs: tickAt - waitDiag.startedAt,
-        tickGapMs: waitDiag.lastTickAt ? tickAt - waitDiag.lastTickAt : 0,
-        cardFirstSeen: !!waitDiag.cardFirstSeen,
-        assistantTurnDetected: !!waitDiag.turnDetected,
-        replyCompleted: !!waitDiag.replyCompleted,
-        visibilityState: document.visibilityState || "unknown",
-        busy,
-        method: trigger,
-        ...assistantWaitSelectionDiagnostics(waitDiag, tickMessages, tickLatest)});
-      waitDiag.lastTickAt = tickAt;
-    }
+  async function tick(trigger = "manual") {
+    if (automaticLoopStopped && trigger !== "manual" && trigger !== "flow_started") return;
     if (busy) {
-      recordAssistantWaitCheckpoint(waitDiag, "tick_busy");
+      if (trigger !== "setInterval") pageCheckQueued = true;
       return;
     }
+    if (trigger === "setInterval" && Date.now() < nextAutomaticCheckAt) return;
+    if (trigger === "manual") invalidatePageScan();
+    clearQueuedAssistantWaitTick();
     busy = true;
+    const epoch = flowEpoch;
+    let pass = null;
     let pendingAutomaticInstructionId = "";
     try {
       const config = await bridgeSettings();
+      if (epoch !== flowEpoch) return;
       if (!config.bound) {
         recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_unbound");
         const bar = document.getElementById("codex-bridge-status");
@@ -1662,6 +1857,7 @@
         return;
       }
       const state = await api("/state");
+      if (epoch !== flowEpoch) return;
       syncRun(state);
       if (state.phase !== lastPhase) {
         lastPhase = state.phase;
@@ -1683,18 +1879,33 @@
       if (state.phase === "report_ready") {
         recordAssistantWaitCheckpoint(assistantWaitDiagnostic, "bridge_phase", {phase: state.phase});
         status("正在处理 Codex 最终报告，核对 ChatGPT 发送状态");
-        await sendReport(state.report, state.reportId, config); return;
+        await sendReport(state.report, state.reportId, config, epoch); return;
       }
       if (document.visibilityState === "hidden" && !assistantWaitDiagnostic?.active) {
         status("ChatGPT 标签页在后台；恢复可见后继续自动检查");
         return;
       }
+      pass = {texts: new WeakMap(), visibility: new WeakMap(),
+        cardScans: 0, cardCacheHits: 0, cardScanMs: 0};
+      scanPass = pass;
       const messages = assistantMessages();
       const unitFallback = messages.length === 0;
       const units = unitFallback ? visibleContentSearchUnits() : [];
       const latest = messages.at(-1) || units.at(-1);
+      observeLatestAssistant(latest || null);
       const wait = assistantWaitDiagnostic?.active ? assistantWaitDiagnostic : null;
+      if (wait) {
+        const tickAt = Date.now();
+        record("assistant_wait_tick", {reportId: wait.reportId,
+          elapsedMs: tickAt - wait.startedAt,
+          tickGapMs: wait.lastTickAt ? tickAt - wait.lastTickAt : 0,
+          cardFirstSeen: !!wait.cardFirstSeen, assistantTurnDetected: !!wait.turnDetected,
+          replyCompleted: !!wait.replyCompleted, visibilityState: document.visibilityState || "unknown",
+          busy: false, method: trigger, ...assistantWaitSelectionDiagnostics(wait, messages, latest)});
+        wait.lastTickAt = tickAt;
+      }
       if (!latest) {
+        deferEmptyCardCheck();
         if (wait) record("assistant_wait_blocked", {reportId: wait.reportId,
           elapsedMs: Date.now() - wait.startedAt, reason: "no_content",
           visibilityState: document.visibilityState || "unknown"}, `assistant_wait_blocked:${wait.reportId}:no_content`);
@@ -1704,6 +1915,7 @@
         status("等待 ChatGPT 内容区域出现"); return;
       }
       const generating = isGenerating();
+      pageIsGenerating = generating;
       if (wait) {
         if (!wait.cardFirstSeen && !wait.initialAssistantStateLogged) {
           wait.initialAssistantStateLogged = true;
@@ -1780,11 +1992,13 @@
       }
       const text = messageText(latest);
       if (!text) {
+        deferEmptyCardCheck();
         recordAssistantWaitCheckpoint(wait, "empty_assistant_text", {phase: state.phase,
           assistantMessageCount: messages.length, latestTextLength: 0, isGenerating: false});
         status("等待 ChatGPT 回复内容"); return;
       }
       if (wait && !assistantWaitCanScan(wait)) {
+        deferEmptyCardCheck();
         recordAssistantWaitCheckpoint(wait, "waiting_for_new_assistant_turn", {
           assistantMessageCount: messages.length,
           latestTextLength: text.length,
@@ -1897,6 +2111,7 @@
           mutationObserverUsed: true}, `page_stability_wait_ended:${wait.reportId}:${wait.stabilityStartedAt}`);
       }
       if (signature === lastSubmitted) {
+        deferEmptyCardCheck();
         recordAssistantWaitCheckpoint(wait, "signature_already_submitted", {phase: state.phase,
           stableElapsedMs, latestTextLength: text.length, isGenerating: false});
         status("已处理当前指令，等待 ChatGPT 新回复"); return;
@@ -1930,7 +2145,11 @@
         wait.pendingSubmitAt = 0;
       }
       if (!unitFallback && STOP.test(text)) {
+        scanPass = null;
+        if (epoch !== flowEpoch) return;
         await api("/stop", "POST", {reason: text.slice(0, 400), runId});
+        if (epoch !== flowEpoch) return;
+        stopAutomaticLoop();
         status("ChatGPT 表示任务完成或需要人工处理，已停止"); return;
       }
       const title = new RegExp(config.title || DEFAULT_TITLE.source, "i");
@@ -1962,20 +2181,23 @@
         reason: found.instruction ? "matched" : "not_matched"}, `card_scan:${signature}`);
       if (unitFallback) {
         if (!found.instruction) {
+          deferEmptyCardCheck();
           status("等待当前回复中出现新的指令卡片");
           return;
         }
       }
       if (!found.instruction) {
+        deferEmptyCardCheck();
         if (found.choices?.length > 1) {
           status(`找到 ${found.choices.length} 张不同的指令卡片；请在扩展弹窗选择`, true);
           return;
         }
-        status(`${found.error}；可在扩展弹窗查看并人工选择卡片`, true); return;
+        status(`${found.error}；等待页面更新，或在扩展弹窗重新检查并人工选择卡片`, true); return;
       }
       const id = instructionId(found.instruction, latest);
       const instructionState = instructionStates.get(id);
       if (instructionState) {
+        deferEmptyCardCheck();
         if (instructionState === "pending") {
           status("指令请求结果待确认；为避免重复投递，自动重试已暂停", true);
           return;
@@ -1985,7 +2207,10 @@
         status("当前指令卡片已处理，等待新卡片");
         return;
       }
+      emptyCardChecks = 0;
+      nextAutomaticCheckAt = 0;
       const codexInstruction = formatCodexInstruction(found.instruction);
+      if (epoch !== flowEpoch) return;
       setInstructionState(id, "pending");
       pendingAutomaticInstructionId = id;
       if (wait) {
@@ -1997,10 +2222,12 @@
         wait.active = false;
         disconnectAssistantWaitObserver();
       }
+      scanPass = null;
       await api("/instruction", "POST", {instruction: codexInstruction, instructionId: id,
         runId});
       setInstructionState(id, "seen");
       pendingAutomaticInstructionId = "";
+      if (epoch !== flowEpoch) return;
       record("card_submit", {instructionLength: found.instruction.length});
       lastSubmitted = signature;
       sessionStorage.setItem("bridge.lastSubmitted", signature);
@@ -2008,24 +2235,59 @@
         ? "已自动识别并发送最新的未处理指令卡片"
         : "指令卡片已送往 Codex");
     } catch (error) {
+      if (epoch !== flowEpoch) return;
       if (/Extension context invalidated/i.test(String(error))) {
         stopInvalidatedScript();
         return;
       }
       const details = errorDiagnostics(error);
+      deferEmptyCardCheck();
       record("tick_error", {...details,
         stage: error?.bridgeReportStage || "automatic_tick",
         ...(Number.isFinite(Number(error?.reportId)) ? {reportId: Number(error.reportId)} : {})});
       status(String(error), true);
     } finally {
+      if (pass && epoch === flowEpoch) {
+        scanMetrics.checkCount += 1;
+        scanMetrics.cardParseCount += pass.cardScans;
+        scanMetrics.cardCacheHits += pass.cardCacheHits;
+        scanMetrics.cardParseMs += pass.cardScanMs;
+        if (Date.now() - lastScanMetricsAt >= LOG_REPEAT_INTERVAL_MS) {
+          record("scan_metrics", {...scanMetrics,
+            cardParseMs: Math.round(scanMetrics.cardParseMs * 1000) / 1000,
+            pollDelayMs: Math.max(0, nextAutomaticCheckAt - Date.now())});
+          scanMetrics = {checkCount: 0, cardParseCount: 0, cardCacheHits: 0, cardParseMs: 0};
+          lastScanMetricsAt = Date.now();
+        }
+      }
+      scanPass = null;
       busy = false;
-      drainQueuedAssistantWaitTick();
-      drainQueuedReportWake();
+      if (epoch === flowEpoch) {
+        drainQueuedAssistantWaitTick();
+        drainQueuedReportWake();
+        if (pageCheckQueued) { pageCheckQueued = false; schedulePageCheck(); }
+      }
     }
   }
   function stopAutomaticLoop() {
+    flowEpoch += 1;
+    automaticLoopStopped = true;
     if (tickInterval !== null) clearInterval(tickInterval);
     tickInterval = null;
+    if (pageWakeTimer !== null) clearTimeout(pageWakeTimer);
+    pageWakeTimer = null;
+    pageCheckQueued = false;
+    pageIsGenerating = false;
+    pageObserver?.disconnect();
+    focusedPageObserver?.disconnect();
+    pageObserver = null;
+    focusedPageObserver = null;
+    observedAssistant = null;
+    cardScanCache = new WeakMap();
+    signatureFingerprints.clear();
+    scanMetrics = {checkCount: 0, cardParseCount: 0, cardCacheHits: 0, cardParseMs: 0};
+    lastScanMetricsAt = 0;
+    invalidatePageScan();
     clearQueuedAssistantWaitTick();
     assistantWaitLastWakeAt = 0;
     reportWakeQueued = false;
@@ -2034,15 +2296,26 @@
   }
 
   function startAutomaticLoop(trigger = "setInterval") {
+    automaticLoopStopped = false;
+    invalidatePageScan();
+    startPageObserver();
     if (tickInterval !== null) return tick(trigger).then(() => false);
-    tickInterval = setInterval(tick, 2000);
+    tickInterval = setInterval(() => { void tick("setInterval"); }, 2000);
     return tick(trigger).then(() => true);
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible" || !assistantWaitDiagnostic?.active) return;
+    if (document.visibilityState !== "visible" || automaticLoopStopped) return;
+    invalidatePageScan();
+    if (!assistantWaitDiagnostic?.active) { schedulePageCheck(); return; }
     assistantWaitLastWakeAt = 0;
     requestAssistantWaitTick("visibility_visible");
+  });
+
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== "local" || !["connections", "title", "card"].some(key => key in changes)) return;
+    invalidatePageScan();
+    schedulePageCheck();
   });
 
   void startAutomaticLoop("script_started");

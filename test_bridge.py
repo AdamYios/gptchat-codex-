@@ -89,6 +89,35 @@ class BridgeTests(unittest.TestCase):
                 create_bridge_server(8766, object(), False)
         factory.assert_called_once()
 
+    def test_default_port_falls_back_when_access_is_denied(self):
+        denied = OSError(errno.EACCES, "excluded port")
+        windows_denied = OSError("Windows excluded port")
+        windows_denied.winerror = 10013
+        for error in (denied, windows_denied):
+            with self.subTest(error=error):
+                fallback_server = SimpleNamespace(server_address=("127.0.0.1", 49152))
+                with patch("bridge.BridgeHTTPServer", side_effect=[error, fallback_server]) as factory:
+                    server, auto_selected = create_bridge_server(8765, object(), True)
+                self.assertIs(server, fallback_server)
+                self.assertTrue(auto_selected)
+                self.assertEqual(factory.call_args_list[1].args[0], ("127.0.0.1", 0))
+
+    def test_explicit_denied_port_does_not_silently_change(self):
+        error = OSError(errno.EACCES, "excluded port")
+        with patch("bridge.BridgeHTTPServer", side_effect=error) as factory:
+            with self.assertRaises(OSError) as raised:
+                create_bridge_server(8765, object(), False)
+        self.assertIs(raised.exception, error)
+        factory.assert_called_once()
+
+    def test_unrelated_bind_error_does_not_trigger_fallback(self):
+        error = OSError(errno.EBADF, "bad descriptor")
+        with patch("bridge.BridgeHTTPServer", side_effect=error) as factory:
+            with self.assertRaises(OSError) as raised:
+                create_bridge_server(8765, object(), True)
+        self.assertIs(raised.exception, error)
+        factory.assert_called_once()
+
     def test_default_port_falls_back_when_another_local_server_owns_it(self):
         first = create_bridge_server(0, BaseHTTPRequestHandler, False)[0]
         try:

@@ -27,6 +27,7 @@ const LOG_FIELDS = new Set([
   "signatureChangeCount", "signatureLength", "unitKeyLength",
   "latestTextLength", "assistantMessageCount", "previousStableElapsedMs", "cardFirstSeen",
   "replyCompleted", "lastContentChangeAt", "stabilityStartedAt", "assistantContentMutationCount",
+  "checkCount", "cardParseCount", "cardCacheHits", "cardParseMs", "pollDelayMs",
   "composerText", "errorName", "errorMessage", "errorStack"
 ]);
 let logQueue = Promise.resolve();
@@ -342,6 +343,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const tabId = Number(message.tabId);
       const connection = await getConnection(tabId);
       if (!connection) throw new Error("当前标签页没有绑定桥接任务");
+      if (message.type === "bridgeTaskStopped") {
+        try { await chrome.tabs.sendMessage(tabId, {type: "bridgeFlowStopped"}); }
+        catch { /* A missing content script will observe stopped on its next load. */ }
+      }
       await updateConnectionStopped(connection, message.type === "bridgeTaskStopped");
       await ensureReportWakeAlarm();
       return {ok: true};
