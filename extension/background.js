@@ -381,7 +381,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         "connections", "tabId", "port", "token", "title", "card"
       ]);
       const connections = connectionMap(config);
+      const previous = connections[String(tabId)];
+      if (Object.prototype.hasOwnProperty.call(message, "expectedConnection")) {
+        const expected = message.expectedConnection;
+        if (expected ? (!previous || previous.port !== expected.port || previous.token !== expected.token) : previous)
+          throw new Error("标签页绑定已变化，请重新打开扩展后再连接");
+      }
+      const duplicate = Object.entries(connections).find(([id, item]) => id !== String(tabId) &&
+        ((item.port === connection.port && item.token === connection.token) ||
+         (connection.threadId && item.threadId === connection.threadId)));
+      if (duplicate) throw new Error(`此桥接或 Codex 任务已绑定到标签页 ${duplicate[0]}`);
       const key = connectionLogKey(connection);
+      const replacedKey = previous && connectionLogKey(previous) !== key ? connectionLogKey(previous) : null;
       const detachedKey = detachedLogKey(tabId);
       const singletonTabId = Number(config.tabId);
       const hasSingleton = Number.isInteger(singletonTabId) && config.port && config.token &&
@@ -393,8 +404,14 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         ? connectionLogKey(previousLegacy || replacedLegacy) : null;
       const keys = [key, detachedKey, LEGACY_LOG_KEY];
       if (previousLegacyKey) keys.push(previousLegacyKey);
+      if (replacedKey) keys.push(replacedKey);
       const stored = await chrome.storage.local.get(keys);
-      const detached = Array.isArray(stored[detachedKey]) ? stored[detachedKey] : [];
+      const detached = [
+        ...(Array.isArray(stored[detachedKey]) ? stored[detachedKey] : []),
+        ...(replacedKey && !replacedLegacy && Array.isArray(stored[replacedKey])
+          ? stored[replacedKey].map(entry => entry.taskId || !previous.threadId
+            ? entry : {...entry, taskId: previous.threadId}) : [])
+      ];
       const detachedForTask = connection.threadId
         ? detached.filter(entry => entry.taskId === connection.threadId) : [];
       const detachedForOtherTasks = detached.filter(entry => !detachedForTask.includes(entry));
@@ -403,10 +420,16 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
           ? stored[LEGACY_LOG_KEY] : []),
         ...(Number(config.tabId) === tabId && previousLegacyKey && Array.isArray(stored[previousLegacyKey])
           ? stored[previousLegacyKey] : [])
-      ].map(entry => entry.taskId || !connection.threadId ? entry : {...entry, taskId: connection.threadId});
+      ].map(entry => {
+        const sameEndpoint = previous?.port === connection.port && previous?.token === connection.token;
+        const taskId = replacedKey && !sameEndpoint ? previous?.threadId : connection.threadId;
+        return entry.taskId || !taskId ? entry : {...entry, taskId};
+      });
+      const legacyForTask = legacyPending.filter(entry => entry.taskId === connection.threadId && connection.threadId);
+      detachedForOtherTasks.push(...legacyPending.filter(entry => !legacyForTask.includes(entry)));
       const pending = [
         ...detachedForTask,
-        ...legacyPending,
+        ...legacyForTask,
         ...(Array.isArray(stored[key]) ? stored[key] : [])
       ].slice(-LOG_LIMIT);
       if (Number(config.tabId) && Number(config.tabId) !== tabId &&
@@ -417,10 +440,13 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         ].slice(-LOG_LIMIT)});
       }
       if (pending.length) await chrome.storage.local.set({[key]: pending});
-      if (detachedForOtherTasks.length) await chrome.storage.local.set({[detachedKey]: detachedForOtherTasks});
+      if (detachedForOtherTasks.length) await chrome.storage.local.set({[detachedKey]: detachedForOtherTasks.slice(-LOG_LIMIT)});
       else await chrome.storage.local.remove(detachedKey);
       if (Array.isArray(stored[LEGACY_LOG_KEY])) await chrome.storage.local.remove(LEGACY_LOG_KEY);
-      if (replacedLegacy && previousLegacyKey) await chrome.storage.local.remove(previousLegacyKey);
+      if (replacedKey) {
+        await chrome.storage.local.remove(replacedKey);
+        await updateConnectionStopped(previous, false);
+      }
       await updateConnectionStopped(connection, false);
       connections[String(tabId)] = connection;
       await saveConnectionMap(config, connections);

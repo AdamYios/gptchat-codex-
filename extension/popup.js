@@ -49,10 +49,23 @@ async function connectionFor(tabId) {
 
 async function bridgeApi(path, method = "GET", body, connection) {
   if (!connection?.port || !connection?.token) throw new Error("当前标签页尚未绑定桥接任务");
-  const response = await fetch(`http://127.0.0.1:${connection.port}${path}`, {
-    method, headers: {"Content-Type": "application/json", "X-Bridge-Token": connection.token},
-    body: body ? JSON.stringify(body) : undefined
-  });
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${connection.port}${path}`, {
+      method, headers: {"Content-Type": "application/json", "X-Bridge-Token": connection.token},
+      body: body ? JSON.stringify(body) : undefined,
+      ...(path === "/state" ? {signal: AbortSignal.timeout(4000)} : {})
+    });
+  } catch (cause) {
+    const error = new Error("无法连接桥接器，可能已退出或连接超时", {cause});
+    error.connectionUnavailable = true;
+    throw error;
+  }
+  if (response.status === 403) {
+    const error = new Error("桥接令牌已失效，请使用终端最新的连接信息");
+    error.connectionUnavailable = true;
+    throw error;
+  }
   const data = await response.json();
   if (!response.ok) {
     if (response.status === 404 && path === "/start")
@@ -201,7 +214,7 @@ async function show() {
       }
       recoveryActions.hidden = state.phase !== "report_ready" || !state.reportId;
     } catch (error) {
-      $("status").textContent = `已保存的桥接连接无响应：${error}`;
+      $("status").textContent = `已保存的桥接连接无响应：${error.message || error}。重启后可直接填写新连接信息并绑定，无需先解除旧绑定。`;
     }
   }
 
@@ -213,7 +226,7 @@ async function show() {
     try { title = (await chrome.tabs.get(Number(tabId))).title || title; } catch { title += "（已关闭）"; }
     let stateLabel = "桥接无响应";
     try { stateLabel = phaseLabel(await bridgeApi("/state", "GET", undefined, connection)); }
-    catch (error) { stateLabel = String(error); }
+    catch (error) { stateLabel = `未连接 · ${error.message || error}`; }
     return makeConnectionRow(tabId, connection, title, stateLabel);
   }));
   for (const row of rows) list.appendChild(row);
@@ -259,8 +272,14 @@ async function refreshActiveTaskState() {
     $("taskPhase").textContent = phaseLabel(state);
     $("endFlow").disabled = false;
     $("reportRecoveryActions").hidden = state.phase !== "report_ready" || !state.reportId;
-  } catch {
-    // A transient state request failure should not replace the user's current popup feedback.
+  } catch (error) {
+    $("connectionConfigSection").hidden = false;
+    $("currentTaskSection").hidden = true;
+    $("startSection").hidden = true;
+    $("reportRecoveryActions").hidden = true;
+    $("endFlow").disabled = true;
+    $("startSelected").disabled = true;
+    $("status").textContent = `桥接连接中断：${error.message || error}。可直接填写重启后的新连接信息并绑定。`;
   } finally {
     refreshingActiveTask = false;
   }
@@ -323,9 +342,6 @@ $("bind").onclick = async () => {
   catch (error) { $("status").textContent = String(error); return; }
   const connections = await readConnections();
   const existing = connections[String(tab.id)];
-  if (existing && (existing.port !== endpoint.port || existing.token !== endpoint.token)) {
-    $("status").textContent = "此标签页已绑定另一项任务；请先解除当前绑定，再绑定新任务"; return;
-  }
   const duplicate = Object.entries(connections).find(([id, connection]) =>
     id !== String(tab.id) && connection.port === endpoint.port && connection.token === endpoint.token);
   if (duplicate) {
@@ -333,25 +349,45 @@ $("bind").onclick = async () => {
     return;
   }
   try {
+    $("bind").disabled = true;
+    $("status").textContent = "正在检查新连接和已有绑定…";
     const state = await bridgeApi("/state", "GET", undefined, endpoint);
+    const replacing = existing && (existing.port !== endpoint.port || existing.token !== endpoint.token);
+    if (replacing) {
+      let oldOnline = false;
+      try {
+        await bridgeApi("/state", "GET", undefined, existing);
+        oldOnline = true;
+      } catch (error) {
+        if (!error.connectionUnavailable)
+          throw new Error(`无法确认旧桥接已失效，暂不替换：${error.message || error}`);
+      }
+      if (oldOnline)
+        throw new Error("此标签页的旧桥接仍在线；请先关闭旧桥接，或手动解除绑定后切换任务");
+    }
     const duplicateTask = Object.entries(connections).find(([id, connection]) =>
       id !== String(tab.id) && state.threadId && connection.threadId === state.threadId);
     if (duplicateTask)
       throw new Error(`Codex 任务 ${state.threadId} 已绑定到标签页 ${duplicateTask[0]}；每个任务请使用独立 Codex 任务`);
     await ensureContent(tab.id);
-    const connection = {...(existing || {}), id: connectionId(endpoint.port, endpoint.token),
+    const keepSettings = existing && (!existing.threadId || existing.threadId === state.threadId);
+    const connection = {...(keepSettings ? existing : {}), id: connectionId(endpoint.port, endpoint.token),
       tabId: tab.id, port: endpoint.port, token: endpoint.token,
       threadId: state.threadId || "",
       boundAt: new Date().toISOString()};
-    const result = await chrome.runtime.sendMessage({type: "bridgeBind", connection});
+    const result = await chrome.runtime.sendMessage({type: "bridgeBind", connection,
+      expectedConnection: existing ? {port: existing.port, token: existing.token} : null});
     if (!result?.ok) throw new Error(result?.error || "保存桥接绑定失败");
     recordPopup("bind_ok", {phase: state.phase}, tab.id);
     await notifyPage("绑定 ChatGPT 标签页：已完成", false, tab.id);
     $("connectionCode").value = "";
     await show();
+    if (replacing) $("status").textContent = "已替换失效的旧绑定；请选择起点继续流程。";
   } catch (error) {
     recordPopup("bind_error", {reason: popupErrorReason(error)}, tab.id);
     $("status").textContent = String(error);
+  } finally {
+    $("bind").disabled = false;
   }
 };
 
