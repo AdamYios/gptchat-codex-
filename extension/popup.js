@@ -7,8 +7,17 @@ const PHASE_HELP = {
   stopped: "当前流程已结束，可选择新起点",
 };
 const CHAT_URL = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//;
+const CODEX_STAGE_HELP = {
+  submitting: "正在投递，尚未确认开始执行",
+  queued: "已入队，等待启动",
+  queue_stalled: "排队停滞，仍在等待原指令",
+  running: "Codex 已开始执行",
+  execution_overdue: "执行等待超时，仍在跟踪原指令",
+  monitor_error: "历史读取暂时失败，仍在跟踪原指令"
+};
 function phaseLabel(state) {
-  const help = PHASE_HELP[state.phase] || "未知状态，请检查桥接器输出";
+  const help = (state.phase === "codex_running" && CODEX_STAGE_HELP[state.codexStage]) ||
+    PHASE_HELP[state.phase] || "未知状态，请检查桥接器输出";
   const round = state.phase === "await_instruction" && state.round === 0
     ? "尚未投递第一条指令" : `第 ${state.round} 轮`;
   return `${state.phase} · ${round}${state.detail ? ` · ${state.detail}` : ""} · ${help}`;

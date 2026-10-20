@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 5 * 60 * 60
+DEFAULT_QUEUE_TIMEOUT_SECONDS = 120
+QUEUE_WAKE_AFTER_SECONDS = 15
 SESSION_LIST_LIMIT = 10
 
 
@@ -277,14 +279,18 @@ def history_database():
     return databases[0]
 
 
-def latest_turn(thread_id: str):
-    """Return the newest turn and its persisted input/final items, if present."""
+def latest_turn(thread_id: str, after_ordinal: int | None = None):
+    """Read the newest turn, or the first user turn after a submission baseline."""
     database = history_database()
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+        order = "DESC" if after_ordinal is None else "ASC"
+        condition = ("" if after_ordinal is None else
+                     " AND rollout_ordinal > ? AND first_user_item_id IS NOT NULL")
+        parameters = (thread_id,) if after_ordinal is None else (thread_id, after_ordinal)
         row = conn.execute(
             "SELECT turn_id, rollout_ordinal, status, first_user_item_id, final_agent_item_id, error_json "
-            "FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1",
-            (thread_id,),
+            f"FROM thread_turns WHERE thread_id = ?{condition} ORDER BY rollout_ordinal {order} LIMIT 1",
+            parameters,
         ).fetchone()
         if row is None:
             return None
@@ -315,6 +321,14 @@ def user_item_text(item):
         return None
     return "\n".join(part.get("text", "") for part in item.get("content", [])
                      if part.get("type") == "text").strip()
+
+
+def open_codex_thread(thread_id: str):
+    """Ask Desktop to open an existing thread, without submitting another turn."""
+    thread_id = str(uuid.UUID(thread_id))
+    if os.name != "nt":
+        raise OSError("自动打开 Codex 会话目前仅支持 Windows，请手动打开目标会话")
+    os.startfile(f"codex://threads/{thread_id}")
 
 
 def local_sessions(thread_id: str | None = None):
@@ -460,12 +474,16 @@ def probe_codex_executable(executable: str, cwd: Path):
 
 class Bridge:
     def __init__(self, thread_id: str, cwd: Path, codex: str, max_rounds: int, timeout: int,
-                 event_log: EventLog | None = None):
+                 event_log: EventLog | None = None, *,
+                 queue_timeout: int = DEFAULT_QUEUE_TIMEOUT_SECONDS, auto_wake: bool = True):
         self.thread_id = thread_id
         self.cwd = cwd
         self.codex = codex
         self.max_rounds = max_rounds
         self.timeout = timeout
+        self.queue_timeout = queue_timeout
+        self.auto_wake = auto_wake
+        self.codex_stage = "idle"
         self.run_id = secrets.token_hex(8)
         self.lock = threading.Lock()
         self.phase = "setup"
@@ -504,6 +522,7 @@ class Bridge:
             self.report_id = 1 if initial else 0
             self.detail = ""
             self.last_instruction = ""
+            self.codex_stage = "idle"
             self.phase = "report_ready" if mode == "B" else "await_instruction"
         self.log("start", {"mode": mode, "phase": self.phase})
         if initial:
@@ -517,7 +536,8 @@ class Bridge:
             return {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
                     "report": self.report if self.phase == "report_ready" else "",
                     "reportId": self.report_id, "detail": self.detail,
-                    "codexInProgress": self.active_codex_run_id is not None}
+                    "codexInProgress": self.active_codex_run_id is not None,
+                    "codexStage": self.codex_stage}
 
     def submit(self, instruction: str, run_id: str, instruction_id: str = "") -> bool:
         instruction = instruction.strip()
@@ -557,6 +577,8 @@ class Bridge:
                     self.detail = "已达到最大轮数"
                     raise ValueError(self.detail)
                 self.phase = "codex_running"
+                self.codex_stage = "submitting"
+                self.detail = "正在将指令投递到 Codex 队列，尚未确认开始执行"
                 self.round += 1
                 self.last_instruction = instruction
                 number = self.round
@@ -570,6 +592,14 @@ class Bridge:
         self.log("instruction_accepted", {"round": number, "instructionLength": len(instruction),
                                            "instructionId": instruction_id or None})
         return True
+
+    def update_codex_wait(self, run_id: str, number: int, stage: str, detail: str):
+        with self.lock:
+            if self.run_id != run_id or self.round != number or self.phase != "codex_running":
+                return False
+            self.codex_stage = stage
+            self.detail = detail
+            return True
 
     def run_codex(self, instruction: str, number: int, run_id: str | None = None):
         run_id = self.run_id if run_id is None else run_id
@@ -586,21 +616,36 @@ class Bridge:
             if proc.returncode != 0:
                 raise RuntimeError(f"向原 Codex 任务投递指令失败（退出码 {proc.returncode}）："
                                    f"{(proc.stderr or proc.stdout).strip()[-1500:]}")
-            print(f"第 {number} 轮：指令已投递到原 Codex 任务，等待最终回复", flush=True)
+            print(f"第 {number} 轮：指令已入队，尚未确认 Codex 开始执行", flush=True)
             self.log("instruction_queued", {"round": number})
-            deadline = time.monotonic() + self.timeout
-            while time.monotonic() < deadline:
-                turn = latest_turn(self.thread_id)
-                if not turn or turn["ordinal"] <= start_ordinal:
+            queued_at = time.monotonic()
+            started_at = None
+            wake_attempted = False
+            wake_detail = ""
+            queue_warned = False
+            execution_warned = False
+            read_warned = False
+            self.update_codex_wait(run_id, number, "queued", "指令已入队，等待 Codex 开始执行；请勿重复投递")
+            while True:
+                try:
+                    # Follow the first new turn, not whichever unrelated message
+                    # happens to be newest when Desktop wakes or history catches up.
+                    turn = latest_turn(self.thread_id, start_ordinal)
+                except (sqlite3.Error, OSError, RuntimeError, json.JSONDecodeError) as exc:
+                    self.update_codex_wait(run_id, number, "monitor_error",
+                        "暂时无法读取 Codex 执行历史，仍在跟踪原指令；请勿重复投递")
+                    if not read_warned:
+                        self.log("codex_history_unavailable", {"round": number, "errorType": type(exc).__name__})
+                        read_warned = True
                     time.sleep(2)
                     continue
-                submitted = user_item_text(turn["user"])
-                if submitted is None:
-                    time.sleep(2)
-                    continue
-                if submitted != instruction:
+                read_warned = False
+                now = time.monotonic()
+                submitted = user_item_text(turn["user"]) if turn and turn["ordinal"] > start_ordinal else None
+                if submitted is not None and submitted != instruction:
                     raise RuntimeError("目标任务收到另一条用户消息，无法确认本轮归属；已停止自动转发")
-                if turn["status"] == "completed":
+                matched = submitted == instruction
+                if matched and turn["status"] == "completed":
                     final = turn["final"]
                     report = (final or {}).get("text", "").strip()
                     if (final or {}).get("type") != "agentMessage" or (final or {}).get("phase") != "final_answer" or not report:
@@ -609,6 +654,7 @@ class Bridge:
                     with self.lock:
                         if self.active_codex_run_id == run_id:
                             self.active_codex_run_id = None
+                            self.codex_stage = "completed"
                         if self.run_id == run_id and self.phase == "codex_running" and self.round == number:
                             self.report = report
                             self.report_id += 1
@@ -625,14 +671,59 @@ class Bridge:
                                               "conversationOutput": report,
                                               "contentSha256": content_sha256(report)})
                     return
-                if turn["status"] not in ("inProgress", "pending"):
+                if matched and turn["status"] not in ("inProgress", "pending"):
                     raise RuntimeError(f"Codex 本轮未完成（状态 {turn['status']}）：{turn['error'] or ''}")
+                if matched and turn["status"] == "inProgress" and started_at is None:
+                    started_at = now
+                    self.log("codex_started", {"round": number, "elapsedMs": int((now - queued_at) * 1000)})
+                    print(f"第 {number} 轮：已确认 Codex 开始执行", flush=True)
+                if started_at is None:
+                    waiting = now - queued_at
+                    # Opening a deep link is a one-shot Desktop wake request,
+                    # never another queue/add or turn/start. Stop suppresses it.
+                    if self.auto_wake and not wake_attempted and waiting >= QUEUE_WAKE_AFTER_SECONDS:
+                        with self.lock:
+                            may_wake = (self.run_id == run_id and self.round == number
+                                        and self.phase == "codex_running")
+                            if may_wake:
+                                wake_attempted = True
+                                try:
+                                    open_codex_thread(self.thread_id)
+                                    wake_detail = "；已请求打开目标 Codex 会话，等待实际启动"
+                                    wake_event = "codex_wake_requested"
+                                except (OSError, ValueError, NotImplementedError):
+                                    wake_detail = "；自动打开会话失败，请手动打开目标 Codex 会话"
+                                    wake_event = "codex_wake_failed"
+                        if may_wake:
+                            self.log(wake_event, {"round": number})
+                    if waiting >= self.queue_timeout:
+                        self.update_codex_wait(run_id, number, "queue_stalled",
+                            f"指令已入队超过 {self.queue_timeout} 秒，但尚未确认开始执行；"
+                            "请打开目标 Codex 会话检查，桥接仍在等待原指令，请勿重复投递" + wake_detail)
+                        if not queue_warned:
+                            queue_warned = True
+                            self.log("codex_queue_stalled", {"round": number, "elapsedMs": int(waiting * 1000)})
+                            print(f"第 {number} 轮：排队停滞，仍在等待原指令；请打开目标 Codex 会话", flush=True)
+                    else:
+                        self.update_codex_wait(run_id, number, "queued",
+                            "指令已入队，等待 Codex 开始执行；请勿重复投递" + wake_detail)
+                elif now - started_at >= self.timeout:
+                    self.update_codex_wait(run_id, number, "execution_overdue",
+                        f"Codex 已开始执行，等待最终报告超过 {self.timeout} 秒；"
+                        "桥接仍在跟踪原指令，完成后会接收报告，请勿重复投递")
+                    if not execution_warned:
+                        execution_warned = True
+                        self.log("codex_execution_overdue", {"round": number,
+                            "elapsedMs": int((now - started_at) * 1000)})
+                        print(f"第 {number} 轮：执行等待超时，继续跟踪原指令，请勿重复投递", flush=True)
+                else:
+                    self.update_codex_wait(run_id, number, "running", "Codex 已开始执行，等待最终报告")
                 time.sleep(2)
-            raise RuntimeError(f"等待 Codex 最终报告超过 {self.timeout} 秒；指令可能仍在原任务中执行，请勿重复投递")
         except Exception as exc:
             with self.lock:
                 if self.active_codex_run_id == run_id:
                     self.active_codex_run_id = None
+                    self.codex_stage = "failed"
                 if self.run_id == run_id and self.phase == "codex_running" and self.round == number:
                     self.phase = "stopped"
                     self.detail = f"{exc}（Codex 程序：{self.codex}；任务 ID：{self.thread_id}）"
@@ -775,7 +866,11 @@ def main():
     parser.add_argument("--max-rounds", type=int, default=None,
                         help="可选：设置桥接流程最大轮数；默认不限轮数")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TURN_TIMEOUT_SECONDS,
-                        help="每轮 Codex 最长等待秒数（默认 18000，即 5 小时）")
+                        help="确认开始执行后的报告等待告警秒数（默认 18000）；超时仍跟踪原指令")
+    parser.add_argument("--queue-timeout", type=int, default=DEFAULT_QUEUE_TIMEOUT_SECONDS,
+                        help="排队未启动告警秒数（默认 120）；告警后仍跟踪原指令")
+    parser.add_argument("--no-auto-wake", action="store_true",
+                        help="禁用排队 15 秒后自动打开目标 Codex 桌面会话")
     parser.add_argument("--list-tasks", action="store_true", help="仅列出本机任务，不启动桥接或发送消息")
     start = parser.add_mutually_exclusive_group()
     start.add_argument("--initial-report-file", type=Path, help="首次启动时要发给 ChatGPT 的既有 Codex 最终报告")
@@ -789,8 +884,9 @@ def main():
         except RuntimeError as exc:
             parser.error(str(exc))
         return
-    if (args.max_rounds is not None and args.max_rounds < 1) or args.timeout < 1:
-        parser.error("max-rounds（若指定）和 timeout 必须为正数")
+    if ((args.max_rounds is not None and args.max_rounds < 1)
+            or args.timeout < 1 or args.queue_timeout < 1):
+        parser.error("max-rounds（若指定）、timeout 和 queue-timeout 必须为正数")
     if args.port is not None and not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     try:
@@ -803,7 +899,8 @@ def main():
     started_at = datetime.now().astimezone()
     log_path = task_log_path(Path(__file__).resolve().parent / "logs", title, started_at)
     event_log = EventLog(log_path, task_id=thread_id)
-    bridge = Bridge(thread_id, cwd, codex_executable, args.max_rounds, args.timeout, event_log)
+    bridge = Bridge(thread_id, cwd, codex_executable, args.max_rounds, args.timeout, event_log,
+                    queue_timeout=args.queue_timeout, auto_wake=not args.no_auto_wake)
     if args.start_from_codex_final:
         try:
             if queued_count(thread_id):
