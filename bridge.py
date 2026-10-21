@@ -232,7 +232,7 @@ def read_clipboard_text():
         user32.CloseClipboard()
 
 
-def read_latest_codex_final(thread_id: str):
+def read_latest_codex_final(thread_id: str, *, include_turn: bool = False):
     """Read the selected thread's latest completed final answer from local history."""
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     databases = sorted(codex_home.glob("thread_history_*.sqlite"), reverse=True)
@@ -263,7 +263,7 @@ def read_latest_codex_final(thread_id: str):
                 report = payload.get("text", "").strip()
                 if payload.get("type") != "agentMessage" or payload.get("phase") != "final_answer" or not report:
                     raise RuntimeError("历史记录中的最终消息格式不符合预期，已停止自动转发")
-                return report
+                return (report, turn_id) if include_turn else report
         except sqlite3.Error:
             continue
         except json.JSONDecodeError as exc:
@@ -277,6 +277,72 @@ def history_database():
     if not databases:
         raise RuntimeError("找不到本机 Codex 对话历史索引")
     return databases[0]
+
+
+def model_value(value):
+    """Only expose bounded metadata, never arbitrary rollout text in the prompt."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(c for c in value if c.isascii() and (c.isalnum() or c in "_.:/-"))[:120]
+
+
+def read_codex_model_config(thread_id: str):
+    """Read fresh task configuration; this is not proof of the serving model."""
+    unknown = {"model": "", "reasoningEffort": "", "source": "unknown"}
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    for database in sorted(codex_home.glob("state_*.sqlite"), reverse=True):
+        try:
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.25)) as conn:
+                row = conn.execute(
+                    "SELECT model, reasoning_effort, rollout_path FROM threads WHERE id = ?",
+                    (thread_id,),
+                ).fetchone()
+            if row:
+                model = model_value(row[0])
+                return {"model": model, "reasoningEffort": model_value(row[1]),
+                        "source": "state_index" if model else "unknown", "rolloutPath": row[2]}
+        except (sqlite3.Error, OSError):
+            continue
+    return unknown
+
+
+def read_codex_turn_model(thread_id: str, turn_id: str):
+    """Use the exact report turn's context, with bounded IO and no latest-turn guess."""
+    unknown = {"model": "", "reasoningEffort": "", "source": "unknown", "turnId": turn_id}
+    if not turn_id:
+        return unknown
+    try:
+        config = read_codex_model_config(thread_id)
+        if not config.get("rolloutPath"):
+            return unknown
+        with closing(sqlite3.connect(history_database().as_uri() + "?mode=ro", uri=True, timeout=0.25)) as conn:
+            row = conn.execute(
+                "SELECT rollout_byte_offset, rollout_end_byte_offset FROM thread_turns "
+                "WHERE thread_id = ? AND turn_id = ?", (thread_id, turn_id),
+            ).fetchone()
+        if not row or row[0] is None or row[0] < 0:
+            return unknown
+        # The turn context normally follows task_started. Never scan an entire long chat.
+        limit = min(2_000_000, max(0, row[1] - row[0])) if row[1] is not None else 2_000_000
+        with Path(config["rolloutPath"]).open("rb") as stream:
+            stream.seek(row[0])
+            for line in stream.read(limit).splitlines():
+                try:
+                    entry = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "turn_context":
+                    continue
+                context = entry.get("payload")
+                if not isinstance(context, dict) or context.get("turn_id") != turn_id:
+                    continue
+                model = model_value(context.get("model"))
+                return {"model": model,
+                        "reasoningEffort": model_value(context.get("effort") or context.get("reasoning_effort")),
+                        "source": "turn_context" if model else "unknown", "turnId": turn_id}
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return unknown
 
 
 def latest_turn(thread_id: str, after_ordinal: int | None = None):
@@ -491,6 +557,7 @@ class Bridge:
         self.round = 0
         self.report = ""
         self.report_id = 0
+        self.report_model = read_codex_turn_model(thread_id, "")
         self.detail = ""
         self.last_instruction = ""
         self.accepted_instruction_ids: dict[str, tuple[str, int]] = {}
@@ -512,13 +579,15 @@ class Bridge:
         # Read before changing state so a missing/incomplete final cannot discard a run.
         if mode == "B" and queued_count(self.thread_id):
             raise ValueError("目标 Codex 任务已有待处理消息；不能把上一轮报告作为当前报告发送")
-        initial = read_latest_codex_final(self.thread_id) if mode == "B" else ""
+        initial, turn_id = read_latest_codex_final(self.thread_id, include_turn=True) if mode == "B" else ("", "")
+        report_model = read_codex_turn_model(self.thread_id, turn_id)
         with self.lock:
             if self.phase == "codex_running" or self.active_codex_run_id is not None:
                 raise ValueError("Codex 本轮仍在执行；请等它结束后再开始新流程")
             self.run_id = secrets.token_hex(8)
             self.round = 0
             self.report = initial
+            self.report_model = report_model
             self.report_id = 1 if initial else 0
             self.detail = ""
             self.last_instruction = ""
@@ -533,11 +602,14 @@ class Bridge:
 
     def snapshot(self):
         with self.lock:
-            return {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
+            state = {"threadId": self.thread_id, "runId": self.run_id, "phase": self.phase, "round": self.round, "maxRounds": self.max_rounds,
                     "report": self.report if self.phase == "report_ready" else "",
                     "reportId": self.report_id, "detail": self.detail,
                     "codexInProgress": self.active_codex_run_id is not None,
-                    "codexStage": self.codex_stage}
+                    "codexStage": self.codex_stage, "reportModel": dict(self.report_model)}
+        config = read_codex_model_config(self.thread_id)
+        state["currentModel"] = {key: config[key] for key in ("model", "reasoningEffort", "source")}
+        return state
 
     def submit(self, instruction: str, run_id: str, instruction_id: str = "") -> bool:
         instruction = instruction.strip()
@@ -650,6 +722,7 @@ class Bridge:
                     report = (final or {}).get("text", "").strip()
                     if (final or {}).get("type") != "agentMessage" or (final or {}).get("phase") != "final_answer" or not report:
                         raise RuntimeError("本轮已结束，但没有可转发的最终报告")
+                    report_model = read_codex_turn_model(self.thread_id, turn["turn_id"])
                     published = False
                     with self.lock:
                         if self.active_codex_run_id == run_id:
@@ -657,6 +730,7 @@ class Bridge:
                             self.codex_stage = "completed"
                         if self.run_id == run_id and self.phase == "codex_running" and self.round == number:
                             self.report = report
+                            self.report_model = report_model
                             self.report_id += 1
                             self.phase = "report_ready"
                             self.detail = ""
@@ -905,10 +979,11 @@ def main():
         try:
             if queued_count(thread_id):
                 raise RuntimeError("目标 Codex 任务已有待处理消息；不能把上一轮报告作为当前报告发送")
-            initial = read_latest_codex_final(thread_id)
+            initial, turn_id = read_latest_codex_final(thread_id, include_turn=True)
         except RuntimeError as exc:
             parser.error(str(exc))
         bridge.report = initial
+        bridge.report_model = read_codex_turn_model(thread_id, turn_id)
         bridge.report_id = 1
         bridge.phase = "report_ready"
         print(f"已从所选 Codex 任务读取上一轮最终报告（{len(initial)} 字）", flush=True)

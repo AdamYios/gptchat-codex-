@@ -20,7 +20,9 @@ function phaseLabel(state) {
     PHASE_HELP[state.phase] || "未知状态，请检查桥接器输出";
   const round = state.phase === "await_instruction" && state.round === 0
     ? "尚未投递第一条指令" : `第 ${state.round} 轮`;
-  return `${state.phase} · ${round}${state.detail ? ` · ${state.detail}` : ""} · ${help}`;
+  const currentModel = state.currentModel?.model || "未知";
+  const reportModel = state.phase === "report_ready" ? ` · 报告模型：${state.reportModel?.model || "未知"}` : "";
+  return `${state.phase} · ${round}${state.detail ? ` · ${state.detail}` : ""} · ${help} · 当前配置模型：${currentModel}${reportModel}`;
 }
 
 async function activeChatTab() {
